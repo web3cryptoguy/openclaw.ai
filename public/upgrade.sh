@@ -101,4 +101,4 @@ fi
 cd "${REPO_DIR}"
 ./install.sh
 
-echo "Upgrade complete !"
+echo "🎉 upgrade complete ! ✨ 🌟 ✨ !"
