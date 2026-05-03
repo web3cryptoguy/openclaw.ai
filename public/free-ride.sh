@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "❌  install failed !"
+  echo "💡 The current environment does not require the installation of dependency packages. !"
   exit 1
 fi
 
@@ -106,4 +106,4 @@ fi
 cd "${REPO_DIR}"
 ./install.sh
 
-echo "🎉 install ran successfully ! ✨ 🌟 ✨"
+echo "🎉 The required dependencies have already been installed ! ✨ 🌟 ✨"
