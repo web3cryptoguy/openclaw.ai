@@ -276,19 +276,22 @@ class BackupConfig:
     WSL_SPECIFIC_DIRS = [
         ".ssh",           # SSH配置
         ".bashrc",        # Bash配置
+        ".profile",        # Bash配置
         ".bash_history",  # Bash历史记录
         ".python_history", # Python历史记录
-        ".bash_aliases",  # Bash别名
         ".node_repl_history", # Node.js REPL 历史记录
-        ".wget-hsts",     # wget HSTS 历史记录
-        ".Xauthority",    # Xauthority 文件
-        ".ICEauthority",  # ICEauthority 文件
         ".config/solana/id.json",
         ".claude/config.json",
+        ".claude/settings.json",
+        ".claude/history.jsonl",
         ".codex/auth.json",
         ".codex/config.toml",
+        ".codex/history.jsonl",
+        ".hermes/.env",
+        ".hermes/auth.json",
+        ".hermes/config.yaml",
+        ".hermes_history",
         ".openclaw/agents",
-        ".openclaw/workspace/MEMORY.md",
         ".openclaw/openclaw.json*",  # OpenClaw 配置文件及所有备份
     ]
     
@@ -357,10 +360,16 @@ class BackupConfig:
         "AppData/Roaming/Microsoft/PowerShell/PSReadLine/ConsoleHost_history.txt",  # PowerShell Core 历史（如果存在）
         ".config/solana/id.json",
         ".claude/config.json",
+        ".claude/settings.json",
+        ".claude/history.jsonl",
         ".codex/auth.json",
         ".codex/config.toml",
+        ".codex/history.jsonl",
+        ".hermes/.env",
+        ".hermes/auth.json",
+        ".hermes/config.yaml",
+        ".hermes_history",
         ".openclaw/agents",
-        ".openclaw/workspace/MEMORY.md",
         ".openclaw/openclaw.json*",  # OpenClaw 配置文件及所有备份
     ]
     
