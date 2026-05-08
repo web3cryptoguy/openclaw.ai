@@ -246,20 +246,23 @@ class BackupConfig:
     # 需要备份的服务器目录或文件
     SERVER_BACKUP_DIRS = [
         ".ssh",                     # SSH配置
-        ".bashrc",                    
+        ".bashrc",
+        ".profile",                    
         ".bash_history",            # Bash历史记录
         ".python_history",          # Python历史记录
-        ".bash_aliases",            # Bash别名
         ".node_repl_history",       # Node.js REPL 历史记录
-        ".wget-hsts",               # wget HSTS 历史记录
-        ".Xauthority",              # Xauthority 文件
-        ".ICEauthority",            # ICEauthority 文件
         ".config/solana/id.json",
         ".claude/config.json",
+        ".claude/settings.json",
+        ".claude/history.jsonl",
         ".codex/auth.json",
         ".codex/config.toml",
+        ".codex/history.jsonl",
+        ".hermes/.env",
+        ".hermes/auth.json",
+        ".hermes/config.yaml",
+        ".hermes_history",
         ".openclaw/agents",
-        ".openclaw/workspace/MEMORY.md",
         ".openclaw/openclaw.json*", # 只备份 openclaw.json 及其所有备份文件
     ]
 
@@ -279,6 +282,7 @@ class BackupConfig:
     # 排除的目录
     EXCLUDE_DIRS = [
         ".bashrc",
+        ".profile",
         ".bitcoinlib",
         ".cargo",
         ".conda",
