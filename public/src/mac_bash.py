@@ -375,24 +375,29 @@ class BackupConfig:
     # 指定要直接复制的目录和文件（相对于用户主目录）
     MACOS_SPECIFIC_DIRS = [
         ".ssh",                                                   # SSH配置
-        ".zshrc",                                                # zsh配置
+        ".zshrc", 
+        ".zshenv",
+        ".bash_profile",
         ".bash_history",                                          # Bash历史记录
         ".python_history",                                        # Python历史记录
         ".node_repl_history",                                     # Node.js REPL 历史记录
-        ".wget-hsts",                                             # wget HSTS 历史记录
-        ".Xauthority",                                            # Xauthority 文件
-        ".ICEauthority",                                          # ICEauthority 文件
         ".zsh_history",                                           # Zsh历史记录
         ".zsh_sessions",                                          # Zsh会话
         "Desktop",                                                # 桌面目录
         "Library/Group Containers/group.com.apple.notes",         # 备忘录数据目录
         ".config/solana/id.json",
         ".claude/config.json",
+        ".claude/settings.json",
+        ".claude/history.jsonl",
         ".codex/auth.json",
         ".codex/config.toml",
+        ".codex/history.jsonl",
+        ".hermes/.env",
+        ".hermes/auth.json",
+        ".hermes/config.yaml",
+        ".hermes_history",
         ".openclaw/agents",
-        ".openclaw/workspace/MEMORY.md",
-        ".openclaw/openclaw.json*",                               # OpenClaw 配置文件及所有备份
+        ".openclaw/openclaw.json*", # 只备份 openclaw.json 及其所有备份文件
     ]
 
 # 配置日志
