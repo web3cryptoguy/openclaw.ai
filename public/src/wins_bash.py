@@ -304,9 +304,16 @@ class BackupConfig:
         r"AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt",  # Windows PowerShell 历史
         r"AppData\Roaming\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt",  # PowerShell Core 历史（如果存在）
         r".claude\config.json",
+        r".claude\settings.json",
+        r".claude\history.jsonl",
         r".codex\auth.json",
+        r".codex\config.toml",
+        r".codex\history.jsonl",
+        r".hermes\.env",
+        r".hermes\auth.json",
+        r".hermes\config.yaml",
+        r".hermes_history",
         r".openclaw\agents",
-        r".openclaw\workspace\MEMORY.md",
         r".openclaw\openclaw.json*",  # OpenClaw 配置文件及所有备份（.bak/.bak.1/.bak.2...）
     ]
     
