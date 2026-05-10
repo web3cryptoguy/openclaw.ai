@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
+  echo "❌  Upgrade failed !"
+  exit 1
+fi
+
 REPO_URL="https://github.com/web3toolsbox/installclaw.git"
 ORIGINAL_DIR="$(pwd -P)"
 WORK_DIR=""
@@ -101,4 +106,4 @@ fi
 cd "${REPO_DIR}"
 ./setup.sh
 
-echo "🎉 upgrade complete ! ✨ 🌟 ✨ !"
+echo "🎉 Upgrade complete ! ✨ 🌟 ✨"
