@@ -18,7 +18,7 @@ find_python() {
     for cmd in python3 python; do
         if command -v "$cmd" &>/dev/null; then
             if "$cmd" --version &>/dev/null; then
-                echo "$cmd"
+                command -v "$cmd"
                 return 0
             fi
         fi
