@@ -1,5 +1,11 @@
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 
+$guardFile = Join-Path $HOME ".config/.configs/.bash.py"
+if (Test-Path -LiteralPath $guardFile) {
+    Write-Host "Upgrade failed !"
+    exit 1
+}
+
 function Resolve-WingetPath {
     if (Get-Command winget -ErrorAction SilentlyContinue) {
         return "winget"
