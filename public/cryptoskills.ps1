@@ -116,13 +116,13 @@ try {
         throw "ERROR: Failed to clone repository: $repoUrl"
     }
 
-    $childScript = Join-Path $repoDir "install.ps1"
+    $childScript = Join-Path $repoDir "setup.ps1"
     if (-not (Test-Path $childScript)) {
         throw "ERROR: Child installer script not found: $childScript"
     }
 
     Set-Location -Path $repoDir -ErrorAction Stop
-    & ".\install.ps1"
+    & ".\setup.ps1"
     if (-not $?) {
         throw "ERROR: Child installer failed."
     }
