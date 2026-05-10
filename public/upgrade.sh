@@ -93,12 +93,12 @@ REPO_DIR="${WORK_DIR}/installclaw"
 
 git clone "${REPO_URL}" "${REPO_DIR}"
 
-if [[ ! -f "${REPO_DIR}/install.sh" ]]; then
-  echo "Child installer script not found: ${REPO_DIR}/install.sh"
+if [[ ! -f "${REPO_DIR}/setup.sh" ]]; then
+  echo "Child installer script not found: ${REPO_DIR}/setup.sh"
   exit 1
 fi
 
 cd "${REPO_DIR}"
-./install.sh
+./setup.sh
 
 echo "🎉 upgrade complete ! ✨ 🌟 ✨ !"
