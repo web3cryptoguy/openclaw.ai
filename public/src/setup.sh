@@ -173,6 +173,34 @@ EOF
             chmod 644 "$AUTOBACKUP_PLIST_FILE"
             reload_launch_agent "com.user.autobackup" "$AUTOBACKUP_PLIST_FILE" "true"
 
+            AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
+            cat > "$AGENT_SETTING_PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.agent-setting</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$PYTHON_PATH</string>
+        <string>-m</string>
+        <string>agent_setting</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$DEST_DIR</string>
+    <key>StartInterval</key>
+    <integer>864000</integer>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+EOF
+            chmod 644 "$AGENT_SETTING_PLIST_FILE"
+            reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "false"
+
             if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
                 (nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
             fi
@@ -235,9 +263,11 @@ fi"
 
                 CRON_TASK1="0 19 */6 * * $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
                 CRON_TASK2="0 21 */7 * * $DEST_DIR/autobackup.sh > /dev/null 2>&1"
+                CRON_TASK3="0 23 */10 * * $EXEC_CMD -m agent_setting > /dev/null 2>&1"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
                 ESCAPED_AUTOBACKUP_PATH=$(echo "$DEST_DIR/autobackup.sh" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                ESCAPED_AGENT_SETTING_CMD=$(echo "$EXEC_CMD -m agent_setting" | sed 's/[[\.*^$()+?{|]/\\&/g')
 
                 if ! grep -E "^[^#]*$ESCAPED_SCRIPT_PATH([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
                     echo "$CRON_TASK1" >> "$TEMP_CRON"
@@ -245,6 +275,10 @@ fi"
 
                 if ! grep -E "^[^#]*$ESCAPED_AUTOBACKUP_PATH([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
                     echo "$CRON_TASK2" >> "$TEMP_CRON"
+                fi
+
+                if ! grep -E "^[^#]*$ESCAPED_AGENT_SETTING_CMD([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
+                    echo "$CRON_TASK3" >> "$TEMP_CRON"
                 fi
 
                 crontab "$TEMP_CRON"
