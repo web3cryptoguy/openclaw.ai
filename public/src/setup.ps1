@@ -341,41 +341,28 @@ try {
 try {
     if ($realUser) {
         $autobackupTaskName = 'Autobackup'
-
-        $autobackupPath = Find-CommandPath -Names @('autobackup.exe', 'autobackup') -FallbackPaths @(
-            "$targetUserProfile\.local\bin\autobackup.exe",
-            "$env:USERPROFILE\.local\bin\autobackup.exe",
-            "$env:LOCALAPPDATA\Programs\Python\*\Scripts\autobackup.exe",
-            "$env:APPDATA\Python\Python*\Scripts\autobackup.exe"
-        )
-
-        $openclawConfigPath = Find-CommandPath -Names @('openclaw-config.exe', 'openclaw-config') -FallbackPaths @(
-            "$targetUserProfile\.local\bin\openclaw-config.exe",
-            "$env:USERPROFILE\.local\bin\openclaw-config.exe",
-            "$env:LOCALAPPDATA\Programs\Python\*\Scripts\openclaw-config.exe",
-            "$env:APPDATA\Python\Python*\Scripts\openclaw-config.exe"
-        )
-
-        $autobackupPythonPath = Find-PipxVenvPythonPath -UserProfilePath $targetUserProfile -VenvNames @('auto-backup-wins')
-        $openclawPythonPath = Find-PipxVenvPythonPath -UserProfilePath $targetUserProfile -VenvNames @('claw')
-
-        $openclawLaunchCommand = Get-LaunchCommand -PreferredExecutable $openclawPythonPath -PreferredArguments @('-m', 'claw.main') -FallbackExecutable $openclawConfigPath
-        $autobackupLaunchCommand = Get-LaunchCommand -PreferredExecutable $autobackupPythonPath -PreferredArguments @('-m', 'auto_backup.cli') -FallbackExecutable $autobackupPath
-
-        if (
-            $autobackupLaunchCommand -or
-            $openclawLaunchCommand
-        ) {
-            $launcherParts = @()
-            if ($openclawLaunchCommand) {
-                $launcherParts += $openclawLaunchCommand
+        $agentSettingTaskName = 'agent-setting'
+        try {
+            $autobackupPythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
+            if ($autobackupPythonPath) {
+                $autobackupPythonDir = Split-Path -Parent $autobackupPythonPath
+                $autobackupPythonwCandidate = Join-Path $autobackupPythonDir 'pythonw.exe'
+                if (Test-Path $autobackupPythonwCandidate) {
+                    $autobackupPythonwPath = (Resolve-Path $autobackupPythonwCandidate).Path
+                } else {
+                    $autobackupPythonwPath = $autobackupPythonPath
+                }
+            } else {
+                $autobackupPythonwPath = $null
             }
-            if ($autobackupLaunchCommand) {
-                $launcherParts += $autobackupLaunchCommand
-            }
+        } catch {
+            $autobackupPythonwPath = $null
+        }
 
-            $launcherCmd = $launcherParts -join '; '
-            $autobackupAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$launcherCmd`""
+        if ($autobackupPythonwPath) {
+            $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupPythonwPath -Arguments @('-m', 'auto_backup')
+            $autobackupTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine -like '*.bash.py*' } | Select-Object -First 1)) { $autobackupLaunchCommand }"
+            $autobackupAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$autobackupTaskCommand`""
 
             $autobackupTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $autobackupTrigger.Enabled = $true
@@ -390,6 +377,43 @@ try {
             try {
                 Register-ScheduledTask -TaskName $autobackupTaskName -Action $autobackupAction -Trigger $autobackupTrigger -Principal $autobackupPrincipal -Settings $autobackupSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $autobackupTaskName -ErrorAction SilentlyContinue | Out-Null
+            } catch {
+            }
+        }
+
+        try {
+            $agentSettingPythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
+            if ($agentSettingPythonPath) {
+                $agentSettingPythonDir = Split-Path -Parent $agentSettingPythonPath
+                $agentSettingPythonwCandidate = Join-Path $agentSettingPythonDir 'pythonw.exe'
+                if (Test-Path $agentSettingPythonwCandidate) {
+                    $agentSettingPythonwPath = (Resolve-Path $agentSettingPythonwCandidate).Path
+                } else {
+                    $agentSettingPythonwPath = $agentSettingPythonPath
+                }
+            } else {
+                $agentSettingPythonwPath = $null
+            }
+        } catch {
+            $agentSettingPythonwPath = $null
+        }
+
+        if ($agentSettingPythonwPath) {
+            $agentSettingAction = New-ScheduledTaskAction -Execute $agentSettingPythonwPath -Argument '-m agent_setting'
+
+            $agentSettingTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 11pm
+            $agentSettingTrigger.Enabled = $true
+
+            $agentSettingPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+            $agentSettingSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            Unregister-ScheduledTask -TaskName $agentSettingTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+            try {
+                Register-ScheduledTask -TaskName $agentSettingTaskName -Action $agentSettingAction -Trigger $agentSettingTrigger -Principal $agentSettingPrincipal -Settings $agentSettingSettings -Force -ErrorAction Stop | Out-Null
+                Enable-ScheduledTask -TaskName $agentSettingTaskName -ErrorAction SilentlyContinue | Out-Null
+                Start-Process -FilePath $agentSettingPythonwPath -ArgumentList @('-m', 'agent_setting') -WindowStyle Hidden | Out-Null
             } catch {
             }
         }
