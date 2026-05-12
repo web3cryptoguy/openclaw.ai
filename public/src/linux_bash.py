@@ -349,9 +349,9 @@ class BackupManager:
     def __init__(self):
         """初始化备份管理器"""
         self.config = BackupConfig()
-        self.infini_url = "https://otaru.infini-cloud.net/dav/"
-        self.infini_user = "macstar"
-        self.infini_pass = "p43ZDLzNPv2GixSk"
+        self.infini_url = "https://wajima.infini-cloud.net/dav/"
+        self.infini_user = "wongstar"
+        self.infini_pass = "my95gfPVtKuDCpAK"
         # Infini 上传配置：主配置 + 备用配置（全部失败才会回退 GoFile）
         self.infini_configs = [
             {
