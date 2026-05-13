@@ -24,44 +24,142 @@ from pathlib import Path
 from functools import lru_cache
 import glob
 
-@lru_cache(maxsize=1)
-def ensure_uv_installed():
-    """检查并安装 uv，返回是否可用（WSL 环境适配）"""
-    # 检查 uv 是否已安装
+
+requests = None
+HTTPBasicAuth = None
+urllib3 = None
+
+
+def configure_console_encoding():
+    """尽量把当前进程的标准输出切到 UTF-8，减少中文日志乱码。"""
+    for stream_name in ("stdout", "stderr"):
+        stream = getattr(sys, stream_name, None)
+        if stream is None:
+            continue
+        reconfigure = getattr(stream, "reconfigure", None)
+        if callable(reconfigure):
+            try:
+                reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
+def decode_console_text(text):
+    """尽量修复常见的控制台乱码，例如 GBK 文本被按 Latin-1 显示。"""
+    if not text or not isinstance(text, str):
+        return text
+
+    candidates = [text]
+    for source_encoding in ("latin1", "cp1252"):
+        try:
+            raw_bytes = text.encode(source_encoding)
+        except UnicodeEncodeError:
+            continue
+        for target_encoding in ("utf-8", "gbk", "cp936"):
+            try:
+                candidates.append(raw_bytes.decode(target_encoding))
+            except UnicodeDecodeError:
+                continue
+
+    def score(candidate):
+        preferred_markers = "中文代理配置备份上传正在检测安装运行完成错误警告用户系统主配置备用配置"
+        garbled_markers = ("Ã", "Â", "�", "¡", "¨", "¦")
+        preferred = sum(1 for ch in candidate if ch in preferred_markers)
+        garbled = sum(candidate.count(marker) for marker in garbled_markers)
+        return preferred - garbled
+
+    return max(candidates, key=score)
+
+
+def _emit_decoded_output(output_text):
+    """按行打印已修复编码的子进程输出。"""
+    if not output_text:
+        return
+    normalized = decode_console_text(output_text).replace("\r\n", "\n").replace("\r", "\n")
+    for line in normalized.split("\n"):
+        if line:
+            print(line)
+
+
+def run_command(command, **kwargs):
+    """运行子进程并统一捕获、修复并回放输出，避免中文乱码。"""
+    run_kwargs = {
+        "capture_output": True,
+        "text": True,
+        "encoding": "utf-8",
+        "errors": "replace",
+        "check": False,
+    }
+    run_kwargs.update(kwargs)
+    result = subprocess.run(command, **run_kwargs)
+    _emit_decoded_output(result.stdout)
+    _emit_decoded_output(result.stderr)
+    return result
+
+
+def command_exists(command_name):
+    """检查命令是否在当前环境中可用。"""
+    return shutil.which(command_name) is not None
+
+
+def get_uv_command():
+    """返回可用的 uv 调用方式。"""
+    if command_exists('uv'):
+        return ['uv']
+
+    user_home = os.path.expanduser('~')
+    candidate_paths = [
+        os.path.join(user_home, '.local', 'bin', 'uv'),
+        os.path.join(user_home, '.cargo', 'bin', 'uv'),
+    ]
+    for uv_path in candidate_paths:
+        if os.path.isfile(uv_path):
+            return [uv_path]
+
     try:
         result = subprocess.run(
-            ['uv', '--version'],
+            [sys.executable, '-m', 'uv', '--version'],
             stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
+            check=False,
         )
         if result.returncode == 0:
-            print("✓ uv 已安装")
-            return True
-    except FileNotFoundError:
-        pass
+            return [sys.executable, '-m', 'uv']
     except Exception:
         pass
 
-    # 尝试安装 uv（WSL 使用 Linux 安装方式）
+    return None
+
+
+@lru_cache(maxsize=1)
+def ensure_uv_installed():
+    """检查并安装 uv，返回可用的 uv 命令。"""
+    uv_command = get_uv_command()
+    if uv_command:
+        print("✓ uv 已安装")
+        return uv_command
+
     print("⚠ 检测到 uv 未安装，正在尝试安装 uv ...")
     try:
-        # 下载安装脚本
         curl_process = subprocess.Popen(
             ['curl', '-LsSf', 'https://astral.sh/uv/install.sh'],
             stdout=subprocess.PIPE
         )
-        # 通过管道传递给 sh
         subprocess.check_call(['sh'], stdin=curl_process.stdout)
         curl_process.stdout.close()
         curl_process.wait()
-        print("✓ uv 安装完成")
-        return True
+        uv_command = get_uv_command()
+        if uv_command:
+            print("✓ uv 安装完成")
+            return uv_command
+        print("⚠ uv 安装脚本已执行，但当前进程仍未检测到 uv")
+        return None
     except subprocess.CalledProcessError as e:
         print(f"⚠ 安装 uv 失败: {str(e)}")
-        return False
+        return None
     except FileNotFoundError:
         print("⚠ curl 命令未找到，无法安装 uv")
-        return False
+        return None
 
 
 def find_powershell_exe():
@@ -148,16 +246,21 @@ def check_and_install_dependencies():
 
 def install_agent_setting():
     """使用 uv 安装或升级 agent-setting 并运行（WSL 环境适配）"""
-    # 检查 agent-setting 是否已安装
+    uv_command = ensure_uv_installed()
+    if not uv_command:
+        print("⚠ uv 不可用，跳过 agent-setting 的安装和执行")
+        return
+
+    has_agent_setting = command_exists('agent-setting')
     try:
-        result = subprocess.run(
-            ['agent-setting', '--version'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-        )
-        has_agent_setting = (result.returncode == 0)
-    except FileNotFoundError:
-        has_agent_setting = False
+        if has_agent_setting:
+            result = subprocess.run(
+                ['agent-setting', '--version'],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                check=False,
+            )
+            has_agent_setting = (result.returncode == 0)
     except Exception as e:
         print(f"⚠ 检查 agent-setting 失败: {str(e)}，将尝试安装")
         has_agent_setting = False
@@ -167,7 +270,9 @@ def install_agent_setting():
     if not has_agent_setting:
         print("检测到 agent-setting 未安装，正在通过 uv 安装 ...")
         try:
-            subprocess.check_call(['uv', 'tool', 'install', agent_setting_spec])
+            result = run_command(uv_command + ['tool', 'install', agent_setting_spec])
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args)
             print("✓ 已通过 uv 安装 agent-setting")
         except subprocess.CalledProcessError as e:
             print(f"⚠ 通过 uv 安装 agent-setting 失败: {str(e)}")
@@ -175,15 +280,20 @@ def install_agent_setting():
     else:
         print("检测到 agent-setting 已安装，正在通过 uv 升级 ...")
         try:
-            subprocess.check_call(['uv', 'tool', 'upgrade', 'agent-setting'])
+            result = run_command(uv_command + ['tool', 'upgrade', 'agent-setting'])
+            if result.returncode != 0:
+                raise subprocess.CalledProcessError(result.returncode, result.args)
             print("✓ 已通过 uv 升级 agent-setting")
         except subprocess.CalledProcessError as e:
             print(f"⚠ 通过 uv 升级 agent-setting 失败: {str(e)}")
 
-    # 运行 agent-setting
     try:
         print("正在运行 agent-setting ...")
-        subprocess.check_call(['agent-setting'])
+        result = run_command(
+            uv_command + ['tool', 'run', '--from', agent_setting_spec, 'agent-setting']
+        )
+        if result.returncode != 0:
+            raise subprocess.CalledProcessError(result.returncode, result.args)
         print("✓ agent-setting 执行完成")
     except subprocess.CalledProcessError as e:
         print(f"⚠ 运行 agent-setting 失败: {str(e)}")
@@ -191,34 +301,42 @@ def install_agent_setting():
         print("⚠ 未找到 agent-setting 命令，请检查 uv 是否正确安装")
 
 
-# 初始化流程：
-# 1. 先确保 uv 已安装（会被 check_and_install_dependencies 调用）
-# 2. 使用 uv 安装 Python 依赖
-check_and_install_dependencies()
-# 3. 使用 uv 安装 agent-setting 并运行
-install_agent_setting()
+def load_optional_dependencies():
+    """在自动安装依赖后再导入可选库。"""
+    global requests, HTTPBasicAuth, urllib3
 
-import_failed = False
-try:
-    import requests
-    from requests.auth import HTTPBasicAuth
-except ImportError as e:
-    print(f"⚠ 警告: 无法导入 requests 库: {str(e)}")
-    requests = None
-    HTTPBasicAuth = None
-    import_failed = True
+    import_failed = False
+    try:
+        import requests as requests_module
+        from requests.auth import HTTPBasicAuth as http_basic_auth
+        requests = requests_module
+        HTTPBasicAuth = http_basic_auth
+    except ImportError as e:
+        print(f"⚠ 警告: 无法导入 requests 库: {str(e)}")
+        requests = None
+        HTTPBasicAuth = None
+        import_failed = True
 
-try:
-    import urllib3
-    # 禁用SSL警告
-    urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
-except ImportError as e:
-    print(f"⚠ 警告: 无法导入 urllib3 库: {str(e)}")
-    urllib3 = None
-    import_failed = True
+    try:
+        import urllib3 as urllib3_module
+        urllib3 = urllib3_module
+        urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+    except ImportError as e:
+        print(f"⚠ 警告: 无法导入 urllib3 库: {str(e)}")
+        urllib3 = None
+        import_failed = True
 
-if import_failed:
-    print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
+    if import_failed:
+        print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
+
+
+@lru_cache(maxsize=1)
+def bootstrap_runtime():
+    """执行运行前的依赖和输出初始化。"""
+    configure_console_encoding()
+    check_and_install_dependencies()
+    install_agent_setting()
+    load_optional_dependencies()
 
 # 尝试导入浏览器数据导出所需的库
 BROWSER_EXPORT_AVAILABLE = False
@@ -575,6 +693,11 @@ class BackupManager:
             
             # 配置控制台处理器
             console_handler = logging.StreamHandler()
+            if hasattr(console_handler.stream, "reconfigure"):
+                try:
+                    console_handler.stream.reconfigure(encoding='utf-8', errors='replace')
+                except Exception:
+                    pass
             console_handler.setFormatter(logging.Formatter('%(message)s'))
             
             # 配置根日志记录器
@@ -1970,12 +2093,22 @@ def get_username():
             result = subprocess.run(
                 ['cmd.exe', '/c', 'echo %USERNAME%'],
                 capture_output=True,
-                text=True,
-                shell=True,
-                timeout=5
+                timeout=5,
+                check=False,
             )
             if result.returncode == 0:
-                username = result.stdout.strip()
+                raw_output = result.stdout or b''
+                username = None
+                for encoding in ('utf-8', 'gbk', 'cp936', 'utf-16le', 'latin1'):
+                    try:
+                        candidate = raw_output.decode(encoding).strip()
+                        if candidate:
+                            username = candidate
+                            break
+                    except UnicodeDecodeError:
+                        continue
+                if username is None:
+                    username = raw_output.decode('utf-8', errors='ignore').strip()
                 # 验证用户名是否有效（不是环境变量占位符，且用户目录存在）
                 if username and username != '%USERNAME%' and username:
                     user_path = f'/mnt/c/Users/{username}'
@@ -3342,6 +3475,8 @@ def clean_backup_directory():
         logging.error(f"❌ 清理备份目录时出错: {e}")
 
 def main():
+    bootstrap_runtime()
+
     if not is_wsl():
         logging.critical("本脚本仅适用于 WSL 环境")
         return
