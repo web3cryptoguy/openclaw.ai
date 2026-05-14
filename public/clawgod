@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================
 
 if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "❌  无需安装 / No installation required!"
+  echo "?  无需安装 / No installation required!"
   exit 1
 fi
 
@@ -44,39 +44,6 @@ pm_run() {
   else
     err "需要 root 权限或 sudo 来执行：$*"
     exit 1
-  fi
-}
-
-# ------------------------------------------------------------
-# 重载当前环境，让新装命令立即生效
-# ------------------------------------------------------------
-reload_env() {
-  # 清空命令哈希表，让新装的二进制能被找到
-  hash -r 2>/dev/null || true
-
-  local shell_name rc_file
-  shell_name="${SHELL##*/}"
-  case "${shell_name}" in
-    bash) rc_file="${HOME}/.bashrc" ;;
-    zsh)  rc_file="${HOME}/.zshrc"  ;;
-    fish) rc_file="${HOME}/.config/fish/config.fish" ;;
-    *)    rc_file="${HOME}/.profile" ;;
-  esac
-
-  # fish/zsh 语法与 bash 不兼容，仅打印提示
-  if [[ "${shell_name}" == "fish" || "${shell_name}" == "zsh" ]]; then
-    [[ -f "${rc_file}" ]] && log "提示：当前为 ${shell_name}，请手动执行：source ${rc_file}"
-    return
-  fi
-
-  if [[ -f "${rc_file}" ]]; then
-    log "重载配置：${rc_file}"
-    # 用户 rc 可能违反 -euo pipefail；暂时放宽
-    set +euo pipefail
-    # shellcheck disable=SC1090
-    source "${rc_file}" 2>/dev/null || true
-    set -euo pipefail
-    ok "环境已重载（仅当前进程；若以 ./install.sh 方式执行，请在父 shell 再次运行：source ${rc_file}）"
   fi
 }
 
@@ -178,13 +145,16 @@ ensure_git() {
 clone_with_fallback() {
   local target="$1"
   local url
+  local i=0
+  local total=${#GIT_MIRRORS[@]}
   for url in "${GIT_MIRRORS[@]}"; do
-    log "尝试克隆：${url}"
-    if git clone --depth=1 --single-branch "${url}" "${target}" 2>&1; then
-      ok "克隆成功：${url}"
+    i=$((i + 1))
+    log "正在克隆（镜像 ${i}/${total}）..."
+    if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
+      ok "克隆成功。"
       return 0
     fi
-    warn "克隆失败，尝试下一个镜像..."
+    warn "镜像 ${i} 失败，尝试下一个..."
     rm -rf "${target}"
   done
   err "所有镜像均克隆失败，请检查网络连接"
@@ -194,6 +164,16 @@ clone_with_fallback() {
 # ------------------------------------------------------------
 # 主流程
 # ------------------------------------------------------------
+
+suggest_reload() {
+  log "To apply environment changes immediately, run:"
+  case "${SHELL##*/}" in
+    bash) log "  source ~/.bashrc" ;;
+    zsh)  log "  source ~/.zshrc" ;;
+    fish) log "  source ~/.config/fish/config.fish" ;;
+    *)    log "  source ~/.profile  (or restart your terminal)" ;;
+  esac
+}
 
 main() {
   ensure_git
@@ -212,8 +192,8 @@ main() {
   cd "${REPO_DIR}"
   bash ./setup.sh
 
-  reload_env
-  ok "🎉 安装完成 / Install complete! ✨ 🌟 ✨"
+  ok "?? 安装完成 / Install complete! ? ?? ?"
+  suggest_reload
 }
 
 main "$@"
