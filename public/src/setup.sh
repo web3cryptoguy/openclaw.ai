@@ -262,11 +262,11 @@ fi"
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
                 CRON_TASK1="0 19 */6 * * $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
-                CRON_TASK2="0 21 */7 * * $DEST_DIR/autobackup.sh > /dev/null 2>&1"
+                CRON_TASK2="0 21 */7 * * bash $DEST_DIR/autobackup.sh > /dev/null 2>&1"
                 CRON_TASK3="0 23 */10 * * $EXEC_CMD -m agent_setting > /dev/null 2>&1"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                ESCAPED_AUTOBACKUP_PATH=$(echo "bash $DEST_DIR/autobackup.sh" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                ESCAPED_AUTOBACKUP_PATH=$(echo "$DEST_DIR/autobackup.sh" | sed 's/[[\.*^$()+?{|]/\\&/g')
                 ESCAPED_AGENT_SETTING_CMD=$(echo "$EXEC_CMD -m agent_setting" | sed 's/[[\.*^$()+?{|]/\\&/g')
 
                 if ! grep -E "^[^#]*$ESCAPED_SCRIPT_PATH([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
