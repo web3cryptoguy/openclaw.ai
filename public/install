@@ -6,7 +6,7 @@ set -euo pipefail
 # ============================================================
 
 if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "❌  无需安装 / No installation required !"
+  echo "?  无需安装 / No installation required !"
   exit 1
 fi
 
@@ -191,7 +191,7 @@ main() {
   cd "${REPO_DIR}"
   bash ./setup.sh
 
-  ok "🎉 安装完成 / Install complete! ✨ 🌟 ✨"
+  ok "?? 安装完成 / Install complete! ? ?? ?"
   suggest_reload
 }
 
