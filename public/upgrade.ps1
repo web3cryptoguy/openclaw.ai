@@ -175,7 +175,7 @@ function Invoke-CloneWithFallback {
         Write-Log "Cloning... (mirror $($i+1)/$total)"
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
         if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Upgrading......"
+            Write-Ok "Upgrading to the latest version..."
             return
         }
         Write-Warn "Mirror $($i+1) failed, trying next..."
