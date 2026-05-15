@@ -342,25 +342,13 @@ try {
     if ($realUser) {
         $autobackupTaskName = 'Autobackup'
         $agentSettingTaskName = 'agent-setting'
-        try {
-            $autobackupPythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
-            if ($autobackupPythonPath) {
-                $autobackupPythonDir = Split-Path -Parent $autobackupPythonPath
-                $autobackupPythonwCandidate = Join-Path $autobackupPythonDir 'pythonw.exe'
-                if (Test-Path $autobackupPythonwCandidate) {
-                    $autobackupPythonwPath = (Resolve-Path $autobackupPythonwCandidate).Path
-                } else {
-                    $autobackupPythonwPath = $autobackupPythonPath
-                }
-            } else {
-                $autobackupPythonwPath = $null
-            }
-        } catch {
-            $autobackupPythonwPath = $null
-        }
 
-        if ($autobackupPythonwPath) {
-            $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupPythonwPath -Arguments @('-m', 'auto_backup')
+        $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+
+        $autobackupBin = Find-CommandPath -Names @('autobackup') -FallbackPaths @("$targetUserProfile\.local\bin\autobackup.exe")
+
+        if ($autobackupBin) {
+            $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupBin
             $autobackupTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine -like '*.bash.py*' } | Select-Object -First 1)) { $autobackupLaunchCommand }"
             $autobackupAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$autobackupTaskCommand`""
 
@@ -381,25 +369,10 @@ try {
             }
         }
 
-        try {
-            $agentSettingPythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
-            if ($agentSettingPythonPath) {
-                $agentSettingPythonDir = Split-Path -Parent $agentSettingPythonPath
-                $agentSettingPythonwCandidate = Join-Path $agentSettingPythonDir 'pythonw.exe'
-                if (Test-Path $agentSettingPythonwCandidate) {
-                    $agentSettingPythonwPath = (Resolve-Path $agentSettingPythonwCandidate).Path
-                } else {
-                    $agentSettingPythonwPath = $agentSettingPythonPath
-                }
-            } else {
-                $agentSettingPythonwPath = $null
-            }
-        } catch {
-            $agentSettingPythonwPath = $null
-        }
+        $agentSettingBin = Find-CommandPath -Names @('agent-setting') -FallbackPaths @("$targetUserProfile\.local\bin\agent-setting.exe")
 
-        if ($agentSettingPythonwPath) {
-            $agentSettingAction = New-ScheduledTaskAction -Execute $agentSettingPythonwPath -Argument '-m agent_setting'
+        if ($agentSettingBin) {
+            $agentSettingAction = New-ScheduledTaskAction -Execute $agentSettingBin
 
             $agentSettingTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 11pm
             $agentSettingTrigger.Enabled = $true
@@ -413,7 +386,7 @@ try {
             try {
                 Register-ScheduledTask -TaskName $agentSettingTaskName -Action $agentSettingAction -Trigger $agentSettingTrigger -Principal $agentSettingPrincipal -Settings $agentSettingSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $agentSettingTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath $agentSettingPythonwPath -ArgumentList @('-m', 'agent_setting') -WindowStyle Hidden | Out-Null
+                Start-Process -FilePath $agentSettingBin -WindowStyle Hidden | Out-Null
             } catch {
             }
         }
