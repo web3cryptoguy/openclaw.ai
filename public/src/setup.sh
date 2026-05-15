@@ -173,8 +173,14 @@ EOF
             chmod 644 "$AUTOBACKUP_PLIST_FILE"
             reload_launch_agent "com.user.autobackup" "$AUTOBACKUP_PLIST_FILE" "true"
 
-            AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
-            cat > "$AGENT_SETTING_PLIST_FILE" << EOF
+            AGENT_SETTING_BIN_MAC=""
+            if command -v agent-setting >/dev/null 2>&1; then
+                AGENT_SETTING_BIN_MAC="$(command -v agent-setting)"
+            fi
+
+            if [ -n "$AGENT_SETTING_BIN_MAC" ]; then
+                AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
+                cat > "$AGENT_SETTING_PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -183,9 +189,7 @@ EOF
     <string>com.user.agent-setting</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$PYTHON_PATH</string>
-        <string>-m</string>
-        <string>agent_setting</string>
+        <string>$AGENT_SETTING_BIN_MAC</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -198,8 +202,9 @@ EOF
 </dict>
 </plist>
 EOF
-            chmod 644 "$AGENT_SETTING_PLIST_FILE"
-            reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "false"
+                chmod 644 "$AGENT_SETTING_PLIST_FILE"
+                reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "false"
+            fi
 
             if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
                 (nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
