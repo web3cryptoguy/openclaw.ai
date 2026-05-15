@@ -174,8 +174,12 @@ EOF
             reload_launch_agent "com.user.autobackup" "$AUTOBACKUP_PLIST_FILE" "true"
 
             AGENT_SETTING_BIN_MAC=""
+            hash -r 2>/dev/null
+            export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
             if command -v agent-setting >/dev/null 2>&1; then
                 AGENT_SETTING_BIN_MAC="$(command -v agent-setting)"
+            else
+                AGENT_SETTING_BIN_MAC="/opt/homebrew/bin/agent-setting"
             fi
 
             if [ -n "$AGENT_SETTING_BIN_MAC" ]; then
@@ -270,8 +274,12 @@ fi"
                 CRON_TASK2="0 21 */7 * * $DEST_DIR/autobackup.sh > /dev/null 2>&1"
 
                 AGENT_SETTING_BIN=""
+                hash -r 2>/dev/null
+                export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
                 if command -v agent-setting >/dev/null 2>&1; then
                     AGENT_SETTING_BIN="$(command -v agent-setting)"
+                else
+                    AGENT_SETTING_BIN="$HOME/.local/bin/agent-setting"
                 fi
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
