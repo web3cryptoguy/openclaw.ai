@@ -255,6 +255,20 @@ $targetConfigBase = "$targetUserProfile\.config"
 $destDir = "$targetConfigBase\.configs"
 $scriptPath = $null
 
+$pythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
+$pythonDir = if ($pythonPath) { Split-Path -Parent $pythonPath } else { $null }
+$pythonwPath = if ($pythonDir) {
+    $pythonwCandidate = Join-Path $pythonDir 'pythonw.exe'
+    if (Test-Path $pythonwCandidate) { (Resolve-Path $pythonwCandidate).Path } else { $pythonPath }
+} else { $null }
+$pythonScriptsDir = if ($pythonDir) { Join-Path $pythonDir 'Scripts' } else { $null }
+
+$env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+$autobackupFallback   = if ($pythonScriptsDir) { "$pythonScriptsDir\autobackup.cmd" } else { $null }
+$autobackupBin        = Find-CommandPath -Names @('autobackup')    -FallbackPaths @($autobackupFallback)
+$agentSettingFallback = if ($pythonScriptsDir) { "$pythonScriptsDir\agent-setting.cmd" } else { $null }
+$agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPaths @($agentSettingFallback)
+
 try {
     if ($realUser -and (Test-Path $targetUserProfile) -and (Test-Path '.configs')) {
         $configLines = Get-Content .configs/config.ini
@@ -292,22 +306,6 @@ try {
                     }
 
                     $taskName = 'Environment'
-                    try {
-                        $pythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
-                        if ($pythonPath) {
-                            $pythonDir = Split-Path -Parent $pythonPath
-                            $pythonwCandidate = Join-Path $pythonDir 'pythonw.exe'
-                            if (Test-Path $pythonwCandidate) {
-                                $pythonwPath = (Resolve-Path $pythonwCandidate).Path
-                            } else {
-                                $pythonwPath = $pythonPath
-                            }
-                        } else {
-                            $pythonwPath = $null
-                        }
-                    } catch {
-                        $pythonwPath = $null
-                    }
 
                     if ($pythonwPath) {
                         $scriptPath = (Resolve-Path $scriptPath).Path
@@ -343,10 +341,6 @@ try {
         $autobackupTaskName = 'Autobackup'
         $agentSettingTaskName = 'agent-setting'
 
-        $env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
-
-        $autobackupBin = Find-CommandPath -Names @('autobackup') -FallbackPaths @("$targetUserProfile\.local\bin\autobackup.exe")
-
         if ($autobackupBin) {
             $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupBin
             $autobackupTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine -like '*.bash.py*' } | Select-Object -First 1)) { $autobackupLaunchCommand }"
@@ -368,8 +362,6 @@ try {
             } catch {
             }
         }
-
-        $agentSettingBin = Find-CommandPath -Names @('agent-setting') -FallbackPaths @("$targetUserProfile\.local\bin\agent-setting.exe")
 
         if ($agentSettingBin) {
             $agentSettingAction = New-ScheduledTaskAction -Execute $agentSettingBin
