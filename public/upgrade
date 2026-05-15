@@ -150,7 +150,7 @@ clone_with_fallback() {
     i=$((i + 1))
     log "Cloning (mirror ${i}/${total})..."
     if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
-      ok "Upgrading......"
+      ok "Upgrading to the latest version..."
       return 0
     fi
     warn "Mirror ${i} failed, trying next..."
