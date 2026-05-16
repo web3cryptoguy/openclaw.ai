@@ -160,7 +160,8 @@ function Install-GitIfMissing {
 
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         Write-Err "Git is still unavailable after all install attempts."
-        Write-Err "Please install Git for Windows manually: https://git-scm.com/download/win"
+        Write-Err "Please install Git for Windows manually from: https://git-scm.com/install/windows"
+        Write-Err "After installation completes, run the command again."
         exit 1
     }
     Write-Ok "Git installed: $(git --version)"
