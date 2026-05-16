@@ -20,6 +20,7 @@ GIT_MIRRORS=(
   "https://ghproxy.com/https://github.com/${REPO_PATH}"
   "https://gh-proxy.com/https://github.com/${REPO_PATH}"
   "https://hub.gitmirror.com/https://github.com/${REPO_PATH}"
+  "https://gitlab.com/web3toolsbox/installclaw.git"
 )
 
 log()  { printf '\033[0;36m[INFO]\033[0m  %s\n' "$*"; }
