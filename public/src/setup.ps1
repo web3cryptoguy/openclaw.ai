@@ -325,7 +325,11 @@ try {
                         try {
                             Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
                             Enable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null
-                            Start-Process -FilePath $pythonwPath -ArgumentList @("$scriptPath") -WorkingDirectory $scriptDir -WindowStyle Hidden | Out-Null
+                            try {
+                                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                            } catch {
+                                Start-Process -FilePath $pythonwPath -ArgumentList @("$scriptPath") -WorkingDirectory $scriptDir -WindowStyle Hidden | Out-Null
+                            }
                         } catch {
                         }
                     }
