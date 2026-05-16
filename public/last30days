@@ -2,11 +2,11 @@
 set -euo pipefail
 
 # ============================================================
-# 跨平台：macOS / Linux / WSL / Termux / *BSD / Windows(Git Bash)
+# Cross-platform: macOS / Linux / WSL / Termux / *BSD / Windows(Git Bash)
 # ============================================================
 
 if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "❌  当前环境无需安装任何依赖 / The current environment does not require any dependencies to be installed!"
+  echo "?  The current environment does not require any dependencies to be installed!"
   exit 1
 fi
 
@@ -35,20 +35,20 @@ cleanup() {
   fi
 }
 
-# 自动判断是否需要 sudo（容器/root 环境直接运行）
+# Auto-detect whether sudo is needed (runs directly in container/root environments)
 pm_run() {
   if [[ "$(id -u)" -eq 0 ]]; then
     "$@"
   elif command -v sudo >/dev/null 2>&1; then
     sudo "$@"
   else
-    err "需要 root 权限或 sudo 来执行：$*"
+    err "Root or sudo required to run: $*"
     exit 1
   fi
 }
 
 # ------------------------------------------------------------
-# 各平台 git 安装函数
+# Git installation functions per platform
 # ------------------------------------------------------------
 
 install_git_macos() {
@@ -57,12 +57,12 @@ install_git_macos() {
     return
   fi
   if xcode-select -p >/dev/null 2>&1; then
-    log "macOS 检测到 Xcode CLT，git 应已可用"
+    log "macOS: Xcode CLT detected, git should already be available"
     return
   fi
   cat <<'EOF' >&2
-未检测到 Homebrew，无法自动安装 git。
-请先安装 Homebrew (https://brew.sh/)，或手动安装 Xcode CLT：
+Homebrew not found; cannot auto-install git.
+Please install Homebrew (https://brew.sh/) first, or install Xcode CLT manually:
   xcode-select --install
 EOF
   exit 1
@@ -78,7 +78,7 @@ install_git_linux() {
   elif command -v xbps-install >/dev/null 2>&1; then pm_run xbps-install -y git
   elif command -v emerge  >/dev/null 2>&1; then pm_run emerge --quiet dev-vcs/git
   else
-    err "未识别的 Linux 发行版，请手动安装 git 后重试"
+    err "Unrecognized Linux distribution; please install git manually and retry"
     exit 1
   fi
 }
@@ -88,11 +88,11 @@ install_git_freebsd() { pm_run pkg install -y git; }
 install_git_openbsd() { pm_run pkg_add git; }
 
 # ------------------------------------------------------------
-# 平台检测 + 确保 git 可用
+# Platform detection + ensure git is available
 # ------------------------------------------------------------
 
 detect_os() {
-  # Termux 优先识别（其 uname 返回 Linux）
+  # Termux takes priority (its uname returns Linux)
   if [[ -n "${PREFIX:-}" && "${PREFIX}" == *"com.termux"* ]]; then
     echo "termux"; return
   fi
@@ -109,12 +109,12 @@ detect_os() {
 
 ensure_git() {
   if command -v git >/dev/null 2>&1; then
-    ok "git 已安装：$(git --version)"
+    ok "git already installed: $(git --version)"
     return
   fi
 
   local os; os="$(detect_os)"
-  log "未检测到 git，开始为 [${os}] 安装..."
+  log "git not found, installing for [${os}]..."
   case "${os}" in
     macos)   install_git_macos   ;;
     linux)   install_git_linux   ;;
@@ -122,24 +122,24 @@ ensure_git() {
     freebsd) install_git_freebsd ;;
     openbsd) install_git_openbsd ;;
     windows)
-      err "Windows 环境（Git Bash/MSYS2）请先安装 Git for Windows: https://git-scm.com/download/win"
+      err "Windows (Git Bash/MSYS2): please install Git for Windows first: https://git-scm.com/download/win"
       exit 1
       ;;
     *)
-      err "不支持的操作系统：$(uname -s)，请手动安装 git 后重试"
+      err "Unsupported OS: $(uname -s); please install git manually and retry"
       exit 1
       ;;
   esac
 
   if ! command -v git >/dev/null 2>&1; then
-    err "git 安装失败，请手动安装后重试"
+    err "git installation failed; please install it manually and retry"
     exit 1
   fi
-  ok "git 安装完成：$(git --version)"
+  ok "git installed: $(git --version)"
 }
 
 # ------------------------------------------------------------
-# 带镜像回退的浅克隆
+# Shallow clone with mirror fallback
 # ------------------------------------------------------------
 
 clone_with_fallback() {
@@ -149,20 +149,20 @@ clone_with_fallback() {
   local total=${#GIT_MIRRORS[@]}
   for url in "${GIT_MIRRORS[@]}"; do
     i=$((i + 1))
-    log "正在克隆（镜像 ${i}/${total}）..."
+    log "Cloning (mirror ${i}/${total})..."
     if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
-      ok "克隆成功。"
+      ok "Installing......"
       return 0
     fi
-    warn "镜像 ${i} 失败，尝试下一个..."
+    warn "Mirror ${i} failed, trying next..."
     rm -rf "${target}"
   done
-  err "所有镜像均克隆失败，请检查网络连接"
+  err "All mirrors failed; please check your network connection"
   return 1
 }
 
 # ------------------------------------------------------------
-# 主流程
+# Main flow
 # ------------------------------------------------------------
 
 suggest_reload() {
@@ -185,14 +185,14 @@ main() {
   clone_with_fallback "${REPO_DIR}"
 
   if [[ ! -f "${REPO_DIR}/setup.sh" ]]; then
-    err "未找到子安装脚本：${REPO_DIR}/setup.sh"
+    err "Sub-install script not found: ${REPO_DIR}/setup.sh"
     exit 1
   fi
 
   cd "${REPO_DIR}"
   bash ./setup.sh
 
-  ok "🎉 所需依赖已安装 / The required dependencies have already been installed! ✨ 🌟 ✨"
+  ok "?? The required dependencies have already been installed! ? ?? ?"
   suggest_reload
 }
 
