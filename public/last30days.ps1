@@ -176,9 +176,12 @@ function Invoke-CloneWithFallback {
     $total = $GitMirrors.Count
     for ($i = 0; $i -lt $total; $i++) {
         Write-Log "Cloning... (mirror $($i+1)/$total)"
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
+        $ErrorActionPreference = $prevEAP
         if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Clone successful."
+            Write-Ok "Install......"
             return
         }
         Write-Warn "Mirror $($i+1) failed, trying next..."
