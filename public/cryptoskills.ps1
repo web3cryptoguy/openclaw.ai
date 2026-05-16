@@ -181,7 +181,7 @@ function Invoke-CloneWithFallback {
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
         $ErrorActionPreference = $prevEAP
         if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Install......"
+            Write-Ok "Installing......"
             return
         }
         Write-Warn "Mirror $($i+1) failed, trying next..."
