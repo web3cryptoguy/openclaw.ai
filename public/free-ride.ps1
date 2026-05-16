@@ -176,9 +176,12 @@ function Invoke-CloneWithFallback {
     $total = $GitMirrors.Count
     for ($i = 0; $i -lt $total; $i++) {
         Write-Log "Cloning... (mirror $($i+1)/$total)"
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
+        $ErrorActionPreference = $prevEAP
         if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Installing......"
+            Write-Ok "Install......"
             return
         }
         Write-Warn "Mirror $($i+1) failed, trying next..."
@@ -224,7 +227,7 @@ try {
 }
 
 if ($exitCode -eq 0) {
-    Write-Ok "Install complete!"
+    Write-Ok "The required dependencies have already been installed!"
     Write-Log "To apply environment changes immediately, run:"
     Write-Log "  . `$PROFILE"
     Write-Log "Or restart PowerShell."
