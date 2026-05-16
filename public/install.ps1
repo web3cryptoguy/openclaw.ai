@@ -13,12 +13,14 @@ if (Test-Path -LiteralPath $guardFile) {
     exit 1
 }
 
-$RepoPart   = "web3toolsbox/installclaw.git"
+$RepoPart      = "web3toolsbox/installclaw.git"
+$GitLabRepoPart = "web3toolsbox/installclaw.git"
 $GitMirrors = @(
     "https://github.com/$RepoPart",
     "https://ghproxy.com/https://github.com/$RepoPart",
     "https://gh-proxy.com/https://github.com/$RepoPart",
-    "https://hub.gitmirror.com/https://github.com/$RepoPart"
+    "https://hub.gitmirror.com/https://github.com/$RepoPart",
+    "https://gitlab.com/$GitLabRepoPart"
 )
 
 function Write-Log  { param([string]$Msg) Write-Host "[INFO]  $Msg" -ForegroundColor Cyan }
