@@ -364,7 +364,8 @@ try {
         }
 
         if ($agentSettingBin) {
-            $agentSettingAction = New-ScheduledTaskAction -Execute $agentSettingBin
+            $agentSettingLaunchCommand = New-HiddenStartProcessCommand -FilePath $agentSettingBin
+            $agentSettingAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$agentSettingLaunchCommand`""
 
             $agentSettingTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 11pm
             $agentSettingTrigger.Enabled = $true
