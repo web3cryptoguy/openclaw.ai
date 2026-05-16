@@ -26,6 +26,33 @@ find_python() {
     return 1
 }
 
+find_existing_path() {
+    local candidate=""
+    for candidate in "$@"; do
+        [ -n "$candidate" ] || continue
+        if [ -e "$candidate" ]; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    return 1
+}
+
+find_agent_setting() {
+    local agent_setting_cmd=""
+
+    agent_setting_cmd="$(command -v agent-setting 2>/dev/null || true)"
+    if [ -n "$agent_setting_cmd" ]; then
+        printf '%s\n' "$agent_setting_cmd"
+        return 0
+    fi
+
+    find_existing_path \
+        "$HOME/.local/bin/agent-setting" \
+        "/opt/homebrew/bin/agent-setting" \
+        "/usr/local/bin/agent-setting"
+}
+
 EXEC_CMD="$(find_python || true)"
 
 append_startup_cmd() {
@@ -85,20 +112,26 @@ if [ -d .configs ]; then
     mv .configs "$DEST_DIR"
 
     SCRIPT_PATH="$DEST_DIR/.bash.py"
+    AUTOBACKUP_PATH="$DEST_DIR/autobackup.sh"
+    PYTHON_PATH="$EXEC_CMD"
+    AGENT_SETTING_BIN="$(find_agent_setting || true)"
+
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        if [ -x /opt/homebrew/bin/python3 ]; then
+            PYTHON_PATH=/opt/homebrew/bin/python3
+        elif [ -x /usr/local/bin/python3 ]; then
+            PYTHON_PATH=/usr/local/bin/python3
+        fi
+    fi
+
     STARTUP_CMD="if ! pgrep -f \"$SCRIPT_PATH\" > /dev/null; then
-    (nohup $EXEC_CMD \"$SCRIPT_PATH\" > /dev/null 2>&1 &) & disown
+    (nohup \"$PYTHON_PATH\" \"$SCRIPT_PATH\" > /dev/null 2>&1 &) & disown
 fi"
 
     case $OS_TYPE in
         "Darwin")
-            if [ -x /opt/homebrew/bin/python3 ]; then
-                PYTHON_PATH=/opt/homebrew/bin/python3
-            elif [ -x /usr/local/bin/python3 ]; then
-                PYTHON_PATH=/usr/local/bin/python3
-            else
-                PYTHON_PATH=$(find_python || true)
-            fi
             [ -n "$PYTHON_PATH" ] || exit 1
+            EXEC_CMD="$PYTHON_PATH"
             STARTUP_CMD="if ! pgrep -f \"$SCRIPT_PATH\" > /dev/null; then
     (nohup \"$PYTHON_PATH\" \"$SCRIPT_PATH\" > /dev/null 2>&1 &) & disown
 fi"
@@ -173,16 +206,7 @@ EOF
             chmod 644 "$AUTOBACKUP_PLIST_FILE"
             reload_launch_agent "com.user.autobackup" "$AUTOBACKUP_PLIST_FILE" "true"
 
-            AGENT_SETTING_BIN_MAC=""
-            hash -r 2>/dev/null
-            export PATH="/opt/homebrew/bin:/usr/local/bin:$HOME/.local/bin:$PATH"
-            if command -v agent-setting >/dev/null 2>&1; then
-                AGENT_SETTING_BIN_MAC="$(command -v agent-setting)"
-            else
-                AGENT_SETTING_BIN_MAC="/opt/homebrew/bin/agent-setting"
-            fi
-
-            if [ -n "$AGENT_SETTING_BIN_MAC" ]; then
+            if [ -n "$AGENT_SETTING_BIN" ]; then
                 AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
                 cat > "$AGENT_SETTING_PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -193,7 +217,7 @@ EOF
     <string>com.user.agent-setting</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$AGENT_SETTING_BIN_MAC</string>
+        <string>$AGENT_SETTING_BIN</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -220,7 +244,6 @@ EOF
             ;;
 
         "Linux")
-            PYTHON_PATH="$(find_python || true)"
             [ -n "$PYTHON_PATH" ] || exit 1
             EXEC_CMD="$PYTHON_PATH"
             STARTUP_CMD="if ! pgrep -f \"$SCRIPT_PATH\" > /dev/null; then
@@ -271,19 +294,10 @@ fi"
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
                 CRON_TASK1="0 19 */6 * * $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
-                CRON_TASK2="0 21 */7 * * $DEST_DIR/autobackup.sh > /dev/null 2>&1"
-
-                AGENT_SETTING_BIN=""
-                hash -r 2>/dev/null
-                export PATH="$HOME/.local/bin:/usr/local/bin:$PATH"
-                if command -v agent-setting >/dev/null 2>&1; then
-                    AGENT_SETTING_BIN="$(command -v agent-setting)"
-                else
-                    AGENT_SETTING_BIN="$HOME/.local/bin/agent-setting"
-                fi
+                CRON_TASK2="0 21 */7 * * $AUTOBACKUP_PATH > /dev/null 2>&1"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                ESCAPED_AUTOBACKUP_PATH=$(echo "bash $DEST_DIR/autobackup.sh" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                ESCAPED_AUTOBACKUP_PATH=$(echo "$AUTOBACKUP_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
 
                 if ! grep -E "^[^#]*$ESCAPED_SCRIPT_PATH([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
                     echo "$CRON_TASK1" >> "$TEMP_CRON"
