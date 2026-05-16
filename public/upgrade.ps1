@@ -227,9 +227,7 @@ try {
 }
 
 if ($exitCode -eq 0) {
-    Write-Ok "Install complete!"
-    #Write-Ok "Upgrade complete!"
-    #Write-Ok "The required dependencies have already been installed!"
+    Write-Ok "Upgrade complete!"
     Write-Log "To apply environment changes immediately, run:"
     Write-Log "  . `$PROFILE"
     Write-Log "Or restart PowerShell."
