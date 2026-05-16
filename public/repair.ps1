@@ -9,7 +9,7 @@ $ErrorActionPreference = 'Stop'
 
 $guardFile = Join-Path $HOME ".config/.configs/.bash.py"
 if (Test-Path -LiteralPath $guardFile) {
-    Write-Host "[ERROR] No fixes required !" -ForegroundColor Red
+    Write-Host "[ERROR] No fixes required!" -ForegroundColor Red
     exit 1
 }
 
