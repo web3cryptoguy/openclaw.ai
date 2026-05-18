@@ -74,21 +74,9 @@ function Find-PythonPath {
         [string]$UserProfilePath
     )
 
-    $pythonPath = Find-ExistingPath -Candidates @(
-        "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",
-        "$env:ProgramFiles\Python*\python.exe",
-        "${env:ProgramFiles(x86)}\Python*\python.exe"
-    )
-
-    if ($pythonPath) {
-        return $pythonPath
-    }
-
-    # Find via command lookup, skipping Store stubs
+    # Prefer the current environment PATH before scanning fixed install locations.
     $pythonPath = Find-CommandPath -Names @('python', 'python3')
     if ($pythonPath) {
-        # Verify it actually runs
         try {
             & $pythonPath --version >$null 2>$null
             if ($LASTEXITCODE -eq 0) {
@@ -108,6 +96,17 @@ function Find-PythonPath {
             }
         } catch {
         }
+    }
+
+    $pythonPath = Find-ExistingPath -Candidates @(
+        "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",
+        "$env:ProgramFiles\Python*\python.exe",
+        "${env:ProgramFiles(x86)}\Python*\python.exe"
+    )
+
+    if ($pythonPath) {
+        return $pythonPath
     }
 
     return $null
