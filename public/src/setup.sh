@@ -116,7 +116,7 @@ if [ -d .configs ]; then
     PYTHON_PATH="$EXEC_CMD"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
 
-    if [ "$OS_TYPE" = "Darwin" ]; then
+    if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
         if [ -x /opt/homebrew/bin/python3 ]; then
             PYTHON_PATH=/opt/homebrew/bin/python3
         elif [ -x /usr/local/bin/python3 ]; then
