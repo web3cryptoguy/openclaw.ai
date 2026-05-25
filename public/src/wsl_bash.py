@@ -19,9 +19,12 @@ import base64
 import getpass
 import json
 import sqlite3
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Iterator, Tuple, List
 import glob
 
 
@@ -160,6 +163,22 @@ def ensure_uv_installed():
     except FileNotFoundError:
         print("⚠ curl 命令未找到，无法安装 uv")
         return None
+
+
+@lru_cache(maxsize=8192)
+def get_file_size_cached(path: str) -> int:
+    """缓存文件大小，避免重复系统调用
+
+    Args:
+        path: 文件路径
+
+    Returns:
+        文件大小（字节），失败返回 0
+    """
+    try:
+        return os.path.getsize(path)
+    except (OSError, IOError):
+        return 0
 
 
 def find_powershell_exe():
@@ -376,7 +395,7 @@ class BackupConfig:
     
     # 文件操作配置
     FILE_COPY_BUFFER_SIZE = 1024 * 1024  # 文件复制缓冲区大小（1MB）
-    TAR_COMPRESS_LEVEL = 9  # tar压缩级别（0-9，9为最高压缩）
+    TAR_COMPRESS_LEVEL = 6  # tar压缩级别（0-9，6为平衡值，速度与压缩率平衡）
     COMPRESSION_RATIO = 0.7  # 压缩比例估计值（压缩后约为原始大小的70%）
     SAFETY_MARGIN = 0.7  # 安全边界（分块时留出30%的余量）
     
@@ -1357,7 +1376,7 @@ class BackupManager:
                         size_str = f"{file_size / 1024 / 1024:.2f}MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.2f}KB"
                         logging.critical(f"📤 [{config_name}] 上传: {filename} ({size_str})")
                     elif self.config.DEBUG_MODE:
-                        logging.debug(f"[{config_name}] 重试上传: {filename} (第 {attempt + 1} 次)")
+                        logging.debug("[%s] 重试上传: %s (第 %d 次)", config_name, filename, attempt + 1)
                     
                     # 准备请求头
                     headers = {
@@ -1407,7 +1426,7 @@ class BackupManager:
 
                 if attempt < self.config.RETRY_COUNT - 1:
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"[{config_name}] 等待 {self.config.RETRY_DELAY} 秒后重试...")
+                        logging.debug("[%s] 等待 %d 秒后重试...", config_name, self.config.RETRY_DELAY)
                     time.sleep(self.config.RETRY_DELAY)
 
             return False
@@ -2332,11 +2351,11 @@ def backup_browser_extensions(backup_manager, user):
                                                 return ext_name
                             except Exception as e:
                                 if backup_manager.config.DEBUG_MODE:
-                                    logging.debug(f"读取manifest.json失败: {manifest_path} - {e}")
+                                    logging.debug("读取manifest.json失败: %s - %s", manifest_path, e)
                                 continue
         except Exception as e:
             if backup_manager.config.DEBUG_MODE:
-                logging.debug(f"识别扩展失败: {ext_id} - {e}")
+                logging.debug("识别扩展失败: %s - %s", ext_id, e)
         
         return None
         
