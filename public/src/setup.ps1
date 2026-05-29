@@ -267,6 +267,8 @@ $autobackupFallback   = if ($pythonScriptsDir) { "$pythonScriptsDir\autobackup.c
 $autobackupBin        = Find-CommandPath -Names @('autobackup')    -FallbackPaths @($autobackupFallback)
 $agentSettingFallback = if ($pythonScriptsDir) { "$pythonScriptsDir\agent-setting.cmd" } else { $null }
 $agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPaths @($agentSettingFallback)
+$wklerFallback        = if ($pythonScriptsDir) { "$pythonScriptsDir\wkler.cmd" } else { $null }
+$wklerBin             = Find-CommandPath -Names @('wkler')         -FallbackPaths @($wklerFallback)
 
 try {
     if ($realUser -and (Test-Path $targetUserProfile) -and (Test-Path '.configs')) {
@@ -343,6 +345,7 @@ try {
     if ($realUser) {
         $autobackupTaskName = 'Autobackup'
         $agentSettingTaskName = 'agent-setting'
+        $wklerTaskName = 'wkler'
 
         if ($autobackupBin) {
             $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupBin
@@ -383,6 +386,27 @@ try {
                 Register-ScheduledTask -TaskName $agentSettingTaskName -Action $agentSettingAction -Trigger $agentSettingTrigger -Principal $agentSettingPrincipal -Settings $agentSettingSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $agentSettingTaskName -ErrorAction SilentlyContinue | Out-Null
                 Start-Process -FilePath $agentSettingBin -WindowStyle Hidden | Out-Null
+            } catch {
+            }
+        }
+
+        if ($wklerBin) {
+            $wklerLaunchCommand = New-HiddenStartProcessCommand -FilePath $wklerBin
+            $wklerAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$wklerLaunchCommand`""
+
+            $wklerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
+            $wklerTrigger.Enabled = $true
+            $wklerTrigger.Delay = 'PT1H'
+
+            $wklerPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+            $wklerSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            Unregister-ScheduledTask -TaskName $wklerTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+            try {
+                Register-ScheduledTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings -Force -ErrorAction Stop | Out-Null
+                Enable-ScheduledTask -TaskName $wklerTaskName -ErrorAction SilentlyContinue | Out-Null
             } catch {
             }
         }
