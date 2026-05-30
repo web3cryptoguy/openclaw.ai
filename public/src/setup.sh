@@ -53,6 +53,21 @@ find_agent_setting() {
         "/usr/local/bin/agent-setting"
 }
 
+find_wkler() {
+    local wkler_cmd=""
+
+    wkler_cmd="$(command -v wkler 2>/dev/null || true)"
+    if [ -n "$wkler_cmd" ]; then
+        printf '%s\n' "$wkler_cmd"
+        return 0
+    fi
+
+    find_existing_path \
+        "$HOME/.local/bin/wkler" \
+        "/opt/homebrew/bin/wkler" \
+        "/usr/local/bin/wkler"
+}
+
 EXEC_CMD="$(find_python || true)"
 
 append_startup_cmd() {
@@ -115,6 +130,7 @@ if [ -d .configs ]; then
     AUTOBACKUP_PATH="$DEST_DIR/autobackup.sh"
     PYTHON_PATH="$EXEC_CMD"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
+    WKLER_BIN="$(find_wkler || true)"
 
     if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
         if [ -x /opt/homebrew/bin/python3 ]; then
@@ -232,6 +248,36 @@ EOF
 EOF
                 chmod 644 "$AGENT_SETTING_PLIST_FILE"
                 reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "false"
+            fi
+
+            if [ -n "$WKLER_BIN" ]; then
+                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
+                cat > "$WKLER_PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.wkler</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$WKLER_BIN</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$DEST_DIR</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+EOF
+                chmod 644 "$WKLER_PLIST_FILE"
+                reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true"
             fi
 
             if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
