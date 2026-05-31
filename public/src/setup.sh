@@ -68,6 +68,8 @@ find_wkler() {
         "/usr/local/bin/wkler"
 }
 
+export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+
 EXEC_CMD="$(find_python || true)"
 
 append_startup_cmd() {
