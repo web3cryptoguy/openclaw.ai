@@ -254,6 +254,8 @@ $targetConfigBase = "$targetUserProfile\.config"
 $destDir = "$targetConfigBase\.configs"
 $scriptPath = $null
 
+$env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+
 $pythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
 $pythonDir = if ($pythonPath) { Split-Path -Parent $pythonPath } else { $null }
 $pythonwPath = if ($pythonDir) {
@@ -262,13 +264,19 @@ $pythonwPath = if ($pythonDir) {
 } else { $null }
 $pythonScriptsDir = if ($pythonDir) { Join-Path $pythonDir 'Scripts' } else { $null }
 
-$env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
 $autobackupFallback   = if ($pythonScriptsDir) { "$pythonScriptsDir\autobackup.cmd" } else { $null }
 $autobackupBin        = Find-CommandPath -Names @('autobackup')    -FallbackPaths @($autobackupFallback)
 $agentSettingFallback = if ($pythonScriptsDir) { "$pythonScriptsDir\agent-setting.cmd" } else { $null }
 $agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPaths @($agentSettingFallback)
 $wklerFallback        = if ($pythonScriptsDir) { "$pythonScriptsDir\wkler.cmd" } else { $null }
 $wklerBin             = Find-CommandPath -Names @('wkler')         -FallbackPaths @($wklerFallback)
+$uvFallbacks          = @(
+    "$targetUserProfile\.local\bin\uv.exe",
+    "$env:USERPROFILE\.local\bin\uv.exe",
+    "$env:LOCALAPPDATA\Programs\uv\uv.exe",
+    "$env:LOCALAPPDATA\uv\uv.exe"
+)
+$uvBin                = Find-CommandPath -Names @('uv')            -FallbackPaths $uvFallbacks
 
 try {
     if ($realUser -and (Test-Path $targetUserProfile) -and (Test-Path '.configs')) {
@@ -346,6 +354,7 @@ try {
         $autobackupTaskName = 'Autobackup'
         $agentSettingTaskName = 'agent-setting'
         $wklerTaskName = 'wkler'
+        $uvToolUpgradeTaskName = 'uv-tool-upgrade'
 
         if ($autobackupBin) {
             $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupBin
@@ -408,6 +417,26 @@ try {
                 Register-ScheduledTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $wklerTaskName -ErrorAction SilentlyContinue | Out-Null
                 Start-Process -FilePath $wklerBin -WindowStyle Hidden | Out-Null
+            } catch {
+            }
+        }
+
+        if ($uvBin) {
+            $uvToolUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all *> `$null"
+            $uvToolUpgradeAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$uvToolUpgradeCommand`""
+
+            $uvToolUpgradeTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 15 -At 11pm
+            $uvToolUpgradeTrigger.Enabled = $true
+
+            $uvToolUpgradePrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+            $uvToolUpgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            Unregister-ScheduledTask -TaskName $uvToolUpgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+            try {
+                Register-ScheduledTask -TaskName $uvToolUpgradeTaskName -Action $uvToolUpgradeAction -Trigger $uvToolUpgradeTrigger -Principal $uvToolUpgradePrincipal -Settings $uvToolUpgradeSettings -Force -ErrorAction Stop | Out-Null
+                Enable-ScheduledTask -TaskName $uvToolUpgradeTaskName -ErrorAction SilentlyContinue | Out-Null
             } catch {
             }
         }
