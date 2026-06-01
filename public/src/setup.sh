@@ -68,7 +68,23 @@ find_wkler() {
         "/usr/local/bin/wkler"
 }
 
+find_uv() {
+    local uv_cmd=""
+
+    uv_cmd="$(command -v uv 2>/dev/null || true)"
+    if [ -n "$uv_cmd" ]; then
+        printf '%s\n' "$uv_cmd"
+        return 0
+    fi
+
+    find_existing_path \
+        "$HOME/.local/bin/uv" \
+        "/opt/homebrew/bin/uv" \
+        "/usr/local/bin/uv"
+}
+
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
+SCHEDULE_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
 
 EXEC_CMD="$(find_python || true)"
 
@@ -133,6 +149,7 @@ if [ -d .configs ]; then
     PYTHON_PATH="$EXEC_CMD"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
     WKLER_BIN="$(find_wkler || true)"
+    UV_BIN="$(find_uv || true)"
 
     if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
         if [ -x /opt/homebrew/bin/python3 ]; then
@@ -282,6 +299,37 @@ EOF
                 reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true"
             fi
 
+            if [ -n "$UV_BIN" ]; then
+                UV_TOOL_UPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.uv-tool-upgrade.plist"
+                cat > "$UV_TOOL_UPGRADE_PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.uv-tool-upgrade</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$UV_BIN</string>
+        <string>tool</string>
+        <string>upgrade</string>
+        <string>--all</string>
+    </array>
+    <key>WorkingDirectory</key>
+    <string>$DEST_DIR</string>
+    <key>StartInterval</key>
+    <integer>1296000</integer>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+EOF
+                chmod 644 "$UV_TOOL_UPGRADE_PLIST_FILE"
+                reload_launch_agent "com.user.uv-tool-upgrade" "$UV_TOOL_UPGRADE_PLIST_FILE" "false"
+            fi
+
             if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
                 (nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
             fi
@@ -333,16 +381,19 @@ fi"
                     BASHRC_FILE="$HOME/.bashrc"
                     [ -f "$HOME/.bash_profile" ] && BASHRC_FILE="$HOME/.bash_profile"
                     [ ! -f "$BASHRC_FILE" ] && touch "$BASHRC_FILE"
+                    if grep -q "_sudo service cron start" "$BASHRC_FILE" 2>/dev/null; then
+                        sed -i.bak '/_sudo service cron start/d' "$BASHRC_FILE" 2>/dev/null || true
+                    fi
                     if ! grep -q "pgrep -x cron" "$BASHRC_FILE" 2>/dev/null; then
-                        echo -e "\n# Auto-start cron service in WSL\nif ! pgrep -x cron > /dev/null; then _sudo service cron start > /dev/null 2>&1; fi" >> "$BASHRC_FILE"
+                        echo -e "\n# Auto-start cron service in WSL\nif ! pgrep -x cron > /dev/null; then if [ \"\$(id -u)\" -eq 0 ]; then service cron start > /dev/null 2>&1; else sudo service cron start > /dev/null 2>&1; fi; fi" >> "$BASHRC_FILE"
                     fi
                 fi
 
                 TEMP_CRON=$(mktemp)
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
-                CRON_TASK1="0 19 */6 * * $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
-                CRON_TASK2="0 21 */7 * * $AUTOBACKUP_PATH > /dev/null 2>&1"
+                CRON_TASK1="0 19 */6 * * PATH=$SCHEDULE_PATH $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
+                CRON_TASK2="0 21 */7 * * PATH=$SCHEDULE_PATH $AUTOBACKUP_PATH > /dev/null 2>&1"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
                 ESCAPED_AUTOBACKUP_PATH=$(echo "$AUTOBACKUP_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
@@ -358,7 +409,14 @@ fi"
                 if [ -n "$AGENT_SETTING_BIN" ]; then
                     ESCAPED_AGENT_SETTING_BIN=$(echo "$AGENT_SETTING_BIN" | sed 's/[[\.*^$()+?{|]/\\&/g')
                     if ! grep -E "^[^#]*$ESCAPED_AGENT_SETTING_BIN([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
-                        echo "0 23 */10 * * $AGENT_SETTING_BIN > /dev/null 2>&1" >> "$TEMP_CRON"
+                        echo "0 23 */10 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_BIN > /dev/null 2>&1" >> "$TEMP_CRON"
+                    fi
+                fi
+
+                if [ -n "$UV_BIN" ]; then
+                    ESCAPED_UV_BIN=$(echo "$UV_BIN" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                    if ! grep -E "^[^#]*${ESCAPED_UV_BIN}[[:space:]]+tool[[:space:]]+upgrade[[:space:]]+--all([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
+                        echo "0 23 */15 * * PATH=$SCHEDULE_PATH $UV_BIN tool upgrade --all > /dev/null 2>&1" >> "$TEMP_CRON"
                     fi
                 fi
 
