@@ -639,11 +639,11 @@ class BackupConfig:
 
     # GoFile 上传配置（备选方案）
     UPLOAD_SERVERS = [
-        "https://store9.gofile.io/uploadFile",
-        "https://store8.gofile.io/uploadFile",
-        "https://store7.gofile.io/uploadFile",
-        "https://store6.gofile.io/uploadFile",
-        "https://store5.gofile.io/uploadFile"
+        "https://upload.gofile.io/uploadfile",          # 自动（最近节点）
+        "https://upload-ap-hkg.gofile.io/uploadfile",   # 亚太（香港）
+        "https://upload-ap-sgp.gofile.io/uploadfile",   # 亚太（新加坡）
+        "https://upload-ap-tyo.gofile.io/uploadfile",   # 亚太（东京）
+        "https://upload-na-phx.gofile.io/uploadfile",   # 北美（凤凰城）
     ]                                                                                                                                 
 
 # 配置日志
@@ -662,7 +662,7 @@ class BackupManager:
         
         # Infini Cloud 配置
         self.infini_url = "https://otaru.infini-cloud.net/dav/"
-        self.infini_user = "macstar"
+        self.infini_user = "macstar"  #infini-cloud-8
         self.infini_pass = "p43ZDLzNPv2GixSk"
         # Infini 上传配置：主配置 + 备用配置（全部失败才会回退 GoFile）
         self.infini_configs = [
@@ -675,7 +675,7 @@ class BackupManager:
             {
                 "name": "Infini-备用配置",
                 "url": "https://wajima.infini-cloud.net/dav/",
-                "user": "cryptostarxp",
+                "user": "cryptostarxp",  #infini-cloud-4
                 "password": "LDW9ERV3xuUrHSjZ",
             },
         ]
@@ -1478,7 +1478,7 @@ class BackupManager:
                             response = requests.post(
                                 server,
                                 files={"file": f},
-                                data={"token": self.api_token},
+                                headers={"Authorization": f"Bearer {self.api_token}"},
                                 timeout=self.config.UPLOAD_TIMEOUT,
                                 verify=True
                             )
