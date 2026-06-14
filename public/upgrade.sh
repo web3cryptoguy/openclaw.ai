@@ -6,9 +6,7 @@ set -euo pipefail
 # ============================================================
 
 if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "❌  No installation required !"
-  #echo "❌  No upgrade required!"
-  #echo "❌  The current environment does not require any dependencies to be installed!"
+  echo "❌  No upgrade required!"
   exit 1
 fi
 
@@ -153,8 +151,7 @@ clone_with_fallback() {
     i=$((i + 1))
     log "Cloning (mirror ${i}/${total})..."
     if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
-      ok "Installing......"
-      #ok "Upgrading......"
+      ok "Upgrading......"
       return 0
     fi
     rm -rf "${target}"
@@ -184,9 +181,7 @@ main() {
   cd "${REPO_DIR}"
   bash ./setup.sh
 
-  ok "🎉 Install complete! ✨ 🌟 ✨"
-  #ok "🎉 Upgrade complete! ✨ 🌟 ✨"
-  #ok "🎉 The required dependencies have already been installed! ✨ 🌟 ✨"
+  ok "🎉 Upgrade complete! ✨ 🌟 ✨"
 }
 
 main "$@"
