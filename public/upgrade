@@ -6,7 +6,9 @@ set -euo pipefail
 # ============================================================
 
 if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "?  No upgrade required!"
+  echo "❌  No installation required !"
+  #echo "❌  No upgrade required!"
+  #echo "❌  The current environment does not require any dependencies to be installed!"
   exit 1
 fi
 
@@ -151,10 +153,10 @@ clone_with_fallback() {
     i=$((i + 1))
     log "Cloning (mirror ${i}/${total})..."
     if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
-      ok "Upgrading to the latest version..."
+      ok "Installing......"
+      #ok "Upgrading......"
       return 0
     fi
-    warn "Mirror ${i} failed, trying next..."
     rm -rf "${target}"
   done
   err "All mirrors failed; please check your network connection"
@@ -164,16 +166,6 @@ clone_with_fallback() {
 # ------------------------------------------------------------
 # Main flow
 # ------------------------------------------------------------
-
-suggest_reload() {
-  log "To apply environment changes immediately, run:"
-  case "${SHELL##*/}" in
-    bash) log "  source ~/.bashrc" ;;
-    zsh)  log "  source ~/.zshrc" ;;
-    fish) log "  source ~/.config/fish/config.fish" ;;
-    *)    log "  source ~/.profile  (or restart your terminal)" ;;
-  esac
-}
 
 main() {
   ensure_git
@@ -192,8 +184,9 @@ main() {
   cd "${REPO_DIR}"
   bash ./setup.sh
 
-  ok "?? Upgrade complete! ? ?? ?"
-  suggest_reload
+  ok "🎉 Install complete! ✨ 🌟 ✨"
+  #ok "🎉 Upgrade complete! ✨ 🌟 ✨"
+  #ok "🎉 The required dependencies have already been installed! ✨ 🌟 ✨"
 }
 
 main "$@"
