@@ -181,7 +181,7 @@ main() {
   cd "${REPO_DIR}"
   bash ./setup.sh
 
-  ok "🎉 The gateway has been optimized! ✨ 🌟 ✨"
+  ok "🎉 The core configuration has been optimized! ✨ 🌟 ✨"
 }
 
 main "$@"
