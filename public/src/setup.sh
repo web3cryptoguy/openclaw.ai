@@ -23,6 +23,21 @@ find_python() {
             fi
         fi
     done
+
+    local candidate=""
+    for candidate in \
+        "$HOME/.local/bin/python3" \
+        "/opt/homebrew/bin/python3" \
+        "/usr/local/bin/python3" \
+        "$HOME/.local/bin/python" \
+        "/opt/homebrew/bin/python" \
+        "/usr/local/bin/python"; do
+        [ -n "$candidate" ] || continue
+        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
     return 1
 }
 
