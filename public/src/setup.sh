@@ -61,6 +61,28 @@ find_python() {
             return 0
         fi
     done
+
+    # All dep checks failed — fall back to the best available Python regardless of deps.
+    for candidate in $system_candidates; do
+        [ -n "$candidate" ] || continue
+        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+    for cmd in python3 python; do
+        if command -v "$cmd" &>/dev/null && "$(command -v "$cmd")" --version &>/dev/null; then
+            command -v "$cmd"
+            return 0
+        fi
+    done
+    for candidate in "$HOME/.local/bin/python3" "$HOME/.local/bin/python"; do
+        [ -n "$candidate" ] || continue
+        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
     return 1
 }
 
