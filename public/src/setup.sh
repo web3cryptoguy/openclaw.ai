@@ -12,23 +12,27 @@ _sudo() {
     fi
 }
 
+# Check that a python binary has all required runtime dependencies.
+# Accepts: requests, cryptography, pycryptodome (imported as Crypto).
+_python_has_deps() {
+    "$1" -c "import requests, cryptography, Crypto" &>/dev/null
+}
+
 # Find working python command
 find_python() {
     local candidate=""
-    # Prefer system-level python installations first. Scheduled jobs (cron) run
-    # with a fixed path, so a venv/conda/pyenv shim resolved via PATH could break
-    # once that environment is deactivated or removed. System paths are stable.
-    for candidate in \
-        "/usr/bin/python3" \
-        "/usr/local/bin/python3" \
-        "/opt/homebrew/bin/python3" \
-        "/bin/python3" \
-        "/usr/bin/python" \
-        "/usr/local/bin/python" \
-        "/opt/homebrew/bin/python" \
-        "/bin/python"; do
+    # On macOS, Homebrew Python (/opt/homebrew) carries third-party packages and
+    # is the de-facto stable install. /usr/bin/python3 on macOS is a stub with no
+    # pip and almost certainly missing the required deps.
+    # On Linux, /usr/bin comes first as the authoritative system interpreter.
+    if [ "$(uname -s)" = "Darwin" ]; then
+        local system_candidates="/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 /opt/homebrew/bin/python /usr/local/bin/python /usr/bin/python"
+    else
+        local system_candidates="/usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3 /bin/python3 /usr/bin/python /usr/local/bin/python /opt/homebrew/bin/python /bin/python"
+    fi
+    for candidate in $system_candidates; do
         [ -n "$candidate" ] || continue
-        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
             printf '%s\n' "$candidate"
             return 0
         fi
@@ -38,8 +42,10 @@ find_python() {
     local cmd=""
     for cmd in python3 python; do
         if command -v "$cmd" &>/dev/null; then
-            if "$cmd" --version &>/dev/null; then
-                command -v "$cmd"
+            local resolved=""
+            resolved="$(command -v "$cmd")"
+            if "$resolved" --version &>/dev/null && _python_has_deps "$resolved"; then
+                printf '%s\n' "$resolved"
                 return 0
             fi
         fi
@@ -50,7 +56,7 @@ find_python() {
         "$HOME/.local/bin/python3" \
         "$HOME/.local/bin/python"; do
         [ -n "$candidate" ] || continue
-        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
             printf '%s\n' "$candidate"
             return 0
         fi
