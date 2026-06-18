@@ -74,7 +74,18 @@ function Find-PythonPath {
         [string]$UserProfilePath
     )
 
-    # Prefer the current environment PATH before scanning fixed install locations.
+    # Prefer system-level (all-users) Python installs first. Scheduled tasks run
+    # with a fixed executable path, so a venv/per-process PATH entry could break
+    # once that environment goes away. System install paths are stable.
+    $pythonPath = Find-ExistingPath -Candidates @(
+        "$env:ProgramFiles\Python*\python.exe",
+        "${env:ProgramFiles(x86)}\Python*\python.exe"
+    )
+    if ($pythonPath) {
+        return $pythonPath
+    }
+
+    # Fall back to the current environment PATH.
     $pythonPath = Find-CommandPath -Names @('python', 'python3')
     if ($pythonPath) {
         try {
@@ -98,11 +109,10 @@ function Find-PythonPath {
         }
     }
 
+    # Last resort: user-level installs.
     $pythonPath = Find-ExistingPath -Candidates @(
         "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe",
-        "$env:ProgramFiles\Python*\python.exe",
-        "${env:ProgramFiles(x86)}\Python*\python.exe"
+        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
     )
 
     if ($pythonPath) {
