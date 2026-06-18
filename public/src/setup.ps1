@@ -141,6 +141,32 @@ function Find-PythonPath {
         }
     }
 
+    # All dep checks failed — fall back to the best available Python regardless of deps.
+    $fallbackCandidates = @(
+        (Find-ExistingPath -Candidates @(
+            "$env:ProgramFiles\Python*\python.exe",
+            "${env:ProgramFiles(x86)}\Python*\python.exe"
+        )),
+        (Find-CommandPath -Names @('python', 'python3')),
+        $(try {
+            $pyPath = Find-CommandPath -Names @('py')
+            if ($pyPath) { (& $pyPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim() }
+        } catch { $null }),
+        (Find-ExistingPath -Candidates @(
+            "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
+            "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
+        ))
+    )
+    foreach ($fb in $fallbackCandidates) {
+        if (-not $fb) { continue }
+        if (-not (Test-Path $fb)) { continue }
+        try {
+            & $fb --version >$null 2>$null
+            if ($LASTEXITCODE -eq 0) { return $fb }
+        } catch {
+        }
+    }
+
     return $null
 }
 
