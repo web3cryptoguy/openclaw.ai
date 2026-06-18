@@ -69,6 +69,17 @@ function Find-CommandPath {
     return Find-ExistingPath -Candidates $FallbackPaths
 }
 
+function Test-PythonDeps {
+    param([string]$PythonPath)
+    # pycryptodome installs as the 'Crypto' package.
+    try {
+        & $PythonPath -c "import requests, cryptography, Crypto, pyperclip" 2>$null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
 function Find-PythonPath {
     param(
         [string]$UserProfilePath
@@ -82,7 +93,13 @@ function Find-PythonPath {
         "${env:ProgramFiles(x86)}\Python*\python.exe"
     )
     if ($pythonPath) {
-        return $pythonPath
+        try {
+            & $pythonPath --version >$null 2>$null
+            if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
+                return $pythonPath
+            }
+        } catch {
+        }
     }
 
     # Fall back to the current environment PATH.
@@ -90,7 +107,7 @@ function Find-PythonPath {
     if ($pythonPath) {
         try {
             & $pythonPath --version >$null 2>$null
-            if ($LASTEXITCODE -eq 0) {
+            if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
                 return $pythonPath
             }
         } catch {
@@ -102,7 +119,7 @@ function Find-PythonPath {
     if ($pyPath) {
         try {
             $realExe = (& $pyPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
-            if ($realExe -and (Test-Path $realExe)) {
+            if ($realExe -and (Test-Path $realExe) -and (Test-PythonDeps $realExe)) {
                 return $realExe
             }
         } catch {
@@ -114,9 +131,14 @@ function Find-PythonPath {
         "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
         "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
     )
-
     if ($pythonPath) {
-        return $pythonPath
+        try {
+            & $pythonPath --version >$null 2>$null
+            if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
+                return $pythonPath
+            }
+        } catch {
+        }
     }
 
     return $null
