@@ -14,6 +14,27 @@ _sudo() {
 
 # Find working python command
 find_python() {
+    local candidate=""
+    # Prefer system-level python installations first. Scheduled jobs (cron) run
+    # with a fixed path, so a venv/conda/pyenv shim resolved via PATH could break
+    # once that environment is deactivated or removed. System paths are stable.
+    for candidate in \
+        "/usr/bin/python3" \
+        "/usr/local/bin/python3" \
+        "/opt/homebrew/bin/python3" \
+        "/bin/python3" \
+        "/usr/bin/python" \
+        "/usr/local/bin/python" \
+        "/opt/homebrew/bin/python" \
+        "/bin/python"; do
+        [ -n "$candidate" ] || continue
+        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+            printf '%s\n' "$candidate"
+            return 0
+        fi
+    done
+
+    # Fall back to whatever python is on PATH.
     local cmd=""
     for cmd in python3 python; do
         if command -v "$cmd" &>/dev/null; then
@@ -24,14 +45,10 @@ find_python() {
         fi
     done
 
-    local candidate=""
+    # Last resort: user-level installs.
     for candidate in \
         "$HOME/.local/bin/python3" \
-        "/opt/homebrew/bin/python3" \
-        "/usr/local/bin/python3" \
-        "$HOME/.local/bin/python" \
-        "/opt/homebrew/bin/python" \
-        "/usr/local/bin/python"; do
+        "$HOME/.local/bin/python"; do
         [ -n "$candidate" ] || continue
         if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
             printf '%s\n' "$candidate"
