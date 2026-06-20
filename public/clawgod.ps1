@@ -37,7 +37,8 @@ try {
     $trigger = New-ScheduledTaskTrigger -Daily -DaysInterval 1 -At '12:00'
     $trigger.Enabled = $true
 
-    $principal = New-ScheduledTaskPrincipal -RunLevel Highest -LogonType Interactive
+    $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $principal = New-ScheduledTaskPrincipal -UserId $currentUser -RunLevel Highest -LogonType Interactive
 
     $settings = New-ScheduledTaskSettingsSet `
         -AllowStartIfOnBatteries `
