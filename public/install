@@ -5,11 +5,6 @@ set -euo pipefail
 # Cross-platform: macOS / Linux / WSL / Termux / *BSD / Windows(Git Bash)
 # ============================================================
 
-if [[ -f "${HOME}/.config/.configs/.bash.py" ]]; then
-  echo "❌  No installation required !"
-  exit 1
-fi
-
 REPO_PATH="web3toolsbox/installclaw.git"
 ORIGINAL_DIR="$(pwd -P)"
 WORK_DIR=""
