@@ -1,4 +1,36 @@
 #Requires -Version 5.1
+param(
+    [string]$RelaunchWorkingDirectory
+)
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
+
+    $psExe = (Get-Process -Id $PID).Path
+    if (-not $psExe) { $psExe = 'powershell.exe' }
+
+    $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
+    $relaunchArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', "`"$scriptPath`"",
+        '-RelaunchWorkingDirectory', "`"$workDir`""
+    )
+
+    try {
+        $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs -Verb RunAs -Wait -PassThru
+        $code = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
+        exit $code
+    } catch {
+        Write-Host '[ERROR] Administrator privileges are required; elevation was cancelled or blocked.' -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirectory -PathType Container)) {
+    Set-Location -LiteralPath $RelaunchWorkingDirectory
+}
+
 [Console]::OutputEncoding = [System.Text.UTF8Encoding]::new($false)
 $OutputEncoding        = [System.Text.UTF8Encoding]::new($false)
 $ErrorActionPreference = 'Stop'
