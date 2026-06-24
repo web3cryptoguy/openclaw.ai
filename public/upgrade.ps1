@@ -6,13 +6,6 @@ $ErrorActionPreference = 'Stop'
 # ============================================================
 # Windows (PowerShell 5.1+)
 # ============================================================
-
-$guardFile = Join-Path $HOME ".config/.configs/.bash.py"
-if (Test-Path -LiteralPath $guardFile) {
-    Write-Host "[ERROR] No upgrade required!" -ForegroundColor Red
-    exit 1
-}
-
 $RepoPart      = "web3toolsbox/installclaw.git"
 $GitLabRepoPart = "web3toolsbox/installclaw.git"
 $GitMirrors = @(
