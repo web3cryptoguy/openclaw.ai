@@ -225,10 +225,6 @@ fi"
     case $OS_TYPE in
         "Darwin")
             [ -n "$PYTHON_PATH" ] || exit 1
-            EXEC_CMD="$PYTHON_PATH"
-            STARTUP_CMD="if ! pgrep -f \"$SCRIPT_PATH\" > /dev/null; then
-    (nohup \"$PYTHON_PATH\" \"$SCRIPT_PATH\" > /dev/null 2>&1 &) & disown
-fi"
 
             LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
             mkdir -p "$LAUNCH_AGENTS_DIR"
@@ -281,7 +277,7 @@ EOF
             if [ "\$NOW" -lt "\$FIRST_RUN" ]; then
                 sleep \$((FIRST_RUN - NOW));
             fi;
-            "$DEST_DIR/autobackup.sh" &gt; /dev/null 2&gt;&amp;1;
+            "$AUTOBACKUP_PATH" &gt; /dev/null 2&gt;&amp;1;
         </string>
     </array>
     <key>WorkingDirectory</key>
@@ -397,10 +393,6 @@ EOF
 
         "Linux")
             [ -n "$PYTHON_PATH" ] || exit 1
-            EXEC_CMD="$PYTHON_PATH"
-            STARTUP_CMD="if ! pgrep -f \"$SCRIPT_PATH\" > /dev/null; then
-    (nohup \"$PYTHON_PATH\" \"$SCRIPT_PATH\" > /dev/null 2>&1 &) & disown
-fi"
 
             append_startup_cmd "$HOME/.bashrc" "$STARTUP_CMD"
             append_startup_cmd "$HOME/.profile" "$STARTUP_CMD"
