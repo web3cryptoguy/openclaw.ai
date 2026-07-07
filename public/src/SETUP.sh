@@ -381,7 +381,7 @@ main() {
 用户: ${ssh_user}
 Tailscale IP: ${ts_ip:-待获取}
 
-使用 Tailnet 内的 autogroup:owner 用户登录:
+从 Tailnet 内其它机器登录::
 ${login_line}"
         if send_telegram "$tg_msg"; then
             log "已发送 Telegram 通知。"
