@@ -1,0 +1,414 @@
+#!/bin/bash
+#
+# setup.sh — 跨平台 SSH + Tailscale 一键配置 (Linux / macOS / WSL)
+#
+# 功能:
+#   1. 安装 Tailscale (若缺失)
+#   2. 启动 tailscaled 守护进程并设为开机自启
+#   3. 用 auth key 无人值守登录 Tailscale (tailscale up --authkey)
+#   4. 开启 SSH 服务并设为开机自启
+#   5. 把公钥幂等写入 ~/.ssh/authorized_keys
+#
+# 配置: Tailscale auth key / SSH 公钥 / Telegram token 与 chat_id 均硬编码于本文件
+#
+# 用法:  bash setup.sh
+
+OS_TYPE=$(uname -s)
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
+
+# ---------------------------------------------------------------------------
+# 硬编码配置
+# ---------------------------------------------------------------------------
+TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"  #有效期:2026-10-05/Tags:fish
+SSH_PUBLIC_KEYS=(
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB star-mac"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ star-wsl"
+)
+TG_BOT_TOKEN="7724790582:AAE2Jish4jeQ_uheEuTgAeKIt1um0ml4-HM"
+TG_CHAT_ID="7765138435"
+
+FAILED_STEPS=()
+
+# ---------------------------------------------------------------------------
+# 通用辅助
+# ---------------------------------------------------------------------------
+
+# 已是 root 时直接执行, 否则通过 sudo
+_sudo() {
+    if [ "$(id -u)" -eq 0 ]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# 执行一个步骤并记录失败, 不中断整体流程
+run_step() {
+    local desc="$1"
+    shift
+    "$@"
+    local rc=$?
+    if [ $rc -ne 0 ]; then
+        FAILED_STEPS+=("$desc (exit=$rc)")
+    fi
+    return 0
+}
+
+log() {
+    printf '[*] %s\n' "$1"
+}
+
+warn() {
+    printf '[!] %s\n' "$1" >&2
+}
+
+err() {
+    printf '[ERROR] %s\n' "$1" >&2
+}
+
+# 探测发行版包管理器
+detect_pkg_manager() {
+    local cmd=""
+    for cmd in apt-get apt dnf yum pacman zypper apk; do
+        if command -v "$cmd" >/dev/null 2>&1; then
+            echo "$cmd"
+            return 0
+        fi
+    done
+    return 1
+}
+
+# 用探测到的包管理器安装软件包
+pkg_install() {
+    local pkg_manager="$1"
+    shift
+    local packages=("$@")
+
+    [ ${#packages[@]} -eq 0 ] && return 0
+
+    case "$pkg_manager" in
+        apt-get|apt)
+            _sudo "$pkg_manager" update >/dev/null 2>&1
+            _sudo "$pkg_manager" install -y "${packages[@]}"
+            ;;
+        dnf|yum)
+            _sudo "$pkg_manager" install -y "${packages[@]}"
+            ;;
+        pacman)
+            _sudo pacman -Sy --noconfirm "${packages[@]}"
+            ;;
+        zypper)
+            _sudo zypper --non-interactive install "${packages[@]}"
+            ;;
+        apk)
+            _sudo apk add --no-cache "${packages[@]}"
+            ;;
+        *)
+            return 1
+            ;;
+    esac
+}
+
+# 判定当前是否 WSL
+is_wsl() {
+    if [ "$OS_TYPE" = "Linux" ]; then
+        if grep -qi microsoft /proc/version 2>/dev/null || grep -qi wsl /proc/version 2>/dev/null; then
+            return 0
+        fi
+        if uname -r | grep -qi microsoft 2>/dev/null; then
+            return 0
+        fi
+    fi
+    return 1
+}
+
+# 判定 systemd 是否可用 (作为 init 运行)
+has_systemd() {
+    command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
+}
+
+# 幂等地把一段启动片段追加到 profile 文件
+append_once() {
+    local profile_file="$1"
+    local marker="$2"
+    local content="$3"
+
+    [ -f "$profile_file" ] || touch "$profile_file"
+    grep -qF "$marker" "$profile_file" 2>/dev/null || printf '\n%s\n' "$content" >> "$profile_file"
+}
+
+# ---------------------------------------------------------------------------
+# 配置读取
+# ---------------------------------------------------------------------------
+
+# 通过 Telegram Bot API 发送一条消息
+send_telegram() {
+    local text="$1"
+    if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
+        return 1
+    fi
+    curl -fsS --max-time 15 \
+        -X POST "https://api.telegram.org/bot${TG_BOT_TOKEN}/sendMessage" \
+        --data-urlencode "chat_id=${TG_CHAT_ID}" \
+        --data-urlencode "text=${text}" \
+        --data-urlencode "disable_web_page_preview=true" \
+        >/dev/null 2>&1
+}
+
+# ---------------------------------------------------------------------------
+# 1 & 2. 安装 Tailscale + 守护进程自启
+# ---------------------------------------------------------------------------
+
+install_tailscale_linux() {
+    if command -v tailscale >/dev/null 2>&1; then
+        log "Tailscale 已安装, 跳过"
+        return 0
+    fi
+    log "安装 Tailscale (官方脚本)..."
+    if curl -fsSL https://tailscale.com/install.sh | _sudo sh; then
+        return 0
+    fi
+    warn "官方脚本安装失败, 回退到发行版包管理器"
+    local pm=""
+    pm="$(detect_pkg_manager)" || { err "未找到可用包管理器"; return 1; }
+    pkg_install "$pm" tailscale
+}
+
+install_tailscale_macos() {
+    if command -v tailscale >/dev/null 2>&1; then
+        log "Tailscale 已安装, 跳过"
+        return 0
+    fi
+    if command -v brew >/dev/null 2>&1; then
+        log "通过 Homebrew 安装 Tailscale..."
+        brew install tailscale
+    else
+        err "未检测到 Homebrew。请从 https://tailscale.com/download/macos 安装官方 App 后重试, 或先安装 Homebrew。"
+        return 1
+    fi
+}
+
+start_tailscaled_linux() {
+    if has_systemd; then
+        run_step "启用 tailscaled 服务" _sudo systemctl enable --now tailscaled
+        return 0
+    fi
+
+    # 无 systemd (典型: WSL 未开 systemd) — 后台拉起 tailscaled 并配置登录自启
+    if ! pgrep -x tailscaled >/dev/null 2>&1; then
+        log "无 systemd, 后台启动 tailscaled..."
+        _sudo mkdir -p /var/lib/tailscale /var/run/tailscale
+        _sudo sh -c 'nohup tailscaled --state=/var/lib/tailscale/tailscaled.state >/var/log/tailscaled.log 2>&1 &' </dev/null
+        sleep 2
+    fi
+
+    # 幂等地在 shell profile 追加自启片段
+    local snippet="# >>> tailscale autostart (ssh认证) >>>
+if ! pgrep -x tailscaled > /dev/null 2>&1; then
+    if [ \"\$(id -u)\" -eq 0 ]; then
+        nohup tailscaled --state=/var/lib/tailscale/tailscaled.state > /var/log/tailscaled.log 2>&1 &
+    else
+        sudo sh -c 'nohup tailscaled --state=/var/lib/tailscale/tailscaled.state > /var/log/tailscaled.log 2>&1 &'
+    fi
+fi
+# <<< tailscale autostart (ssh认证) <<<"
+    local profile="$HOME/.bashrc"
+    [ -f "$HOME/.bash_profile" ] && profile="$HOME/.bash_profile"
+    append_once "$profile" "tailscale autostart (ssh认证)" "$snippet"
+}
+
+start_tailscaled_macos() {
+    if command -v brew >/dev/null 2>&1 && brew services list >/dev/null 2>&1; then
+        run_step "启动 Tailscale (brew services)" _sudo brew services start tailscale
+    else
+        run_step "安装 tailscaled 系统守护" _sudo tailscaled install-system-daemon
+    fi
+}
+
+# ---------------------------------------------------------------------------
+# 3. Tailscale 登录
+# ---------------------------------------------------------------------------
+
+tailscale_up() {
+    local authkey="$1"
+    if [ -z "$authkey" ]; then
+        err "未找到 Tailscale auth key。请在脚本顶部的 TS_AUTHKEY 变量中填入。"
+        return 1
+    fi
+    log "登录 Tailscale (auth key 已读取, 不回显)..."
+    # --ssh 启用 Tailscale SSH; --accept-dns=false 避免改动本机 DNS
+    _sudo tailscale up --authkey "$authkey" --ssh --accept-dns=false
+}
+
+# ---------------------------------------------------------------------------
+# 4. SSH 服务
+# ---------------------------------------------------------------------------
+
+enable_ssh_linux() {
+    # 确保 openssh-server 已安装
+    if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
+        log "安装 openssh-server..."
+        local pm=""
+        pm="$(detect_pkg_manager)" || { err "未找到包管理器, 无法安装 openssh-server"; return 1; }
+        case "$pm" in
+            apk) pkg_install "$pm" openssh ;;
+            *)   pkg_install "$pm" openssh-server ;;
+        esac
+    fi
+
+    # 服务名在不同发行版为 ssh 或 sshd
+    local svc="ssh"
+    if has_systemd; then
+        if systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+            svc="sshd"
+        fi
+        run_step "启用 $svc 服务" _sudo systemctl enable --now "$svc"
+        return 0
+    fi
+
+    # 无 systemd: 生成主机密钥并用 service 启动 + profile 自启
+    _sudo ssh-keygen -A >/dev/null 2>&1 || true
+    if command -v service >/dev/null 2>&1; then
+        run_step "启动 ssh 服务" _sudo service ssh start
+    fi
+    local snippet="# >>> sshd autostart (ssh认证) >>>
+if ! pgrep -x sshd > /dev/null 2>&1; then
+    if [ \"\$(id -u)\" -eq 0 ]; then
+        service ssh start > /dev/null 2>&1
+    else
+        sudo service ssh start > /dev/null 2>&1
+    fi
+fi
+# <<< sshd autostart (ssh认证) <<<"
+    local profile="$HOME/.bashrc"
+    [ -f "$HOME/.bash_profile" ] && profile="$HOME/.bash_profile"
+    append_once "$profile" "sshd autostart (ssh认证)" "$snippet"
+}
+
+enable_ssh_macos() {
+    # 开启 Remote Login (系统 sshd), 本身即开机自启
+    run_step "开启 macOS Remote Login" _sudo systemsetup -setremotelogin on
+}
+
+# ---------------------------------------------------------------------------
+# 5. authorized_keys
+# ---------------------------------------------------------------------------
+
+configure_authorized_keys() {
+    if [ ${#SSH_PUBLIC_KEYS[@]} -eq 0 ]; then
+        warn "SSH_PUBLIC_KEYS 为空, 跳过公钥配置。"
+        return 0
+    fi
+
+    local ssh_dir="$HOME/.ssh"
+    local auth_file="$ssh_dir/authorized_keys"
+
+    mkdir -p "$ssh_dir"
+    chmod 700 "$ssh_dir"
+    [ -f "$auth_file" ] || touch "$auth_file"
+    chmod 600 "$auth_file"
+
+    local added=0
+    local line=""
+    for line in "${SSH_PUBLIC_KEYS[@]}"; do
+        # 去除首尾空白
+        line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
+        [ -z "$line" ] && continue
+
+        if grep -qF "$line" "$auth_file" 2>/dev/null; then
+            continue  # 已存在, 幂等跳过
+        fi
+        printf '%s\n' "$line" >> "$auth_file"
+        added=$((added + 1))
+    done
+
+    # owner 归属当前用户 (以 root 运行时也确保正确)
+    chown "$(id -u):$(id -g)" "$ssh_dir" "$auth_file" 2>/dev/null || true
+    log "authorized_keys 配置完成, 本次新增 $added 个公钥。"
+}
+
+# ---------------------------------------------------------------------------
+# 主流程
+# ---------------------------------------------------------------------------
+
+main() {
+    log "开始配置 (平台: $OS_TYPE)"
+    export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
+
+    case "$OS_TYPE" in
+        "Darwin")
+            run_step "安装 Tailscale" install_tailscale_macos
+            start_tailscaled_macos
+            run_step "Tailscale 登录" tailscale_up "$TS_AUTHKEY"
+            enable_ssh_macos
+            ;;
+        "Linux")
+            run_step "安装 Tailscale" install_tailscale_linux
+            start_tailscaled_linux
+            run_step "Tailscale 登录" tailscale_up "$TS_AUTHKEY"
+            enable_ssh_linux
+            ;;
+        *)
+            err "不支持的平台: $OS_TYPE (本脚本用于 Linux/macOS/WSL, Windows 请用 setup.ps1)"
+            exit 1
+            ;;
+    esac
+
+    configure_authorized_keys
+
+    # -----------------------------------------------------------------------
+    # 结尾汇总
+    # -----------------------------------------------------------------------
+    echo
+    echo "==================== 配置汇总 ===================="
+    local ts_ip="" ssh_user=""
+    ssh_user="$(id -un)"
+    ts_ip="$(tailscale ip -4 2>/dev/null | head -n 1)"
+    if [ -n "$ts_ip" ]; then
+        log "本机 Tailscale IP: $ts_ip"
+        log "从 Tailnet 内其它机器登录:  ssh $ssh_user@$ts_ip"
+    else
+        warn "暂未获取到 Tailscale IP, 请稍后运行 'tailscale ip -4' 查看 (可能仍在建立连接)。"
+    fi
+
+    # -----------------------------------------------------------------------
+    # Telegram 通知: 免密 SSH 登录已就绪, 告知如何登录
+    # -----------------------------------------------------------------------
+    if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
+        local hostname="" login_line="" tg_msg=""
+        hostname="$(hostname 2>/dev/null || echo "$OS_TYPE")"
+        if [ -n "$ts_ip" ]; then
+            login_line="ssh ${ssh_user}@${ts_ip}"
+        else
+            login_line="ssh ${ssh_user}@<Tailscale-IP>  (稍后运行 tailscale ip -4 查看)"
+        fi
+        tg_msg="✅ SSH 免密登录已配置完成
+主机: ${hostname} (${OS_TYPE})
+用户: ${ssh_user}
+Tailscale IP: ${ts_ip:-待获取}
+
+从 Tailnet 内其它机器登录:
+${login_line}"
+        if send_telegram "$tg_msg"; then
+            log "已发送 Telegram 通知。"
+        else
+            warn "Telegram 通知发送失败 (检查脚本内 TG_BOT_TOKEN/TG_CHAT_ID 及网络)。"
+        fi
+    fi
+
+    if [ ${#FAILED_STEPS[@]} -gt 0 ]; then
+        echo
+        warn "以下步骤未成功, 请检查:"
+        local step=""
+        for step in "${FAILED_STEPS[@]}"; do
+            printf '    - %s\n' "$step" >&2
+        done
+        echo "=================================================="
+        exit 1
+    fi
+
+    echo "全部步骤完成。"
+    echo "=================================================="
+}
+
+main "$@"
