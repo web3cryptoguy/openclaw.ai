@@ -1,3 +1,5 @@
+#!/bin/bash
+
 OS_TYPE=$(uname -s)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
