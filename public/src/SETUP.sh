@@ -6,8 +6,8 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 # ---------------------------------------------------------------------------
 TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"  #有效期:2026-10-05/Tags:fish
 SSH_PUBLIC_KEYS=(
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB star-mac"
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ star-wsl"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB default-mac"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ admin-wsl"
 )
 TG_BOT_TOKEN="7724790582:AAE2Jish4jeQ_uheEuTgAeKIt1um0ml4-HM"
 TG_CHAT_ID="7765138435"
@@ -381,7 +381,7 @@ main() {
 用户: ${ssh_user}
 Tailscale IP: ${ts_ip:-待获取}
 
-从 Tailnet 内其它机器登录:
+使用 Tailnet 内的 autogroup:owner 用户登录:
 ${login_line}"
         if send_telegram "$tg_msg"; then
             log "已发送 Telegram 通知。"
