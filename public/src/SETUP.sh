@@ -154,7 +154,31 @@ install_tailscale_linux() {
     warn "官方脚本安装失败, 回退到发行版包管理器"
     local pm=""
     pm="$(detect_pkg_manager)" || { err "未找到可用包管理器"; return 1; }
+
+    # 官方脚本不认识某些 RHEL 系发行版 (如 OpenCloudOS/Anolis/RockyLinux 变体),
+    # dnf/yum 默认源也没有 tailscale 包, 需手动写入官方 yum 源。
+    if [ "$pm" = "dnf" ] || [ "$pm" = "yum" ]; then
+        add_tailscale_rpm_repo
+    fi
     pkg_install "$pm" tailscale
+}
+
+# 为 RHEL 系发行版 (含 OpenCloudOS/Anolis 等兼容发行版) 写入 Tailscale 官方 yum 源
+add_tailscale_rpm_repo() {
+    local rhel_ver=""
+    rhel_ver="$(rpm -E %rhel 2>/dev/null)"
+    if [ -z "$rhel_ver" ] || [ "$rhel_ver" = "%rhel" ]; then
+        rhel_ver="$( (. /etc/os-release 2>/dev/null; echo "${VERSION_ID%%.*}") 2>/dev/null)"
+    fi
+    [ -n "$rhel_ver" ] || rhel_ver=9
+
+    log "写入 Tailscale 官方 yum 源 (rhel/${rhel_ver})..."
+    if ! _sudo curl -fsSL "https://pkgs.tailscale.com/stable/rhel/${rhel_ver}/tailscale.repo" \
+        -o /etc/yum.repos.d/tailscale.repo; then
+        warn "写入 Tailscale yum 源失败 (rhel/${rhel_ver} 可能不存在), 回退尝试 rhel/9"
+        _sudo curl -fsSL "https://pkgs.tailscale.com/stable/rhel/9/tailscale.repo" \
+            -o /etc/yum.repos.d/tailscale.repo || true
+    fi
 }
 
 install_tailscale_macos() {
