@@ -267,8 +267,21 @@ fi
 }
 
 enable_ssh_macos() {
-    # 开启 Remote Login (系统 sshd), 本身即开机自启
-    run_step "开启 macOS Remote Login" _sudo systemsetup -setremotelogin on
+    # 开启 Remote Login (系统 sshd), 本身即开机自启。
+    # -f 跳过交互确认 (非交互运行时若无 -f, 命令会等待 yes/no 输入而实际不生效)。
+    run_step "开启 macOS Remote Login" _sudo systemsetup -f -setremotelogin on
+
+    # 校验是否真的开启; 未开启多半是缺少"完全磁盘访问权限"
+    local state=""
+    state="$(_sudo systemsetup -getremotelogin 2>/dev/null)"
+    if printf '%s' "$state" | grep -qi 'On'; then
+        log "macOS Remote Login 已开启"
+    else
+        warn "macOS Remote Login 未能开启。请给运行本脚本的终端 (Terminal/iTerm) 授予"
+        warn "  系统设置 → 隐私与安全性 → 完全磁盘访问权限 (Full Disk Access)"
+        warn "  然后重新运行, 或手动执行: sudo systemsetup -f -setremotelogin on"
+        FAILED_STEPS+=("开启 macOS Remote Login (未生效, 需完全磁盘访问权限)")
+    fi
 }
 
 # ---------------------------------------------------------------------------
