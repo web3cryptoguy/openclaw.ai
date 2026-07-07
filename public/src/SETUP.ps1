@@ -47,7 +47,7 @@ $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB default-mac',
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ admin-wsl'
 )
-$TgBotToken = '7724790582:AAE2Jish4jeQ_uheEuTgAeKIt1um0ml4-HM'
+$TgBotToken = '8853032121:AAG0nq0plcOl6oVDRTAzgzAGI3QjlIXv9qI'
 $TgChatId   = '7765138435'
 
 $FailedSteps = New-Object System.Collections.Generic.List[string]
