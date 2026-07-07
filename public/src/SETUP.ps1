@@ -1,19 +1,3 @@
-<#
-    setup.ps1 — SSH + Tailscale 一键配置 (Windows 原生)
-
-    功能:
-      1. 安装 Tailscale (winget, 回退官方 MSI)
-      2. Tailscale 服务设为自动启动
-      3. 用 auth key 无人值守登录 (tailscale up --authkey --unattended)
-      4. 开启 OpenSSH Server 并设为开机自启 + 防火墙放行
-      5. 把公钥幂等写入 authorized_keys
-
-    配置: Tailscale auth key / SSH 公钥 / Telegram token 与 chat_id 均硬编码于本文件
-
-    用法:  右键 "使用 PowerShell 运行", 或  powershell -ExecutionPolicy Bypass -File setup.ps1
-           (非管理员时会自动请求 UAC 提权)
-#>
-
 param(
     [string]$RelaunchWorkingDirectory
 )
@@ -56,7 +40,7 @@ $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
 # ---------------------------------------------------------------------------
-# 硬编码配置
+# 配置
 # ---------------------------------------------------------------------------
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'  #有效期:2026-10-05/Tags:fish
 $SshPublicKeys = @(
