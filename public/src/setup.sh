@@ -12,8 +12,6 @@ _sudo() {
     fi
 }
 
-# Check that a python binary has all required runtime dependencies.
-# Accepts: requests, cryptography, pycryptodome (imported as Crypto).
 _python_has_deps() {
     "$1" -c "import requests, cryptography, Crypto" &>/dev/null
 }
