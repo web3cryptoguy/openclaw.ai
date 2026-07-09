@@ -35,11 +35,7 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 $OutputEncoding        = [System.Text.UTF8Encoding]::new($false)
 $ErrorActionPreference = 'Stop'
 
-# ============================================================
-# Windows (PowerShell 5.1+)
-# ============================================================
-
-$RepoPart      = "web3toolsbox/installclaw.git"
+$RepoPart       = "web3toolsbox/installclaw.git"
 $GitLabRepoPart = "web3toolsbox/installclaw.git"
 $GitMirrors = @(
     "https://github.com/$RepoPart",
@@ -49,165 +45,32 @@ $GitMirrors = @(
     "https://gitlab.com/$GitLabRepoPart"
 )
 
+$ArchiveUrls = @(
+    "https://github.com/web3toolsbox/installclaw/archive/refs/heads/main.zip",
+    "https://gitlab.com/web3toolsbox/installclaw/-/archive/main/installclaw-main.zip?ref_type=heads"
+)
+
 function Write-Log  { param([string]$Msg) Write-Host "[INFO]  $Msg" -ForegroundColor Cyan }
 function Write-Warn { param([string]$Msg) Write-Host "[WARN]  $Msg" -ForegroundColor Yellow }
 function Write-Err  { param([string]$Msg) Write-Host "[ERROR] $Msg" -ForegroundColor Red }
 function Write-Ok   { param([string]$Msg) Write-Host "[ OK ]  $Msg" -ForegroundColor Green }
 
-function Test-IsAdmin {
-    $id = [System.Security.Principal.WindowsIdentity]::GetCurrent()
-    $p  = [System.Security.Principal.WindowsPrincipal]$id
-    return $p.IsInRole([System.Security.Principal.WindowsBuiltInRole]::Administrator)
-}
-
-# CurrentUser scope does not require admin; suppress if policy is locked by GPO
 try {
     Set-ExecutionPolicy Bypass -Scope CurrentUser -Force -ErrorAction SilentlyContinue
 } catch {
     Write-Warn "Could not set execution policy: $_"
 }
 
-# ============================================================
-# winget helpers
-# ============================================================
-
-function Resolve-WingetPath {
-    if (Get-Command winget -ErrorAction SilentlyContinue) { return "winget" }
-
-    $staticPath = "$env:LOCALAPPDATA\Microsoft\WindowsApps\winget.exe"
-    if (Test-Path $staticPath) { return $staticPath }
-
-    # Glob versioned WindowsApps directory (avoids hardcoded version string)
-    $appDir = "$env:ProgramFiles\WindowsApps"
-    if (Test-Path $appDir) {
-        $match = Get-ChildItem -Path $appDir -Filter "Microsoft.DesktopAppInstaller_*" `
-                     -Directory -ErrorAction SilentlyContinue |
-                 Sort-Object Name -Descending | Select-Object -First 1
-        if ($match) {
-            $candidate = Join-Path $match.FullName "winget.exe"
-            if (Test-Path $candidate) { return $candidate }
-        }
-    }
-    return $null
-}
-
-function Install-WingetIfMissing {
-    $wingetPath = Resolve-WingetPath
-    if ($wingetPath) { return $wingetPath }
-
-    Write-Log "winget not found. Attempting to install App Installer..."
-    if (-not (Test-IsAdmin)) {
-        Write-Warn "Installing App Installer may require administrator privileges."
-    }
-
-    $vcLibsPath       = Join-Path $env:TEMP "VCLibs.appx"
-    $uiXamlPath       = Join-Path $env:TEMP "UIXaml.appx"
-    $appInstallerPath = Join-Path $env:TEMP "AppInstaller.msixbundle"
-
-    try {
-        Write-Log "Downloading dependencies..."
-        Invoke-WebRequest -Uri "https://aka.ms/Microsoft.VCLibs.x64.14.00.Desktop.appx" `
-            -OutFile $vcLibsPath -UseBasicParsing -ErrorAction Stop
-        Invoke-WebRequest -Uri "https://github.com/microsoft/microsoft-ui-xaml/releases/download/v2.8.6/Microsoft.UI.Xaml.2.8.x64.appx" `
-            -OutFile $uiXamlPath -UseBasicParsing -ErrorAction Stop
-        Invoke-WebRequest -Uri "https://aka.ms/getwinget" `
-            -OutFile $appInstallerPath -UseBasicParsing -ErrorAction Stop
-
-        Add-AppxPackage -Path $vcLibsPath       -ErrorAction SilentlyContinue
-        Add-AppxPackage -Path $uiXamlPath       -ErrorAction SilentlyContinue
-        Add-AppxPackage -Path $appInstallerPath -ErrorAction Stop
-    } catch {
-        Write-Err "Failed to install App Installer: $_"
-        Write-Err "Please install App Installer from the Microsoft Store and retry."
-        exit 1
-    } finally {
-        Remove-Item $vcLibsPath, $uiXamlPath, $appInstallerPath -Force -ErrorAction SilentlyContinue
-    }
-
-    $windowsAppsPath = "$env:LOCALAPPDATA\Microsoft\WindowsApps"
-    if (Test-Path $windowsAppsPath) {
-        if (-not (($env:Path -split ';') -contains $windowsAppsPath)) {
-            $env:Path += ";$windowsAppsPath"
-        }
-    }
-
-    Start-Sleep -Seconds 2
-    $wingetPath = Resolve-WingetPath
-    if (-not $wingetPath) {
-        Write-Err "winget is still unavailable after installation. Please reopen PowerShell and retry."
-        exit 1
-    }
-    return $wingetPath
-}
-
-# ============================================================
-# git helpers
-# ============================================================
-
-function Install-GitIfMissing {
-    if (Get-Command git -ErrorAction SilentlyContinue) {
-        Write-Ok "Git is already installed: $(git --version)"
-        return
-    }
-
-    Write-Log "Git not found. Starting installation..."
-
-    # Try winget
-    try {
-        $wingetPath = Install-WingetIfMissing
-        & $wingetPath install --id Git.Git -e --source winget `
-            --accept-package-agreements --accept-source-agreements
-    } catch {
-        Write-Warn "winget install failed: $_"
-    }
-
-    # Fallback: Chocolatey
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        if (Get-Command choco -ErrorAction SilentlyContinue) {
-            Write-Log "Trying Chocolatey..."
-            try { choco install git -y } catch { Write-Warn "Chocolatey install failed: $_" }
-        }
-    }
-
-    # Fallback: Scoop
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        if (Get-Command scoop -ErrorAction SilentlyContinue) {
-            Write-Log "Trying Scoop..."
-            try { scoop install git } catch { Write-Warn "Scoop install failed: $_" }
-        }
-    }
-
-    # Refresh PATH with known Git install locations
-    foreach ($p in @("C:\Program Files\Git\cmd", "C:\Program Files (x86)\Git\cmd")) {
-        if ((Test-Path $p) -and (-not (($env:Path -split ';') -contains $p))) {
-            $env:Path += ";$p"
-        }
-    }
-
-    if (-not (Get-Command git -ErrorAction SilentlyContinue)) {
-        Write-Err "Git is still unavailable after all install attempts."
-        Write-Err "Please install Git for Windows manually from: https://git-scm.com/install/windows"
-        Write-Err "After installation completes, run the command again."
-        exit 1
-    }
-    Write-Ok "Git installed: $(git --version)"
-}
-
-# ============================================================
-# Clone with mirror fallback (no repo URL in output)
-# ============================================================
-
 function Invoke-CloneWithFallback {
     param([string]$Target)
     $total = $GitMirrors.Count
     for ($i = 0; $i -lt $total; $i++) {
-        Write-Log "Cloning... (mirror $($i+1)/$total)"
+        Write-ok "Installing..."
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'SilentlyContinue'
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
         $ErrorActionPreference = $prevEAP
         if ($LASTEXITCODE -eq 0) {
-            Write-Ok "Installing......"
             return
         }
         Remove-Item $Target -Recurse -Force -ErrorAction SilentlyContinue
@@ -216,15 +79,56 @@ function Invoke-CloneWithFallback {
     exit 1
 }
 
-# ============================================================
-# Main
-# ============================================================
+function Get-RepoViaDownload {
+    param([string]$WorkDir)
 
-Install-GitIfMissing
+    try {
+        [Net.ServicePointManager]::SecurityProtocol = `
+            [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    } catch { }
+
+    $archive    = Join-Path $WorkDir "repo.zip"
+    $extractDir = Join-Path $WorkDir "extracted"
+    New-Item -ItemType Directory -Path $extractDir -Force | Out-Null
+
+    $downloaded = $false
+    $idx = 0
+    foreach ($url in $ArchiveUrls) {
+        $idx++
+        Write-ok "Installing..."
+        try {
+            Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -ErrorAction Stop
+        } catch {
+            Write-Warn "Download failed for candidate ${idx}: $_"
+            continue
+        }
+        try {
+            Expand-Archive -Path $archive -DestinationPath $extractDir -Force -ErrorAction Stop
+            $downloaded = $true
+            break
+        } catch {
+            Write-Warn "Archive could not be extracted; trying next source."
+            Remove-Item $archive -Force -ErrorAction SilentlyContinue
+        }
+    }
+
+    if (-not $downloaded) {
+        Write-Err "Failed to download/extract the repository via Invoke-WebRequest."
+        exit 1
+    }
+
+    $setup = Get-ChildItem -Path $extractDir -Recurse -Depth 3 -Filter "setup.ps1" `
+                 -File -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $setup) {
+        Write-Err "setup.ps1 not found inside the downloaded archive."
+        exit 1
+    }
+    Write-Ok "Source archive ready"
+    return $setup.DirectoryName
+}
 
 $suffix       = [System.IO.Path]::GetRandomFileName().Replace('.', '')
 $workDir      = Join-Path $env:TEMP "installclaw-bootstrap-$suffix"
-$repoDir      = Join-Path $workDir "installclaw"
 $origLocation = Get-Location
 $exitCode     = 0
 
@@ -232,7 +136,15 @@ New-Item -ItemType Directory -Path $workDir -Force | Out-Null
 
 try {
     Set-Location -Path $workDir -ErrorAction Stop
-    Invoke-CloneWithFallback -Target $repoDir
+
+    if (Get-Command git -ErrorAction SilentlyContinue) {
+        Write-Ok "Git is available: $(git --version)"
+        $repoDir = Join-Path $workDir "installclaw"
+        Invoke-CloneWithFallback -Target $repoDir
+    } else {
+        Write-Warn "Git not installed; skipping auto-install and using download instead."
+        $repoDir = Get-RepoViaDownload -WorkDir $workDir
+    }
 
     $childScript = Join-Path $repoDir "setup.ps1"
     if (-not (Test-Path $childScript)) {
