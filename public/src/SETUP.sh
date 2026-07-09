@@ -289,7 +289,10 @@ tailscale_up() {
     fi
     log "登录 Tailscale (auth key 已读取, 不回显)..."
     # --ssh 启用 Tailscale SSH; --accept-dns=false 避免改动本机 DNS
-    _sudo tailscale up --authkey "$authkey" --ssh --accept-dns=false
+    # --accept-risk=lose-ssh: 当前若正通过 SSH 连接, 启用 Tailscale SSH 会警告
+    #   "可能断开当前会话" 并默认中止 (aborted, no changes made)。无人值守脚本
+    #   必须显式跳过该护栏; 常规 sshd 已同时启用, 会话即便断开也可重连。
+    _sudo tailscale up --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
 }
 
 # ---------------------------------------------------------------------------
