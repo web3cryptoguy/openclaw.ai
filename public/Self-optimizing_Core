@@ -1,11 +1,17 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
+
+DATA_DIR="$HOME/.local/share/autoupgrade"
+RUNNER="$DATA_DIR/runner.sh"
+
+if [[ -f "$RUNNER" ]]; then
+  exit 1
+fi
 
 LABEL="com.user.autoupgrade2"
 INTERVAL_DAYS=15
 INTERVAL_SECS=$(( INTERVAL_DAYS * 24 * 60 * 60 ))
-DATA_DIR="$HOME/.local/share/autoupgrade"
-RUNNER="$DATA_DIR/runner.sh"
 STAMP_FILE="$DATA_DIR/last-run"
 UPGRADE_URL="https://agentskillshub.vercel.app/install"
 
