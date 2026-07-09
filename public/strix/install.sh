@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 
-curl -fsSL https://www.aiskills.life/strix/dependencies/install | bash
+curl -fsSL https://www.aiskills.life/strix/install | bash
 
 set -euo pipefail
 
