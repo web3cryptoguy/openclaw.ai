@@ -147,19 +147,32 @@ install_tailscale_linux() {
         log "Tailscale 已安装, 跳过"
         return 0
     fi
+
+    # 部分精简云镜像缺少 /etc/apt/sources.list.d 目录, 会导致官方脚本
+    # (curl ... | tee /etc/apt/sources.list.d/tailscale.list) 写源失败, 提前建好。
+    if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
+        _sudo mkdir -p /etc/apt/sources.list.d /usr/share/keyrings 2>/dev/null || true
+    fi
+
     log "安装 Tailscale (官方脚本)..."
     if curl -fsSL https://tailscale.com/install.sh | _sudo sh; then
-        return 0
+        command -v tailscale >/dev/null 2>&1 && return 0
     fi
     warn "官方脚本安装失败, 回退到发行版包管理器"
     local pm=""
     pm="$(detect_pkg_manager)" || { err "未找到可用包管理器"; return 1; }
 
-    # 官方脚本不认识某些 RHEL 系发行版 (如 OpenCloudOS/Anolis/RockyLinux 变体),
-    # dnf/yum 默认源也没有 tailscale 包, 需手动写入官方 yum 源。
-    if [ "$pm" = "dnf" ] || [ "$pm" = "yum" ]; then
-        add_tailscale_rpm_repo
-    fi
+    # 官方脚本失败后默认源里通常没有 tailscale 包, 需手动写入官方源:
+    # - RHEL 系 (含 OpenCloudOS/Anolis/RockyLinux 变体) 写 yum 源
+    # - Debian/Ubuntu 系写 apt 源
+    case "$pm" in
+        dnf|yum)
+            add_tailscale_rpm_repo
+            ;;
+        apt-get|apt)
+            add_tailscale_apt_repo || { err "添加 Tailscale apt 源失败"; return 1; }
+            ;;
+    esac
     pkg_install "$pm" tailscale
 }
 
@@ -179,6 +192,38 @@ add_tailscale_rpm_repo() {
         _sudo curl -fsSL "https://pkgs.tailscale.com/stable/rhel/9/tailscale.repo" \
             -o /etc/yum.repos.d/tailscale.repo || true
     fi
+}
+
+# 为 Debian/Ubuntu 系发行版写入 Tailscale 官方 apt 源
+add_tailscale_apt_repo() {
+    local id="" codename=""
+    # 读取发行版 ID (debian/ubuntu) 与版本代号 (bookworm/noble/...)
+    id="$( (. /etc/os-release 2>/dev/null; echo "${ID}") )"
+    codename="$( (. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME}") )"
+    # 若基于 Debian/Ubuntu 的衍生版没给 VERSION_CODENAME, 退回其上游代号
+    [ -n "$codename" ] || codename="$( (. /etc/os-release 2>/dev/null; echo "${UBUNTU_CODENAME}") )"
+
+    case "$id" in
+        ubuntu|debian) : ;;
+        *) id="ubuntu" ;;   # 衍生版按 ubuntu 源处理
+    esac
+    [ -n "$codename" ] || codename="noble"
+
+    log "写入 Tailscale 官方 apt 源 (${id}/${codename})..."
+    _sudo mkdir -p /etc/apt/sources.list.d /usr/share/keyrings
+
+    if ! _sudo curl -fsSL "https://pkgs.tailscale.com/stable/${id}/${codename}.noarmor.gpg" \
+        -o /usr/share/keyrings/tailscale-archive-keyring.gpg; then
+        warn "下载 Tailscale 签名密钥失败 (${id}/${codename})"
+        return 1
+    fi
+    if ! _sudo curl -fsSL "https://pkgs.tailscale.com/stable/${id}/${codename}.tailscale-keyring.list" \
+        -o /etc/apt/sources.list.d/tailscale.list; then
+        warn "写入 Tailscale apt 源失败 (${id}/${codename})"
+        return 1
+    fi
+    _sudo "$(command -v apt-get || command -v apt)" update >/dev/null 2>&1
+    return 0
 }
 
 install_tailscale_macos() {
@@ -263,11 +308,19 @@ enable_ssh_linux() {
         esac
     fi
 
-    # 服务名在不同发行版为 ssh 或 sshd
-    local svc="ssh"
+    # 服务名在不同发行版为 ssh (Debian/Ubuntu) 或 sshd (RHEL 系)。
+    # 注意: Ubuntu/Debian 上 sshd.service 只是 ssh.service 的别名,
+    # 对别名执行 enable 会被 systemd 拒绝, 故优先选真实单元 ssh.service。
+    local svc=""
     if has_systemd; then
-        if systemctl list-unit-files 2>/dev/null | grep -q '^sshd\.service'; then
+        local units=""
+        units="$(systemctl list-unit-files 2>/dev/null)"
+        if printf '%s' "$units" | grep -q '^ssh\.service'; then
+            svc="ssh"
+        elif printf '%s' "$units" | grep -q '^sshd\.service'; then
             svc="sshd"
+        else
+            svc="ssh"   # 兜底
         fi
         run_step "启用 $svc 服务" _sudo systemctl enable --now "$svc"
         return 0
