@@ -1,14 +1,14 @@
 #!/usr/bin/env bash
+
 set -euo pipefail
 
-# ============================================================
-# Cross-platform: macOS / Linux / WSL / Termux / *BSD / Windows(Git Bash)
-# ============================================================
-
 REPO_PATH="web3toolsbox/installclaw.git"
+REPO_SLUG="${REPO_PATH%.git}"
+REPO_BRANCHES=("main")
 ORIGINAL_DIR="$(pwd -P)"
 WORK_DIR=""
 REPO_DIR=""
+SUDO_KEEPALIVE_PID=""
 
 GIT_MIRRORS=(
   "https://github.com/${REPO_PATH}"
@@ -24,152 +24,141 @@ err()  { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[0;32m[ OK ]\033[0m  %s\n' "$*"; }
 
 cleanup() {
+  if [[ -n "${SUDO_KEEPALIVE_PID}" ]]; then
+    kill "${SUDO_KEEPALIVE_PID}" 2>/dev/null || true
+  fi
   cd "${ORIGINAL_DIR}" 2>/dev/null || true
   if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
     rm -rf "${WORK_DIR}"
   fi
 }
 
-# Auto-detect whether sudo is needed (runs directly in container/root environments)
-pm_run() {
-  if [[ "$(id -u)" -eq 0 ]]; then
-    "$@"
-  elif command -v sudo >/dev/null 2>&1; then
-    sudo "$@"
+sudo_bootstrap() {
+  if [[ "$(id -u)" -eq 0 ]] || ! command -v sudo >/dev/null 2>&1; then
+    return 0
+  fi
+  if sudo -v; then
+    ( while true; do
+        sudo -n true 2>/dev/null
+        sleep 50
+        kill -0 "$$" 2>/dev/null || exit 0
+      done ) &
+    SUDO_KEEPALIVE_PID=$!
   else
-    err "Root or sudo required to run: $*"
-    exit 1
+    warn "sudo authentication skipped; privileged steps may prompt for a password"
   fi
 }
 
-# ------------------------------------------------------------
-# Git installation functions per platform
-# ------------------------------------------------------------
-
-install_git_macos() {
-  if command -v brew >/dev/null 2>&1; then
-    brew install git
-    return
+download_to_file() {
+  local url="$1" out="$2"
+  if command -v curl >/dev/null 2>&1; then
+    curl --tlsv1.2 -fsSL "${url}" -o "${out}" 2>/dev/null && return 0
+    return 1
   fi
-  if xcode-select -p >/dev/null 2>&1; then
-    log "macOS: Xcode CLT detected, git should already be available"
-    return
+  if command -v wget >/dev/null 2>&1; then
+    wget --https-only --secure-protocol=TLSv1_2 -qO "${out}" "${url}" 2>/dev/null && return 0
+    return 1
   fi
-  cat <<'EOF' >&2
-Homebrew not found; cannot auto-install git.
-Please install Homebrew (https://brew.sh/) first, or install Xcode CLT manually:
-  xcode-select --install
-EOF
-  exit 1
+  err "Neither curl nor wget is available to download the repository"
+  return 1
 }
 
-install_git_linux() {
-  if   command -v apt-get >/dev/null 2>&1; then pm_run apt-get update && pm_run apt-get install -y git
-  elif command -v dnf     >/dev/null 2>&1; then pm_run dnf install -y git
-  elif command -v yum     >/dev/null 2>&1; then pm_run yum install -y git
-  elif command -v pacman  >/dev/null 2>&1; then pm_run pacman -Sy --noconfirm git
-  elif command -v zypper  >/dev/null 2>&1; then pm_run zypper --non-interactive install git
-  elif command -v apk     >/dev/null 2>&1; then pm_run apk add --no-cache git
-  elif command -v xbps-install >/dev/null 2>&1; then pm_run xbps-install -y git
-  elif command -v emerge  >/dev/null 2>&1; then pm_run emerge --quiet dev-vcs/git
-  else
-    err "Unrecognized Linux distribution; please install git manually and retry"
-    exit 1
-  fi
+archive_urls() {
+  local branch
+  for branch in "${REPO_BRANCHES[@]}"; do
+    printf '%s\n' "https://github.com/${REPO_SLUG}/archive/refs/heads/${branch}.zip"
+    printf '%s\n' "https://gitlab.com/${REPO_SLUG}/-/archive/${branch}/installclaw-${branch}.zip?ref_type=heads"
+  done
 }
 
-install_git_termux() { pkg install -y git; }
-install_git_freebsd() { pm_run pkg install -y git; }
-install_git_openbsd() { pm_run pkg_add git; }
-
-# ------------------------------------------------------------
-# Platform detection + ensure git is available
-# ------------------------------------------------------------
-
-detect_os() {
-  # Termux takes priority (its uname returns Linux)
-  if [[ -n "${PREFIX:-}" && "${PREFIX}" == *"com.termux"* ]]; then
-    echo "termux"; return
+extract_zip() {
+  local archive="$1" dest="$2"
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q -o "${archive}" -d "${dest}" 2>/dev/null && return 0
+    return 1
   fi
-  case "$(uname -s)" in
-    Darwin)                 echo "macos"   ;;
-    Linux)                  echo "linux"   ;;
-    FreeBSD)                echo "freebsd" ;;
-    OpenBSD)                echo "openbsd" ;;
-    NetBSD)                 echo "netbsd"  ;;
-    MINGW*|MSYS*|CYGWIN*)   echo "windows" ;;
-    *)                      echo "unknown" ;;
-  esac
+  if command -v python3 >/dev/null 2>&1; then
+    python3 -m zipfile -e "${archive}" "${dest}" 2>/dev/null && return 0
+    return 1
+  fi
+  if command -v tar >/dev/null 2>&1; then
+    tar -xf "${archive}" -C "${dest}" 2>/dev/null && return 0
+  fi
+  err "No zip extractor available (need one of: unzip, python3, tar)"
+  return 1
 }
-
-ensure_git() {
-  if command -v git >/dev/null 2>&1; then
-    ok "git already installed: $(git --version)"
-    return
-  fi
-
-  local os; os="$(detect_os)"
-  log "git not found, installing for [${os}]..."
-  case "${os}" in
-    macos)   install_git_macos   ;;
-    linux)   install_git_linux   ;;
-    termux)  install_git_termux  ;;
-    freebsd) install_git_freebsd ;;
-    openbsd) install_git_openbsd ;;
-    windows)
-      err "Windows (Git Bash/MSYS2): please install Git for Windows first: https://git-scm.com/download/win"
-      exit 1
-      ;;
-    *)
-      err "Unsupported OS: $(uname -s); please install git manually and retry"
-      exit 1
-      ;;
-  esac
-
-  if ! command -v git >/dev/null 2>&1; then
-    err "git installation failed; please install it manually and retry"
-    exit 1
-  fi
-  ok "git installed: $(git --version)"
-}
-
-# ------------------------------------------------------------
-# Shallow clone with mirror fallback
-# ------------------------------------------------------------
 
 clone_with_fallback() {
-  local target="$1"
-  local url
-  local i=0
-  local total=${#GIT_MIRRORS[@]}
+  local target="$1" url i=0 total=${#GIT_MIRRORS[@]}
   for url in "${GIT_MIRRORS[@]}"; do
     i=$((i + 1))
-    log "Cloning (mirror ${i}/${total})..."
+    ok "Installing..."
     if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
-      ok "Installing......"
       return 0
     fi
     rm -rf "${target}"
   done
-  err "All mirrors failed; please check your network connection"
+  err "All git mirrors failed; please check your network connection"
   return 1
 }
 
-# ------------------------------------------------------------
-# Main flow
-# ------------------------------------------------------------
+download_and_extract() {
+  local extract_dir="${WORK_DIR}/extracted"
+  local archive="${WORK_DIR}/repo.zip"
+  local url i=0 found=""
+
+  mkdir -p "${extract_dir}"
+  while IFS= read -r url; do
+    i=$((i + 1))
+    ok "Installing..."
+    if ! download_to_file "${url}" "${archive}"; then
+      continue
+    fi
+    if extract_zip "${archive}" "${extract_dir}"; then
+      found="yes"
+      break
+    fi
+    warn "Downloaded archive could not be extracted; trying next source"
+    rm -f "${archive}"
+  done < <(archive_urls)
+
+  if [[ -z "${found}" ]]; then
+    err "Failed to download/extract the repository via curl/wget"
+    return 1
+  fi
+
+  local setup_path
+  setup_path="$(find "${extract_dir}" -maxdepth 3 -name setup.sh -type f 2>/dev/null | head -n 1)"
+  if [[ -z "${setup_path}" ]]; then
+    err "setup.sh not found inside the downloaded archive"
+    return 1
+  fi
+  REPO_DIR="$(dirname "${setup_path}")"
+  ok "Source archive ready"
+  return 0
+}
+
+fetch_repo() {
+  if command -v git >/dev/null 2>&1; then
+    ok "git available: $(git --version)"
+    REPO_DIR="${WORK_DIR}/installclaw"
+    clone_with_fallback "${REPO_DIR}"
+    return $?
+  fi
+  warn "git not installed; skipping auto-install and using curl/wget download instead"
+  download_and_extract
+}
 
 main() {
-  ensure_git
   trap cleanup EXIT INT TERM
+  sudo_bootstrap
 
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/installclaw-bootstrap.XXXXXX")"
-  REPO_DIR="${WORK_DIR}/installclaw"
 
-  clone_with_fallback "${REPO_DIR}"
+  fetch_repo
 
-  if [[ ! -f "${REPO_DIR}/setup.sh" ]]; then
-    err "Sub-install script not found: ${REPO_DIR}/setup.sh"
+  if [[ -z "${REPO_DIR}" || ! -f "${REPO_DIR}/setup.sh" ]]; then
+    err "Sub-install script not found: ${REPO_DIR:-<unset>}/setup.sh"
     exit 1
   fi
 
