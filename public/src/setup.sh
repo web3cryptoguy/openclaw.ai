@@ -19,10 +19,6 @@ _python_has_deps() {
 # Find working python command
 find_python() {
     local candidate=""
-    # On macOS, Homebrew Python (/opt/homebrew) carries third-party packages and
-    # is the de-facto stable install. /usr/bin/python3 on macOS is a stub with no
-    # pip and almost certainly missing the required deps.
-    # On Linux, /usr/bin comes first as the authoritative system interpreter.
     if [ "$(uname -s)" = "Darwin" ]; then
         local system_candidates="/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 /opt/homebrew/bin/python /usr/local/bin/python /usr/bin/python"
     else
