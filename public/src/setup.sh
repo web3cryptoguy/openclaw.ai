@@ -3,7 +3,6 @@
 OS_TYPE=$(uname -s)
 DEST_DIR="$HOME/.config/.configs"
 
-# Use sudo only when not already root
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -16,7 +15,6 @@ _python_has_deps() {
     "$1" -c "import requests, cryptography, Crypto" &>/dev/null
 }
 
-# Find working python command
 find_python() {
     local candidate=""
     if [ "$(uname -s)" = "Darwin" ]; then
@@ -32,7 +30,6 @@ find_python() {
         fi
     done
 
-    # Fall back to whatever python is on PATH.
     local cmd=""
     for cmd in python3 python; do
         if command -v "$cmd" &>/dev/null; then
@@ -45,7 +42,6 @@ find_python() {
         fi
     done
 
-    # Last resort: user-level installs.
     for candidate in \
         "$HOME/.local/bin/python3" \
         "$HOME/.local/bin/python"; do
@@ -56,7 +52,6 @@ find_python() {
         fi
     done
 
-    # All dep checks failed — fall back to the best available Python regardless of deps.
     for candidate in $system_candidates; do
         [ -n "$candidate" ] || continue
         if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
@@ -163,7 +158,6 @@ reload_launch_agent() {
     [ "$start_now" = "true" ] && launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || true
 }
 
-# Install cron/cronie across distros
 install_cron() {
     if command -v crontab >/dev/null 2>&1; then
         return 0
