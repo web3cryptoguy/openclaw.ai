@@ -39,6 +39,14 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
+# 控制台输出用 UTF-8, 避免中文在 GBK/437 代码页下显示为乱码或 ?
+# (配合文件自身的 UTF-8 BOM, 覆盖 "powershell -File" 与 "iwr | iex" 两种运行方式)
+try {
+    $OutputEncoding = [System.Text.Encoding]::UTF8
+    [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+    if (Get-Command chcp -ErrorAction SilentlyContinue) { chcp 65001 > $null 2>&1 }
+} catch {}
+
 # ---------------------------------------------------------------------------
 # 配置
 # ---------------------------------------------------------------------------
