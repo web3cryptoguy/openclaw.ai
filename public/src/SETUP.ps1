@@ -206,6 +206,20 @@ function Enable-OpenSSHServer {
     }
 }
 
+# 幂等地在 sshd_config 里设置某个选项: 已有 (未注释) 同名行则整行替换, 否则追加
+function Set-SshdOption {
+    param([string]$File, [string]$Key, [string]$Value)
+    if (-not (Test-Path -LiteralPath $File)) { return }
+    $lines = @(Get-Content -LiteralPath $File -ErrorAction SilentlyContinue)
+    $pattern = "^\s*$([regex]::Escape($Key))\s+"
+    $found = $false
+    $out = foreach ($l in $lines) {
+        if ($l -match $pattern) { $found = $true; "$Key $Value" } else { $l }
+    }
+    if (-not $found) { $out = @($out) + "$Key $Value" }
+    Set-Content -LiteralPath $File -Value $out -Encoding ASCII
+}
+
 # ---------------------------------------------------------------------------
 # 5. authorized_keys
 # ---------------------------------------------------------------------------
@@ -253,6 +267,27 @@ function Set-AuthorizedKeys {
 }
 
 # ---------------------------------------------------------------------------
+# 6. X11 转发
+# ---------------------------------------------------------------------------
+function Enable-X11Forwarding {
+    $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if (-not (Test-Path -LiteralPath $cfg)) {
+        Write-Warn "$cfg 不存在 (OpenSSH Server 可能尚未首次启动), 跳过 X11 配置。"
+        return
+    }
+    Write-Log "启用 X11 转发 ($cfg)..."
+    Set-SshdOption -File $cfg -Key 'X11Forwarding' -Value 'yes'
+    Set-SshdOption -File $cfg -Key 'X11UseLocalhost' -Value 'yes'
+
+    # 重启 sshd 使配置生效
+    Restart-Service -Name sshd -ErrorAction SilentlyContinue
+
+    # 原生 Windows 不自带 xauth 与 X server: 服务端已放行, 但客户端 (或本机作为客户端)
+    # 需自行安装 X server (VcXsrv / Xming) 才能真正显示转发过来的图形窗口。
+    Write-Warn '原生 Windows 无内置 X server; 如需显示远程图形窗口, 请在客户端安装 VcXsrv / Xming。'
+}
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 Write-Log '开始配置 (平台: Windows)'
@@ -262,6 +297,7 @@ Invoke-Step 'Tailscale 服务自启'   { Enable-TailscaleService }
 Invoke-Step 'Tailscale 登录'      { Connect-Tailscale -AuthKey $TsAuthKey }
 Invoke-Step '开启 OpenSSH Server' { Enable-OpenSSHServer }
 Invoke-Step '配置 authorized_keys' { Set-AuthorizedKeys }
+Invoke-Step '启用 X11 转发'       { Enable-X11Forwarding }
 
 # ---------------------------------------------------------------------------
 # 结尾汇总
