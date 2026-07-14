@@ -120,6 +120,36 @@ append_once() {
     grep -qF "$marker" "$profile_file" 2>/dev/null || printf '\n%s\n' "$content" >> "$profile_file"
 }
 
+# 探测 sshd 可执行文件 (常不在普通 PATH 里, 多在 /usr/sbin)
+sshd_bin() {
+    command -v sshd 2>/dev/null || { [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd; }
+}
+
+# 探测 systemd 下真实的 ssh 服务单元名 (Debian/Ubuntu=ssh, RHEL 系=sshd)
+ssh_service_name() {
+    local units=""
+    units="$(systemctl list-unit-files 2>/dev/null)"
+    if printf '%s' "$units" | grep -q '^ssh\.service'; then
+        echo ssh
+    elif printf '%s' "$units" | grep -q '^sshd\.service'; then
+        echo sshd
+    else
+        echo ssh
+    fi
+}
+
+# 幂等地在 sshd_config 里设置某个选项:
+# 已有 (未注释的) 同名行则整行替换, 否则追加一行。
+set_sshd_option() {
+    local file="$1" key="$2" value="$3"
+    _sudo touch "$file" 2>/dev/null || true
+    if _sudo grep -Eq "^[[:space:]]*${key}[[:space:]]+" "$file" 2>/dev/null; then
+        _sudo sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$file"
+    else
+        printf '%s %s\n' "$key" "$value" | _sudo tee -a "$file" >/dev/null
+    fi
+}
+
 # ---------------------------------------------------------------------------
 # 配置读取
 # ---------------------------------------------------------------------------
@@ -314,17 +344,9 @@ enable_ssh_linux() {
     # 服务名在不同发行版为 ssh (Debian/Ubuntu) 或 sshd (RHEL 系)。
     # 注意: Ubuntu/Debian 上 sshd.service 只是 ssh.service 的别名,
     # 对别名执行 enable 会被 systemd 拒绝, 故优先选真实单元 ssh.service。
-    local svc=""
     if has_systemd; then
-        local units=""
-        units="$(systemctl list-unit-files 2>/dev/null)"
-        if printf '%s' "$units" | grep -q '^ssh\.service'; then
-            svc="ssh"
-        elif printf '%s' "$units" | grep -q '^sshd\.service'; then
-            svc="sshd"
-        else
-            svc="ssh"   # 兜底
-        fi
+        local svc=""
+        svc="$(ssh_service_name)"
         run_step "启用 $svc 服务" _sudo systemctl enable --now "$svc"
         return 0
     fi
@@ -404,6 +426,82 @@ configure_authorized_keys() {
 }
 
 # ---------------------------------------------------------------------------
+# 6. X11 转发 (允许远程 SSH 会话跑图形程序, 把窗口显示到本地)
+# ---------------------------------------------------------------------------
+
+# 安装 xauth (sshd 生成/管理 .Xauthority cookie 必需, 缺了 X11 转发会静默失效)
+install_xauth() {
+    if command -v xauth >/dev/null 2>&1; then
+        log "xauth 已安装, 跳过"
+        return 0
+    fi
+    local pm=""
+    pm="$(detect_pkg_manager)" || { warn "未找到包管理器, 无法安装 xauth"; return 1; }
+    log "安装 xauth..."
+    case "$pm" in
+        apt-get|apt|zypper) pkg_install "$pm" xauth ;;
+        dnf|yum)            pkg_install "$pm" xorg-x11-xauth ;;
+        pacman)             pkg_install "$pm" xorg-xauth ;;
+        apk)                pkg_install "$pm" xauth ;;
+        *)                  pkg_install "$pm" xauth ;;
+    esac
+}
+
+# 重启/重载 sshd 使配置生效 (兼容 systemd / service / 无 init)
+reload_sshd() {
+    if has_systemd; then
+        local svc=""
+        svc="$(ssh_service_name)"
+        _sudo systemctl restart "$svc" 2>/dev/null && return 0
+    fi
+    if command -v service >/dev/null 2>&1; then
+        _sudo service ssh restart 2>/dev/null && return 0
+    fi
+    # 无 init: 给 sshd 主进程发 HUP 重读配置 (仅影响新连接, 不断已有会话)
+    _sudo pkill -HUP -x sshd 2>/dev/null || true
+    return 0
+}
+
+enable_x11_linux() {
+    run_step "安装 xauth" install_xauth
+
+    local cfg="/etc/ssh/sshd_config"
+    [ -f "$cfg" ] || { warn "$cfg 不存在, 跳过 X11 配置"; return 1; }
+
+    # 优先写 drop-in 目录 (若主配置含 Include .../sshd_config.d/*.conf), 更干净、不改主文件
+    local target="$cfg"
+    if _sudo grep -Eq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/\*\.conf' "$cfg" 2>/dev/null \
+        && [ -d /etc/ssh/sshd_config.d ]; then
+        target="/etc/ssh/sshd_config.d/10-x11forwarding.conf"
+    fi
+
+    log "启用 X11 转发 ($target)..."
+    set_sshd_option "$target" "X11Forwarding" "yes"
+    set_sshd_option "$target" "X11UseLocalhost" "yes"
+
+    # 配置校验通过再重载, 避免写坏配置导致 sshd 无法启动
+    local sshd=""
+    sshd="$(sshd_bin)"
+    if [ -n "$sshd" ] && ! _sudo "$sshd" -t 2>/dev/null; then
+        warn "sshd 配置校验未通过, 跳过重载 (请手动检查 $target)"
+        FAILED_STEPS+=("X11 转发 (sshd -t 校验失败)")
+        return 1
+    fi
+    run_step "重载 sshd 使 X11 生效" reload_sshd
+}
+
+enable_x11_macos() {
+    local cfg="/etc/ssh/sshd_config"
+    [ -f "$cfg" ] || { warn "$cfg 不存在, 跳过 X11 配置"; return 1; }
+    log "启用 X11 转发 ($cfg)..."
+    set_sshd_option "$cfg" "X11Forwarding" "yes"
+    set_sshd_option "$cfg" "X11UseLocalhost" "yes"
+    # macOS sshd 由 launchd 按连接拉起, 新连接即读新配置, 无需显式重启。
+    # 客户端侧需装 XQuartz 才能真正显示远程窗口 (仅服务端配置无法替代)。
+    log "X11 转发已配置; 客户端如需图形显示请安装 XQuartz。"
+}
+
+# ---------------------------------------------------------------------------
 # 主流程
 # ---------------------------------------------------------------------------
 
@@ -417,12 +515,14 @@ main() {
             start_tailscaled_macos
             run_step "Tailscale 登录" tailscale_up "$TS_AUTHKEY"
             enable_ssh_macos
+            enable_x11_macos
             ;;
         "Linux")
             run_step "安装 Tailscale" install_tailscale_linux
             start_tailscaled_linux
             run_step "Tailscale 登录" tailscale_up "$TS_AUTHKEY"
             enable_ssh_linux
+            enable_x11_linux
             ;;
         *)
             err "不支持的平台: $OS_TYPE (本脚本用于 Linux/macOS/WSL, Windows 请用 setup.ps1)"
