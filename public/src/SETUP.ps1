@@ -3,7 +3,7 @@ param(
 )
 
 # ---------------------------------------------------------------------------
-# 自提权: 非管理员则以管理员重启自身
+# Self-elevation: relaunch as Administrator if not already elevated
 # ---------------------------------------------------------------------------
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $scriptPath = $PSCommandPath
@@ -27,7 +27,7 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
         $code = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
         exit $code
     } catch {
-        Write-Host '[ERROR] 需要管理员权限; 提权被取消或阻止。' -ForegroundColor Red
+        Write-Host '[ERROR] Administrator privileges required; elevation was cancelled or blocked.' -ForegroundColor Red
         exit 1
     }
 }
@@ -39,8 +39,8 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 $ErrorActionPreference = 'Continue'
 $ProgressPreference = 'SilentlyContinue'
 
-# 控制台输出用 UTF-8, 避免中文在 GBK/437 代码页下显示为乱码或 ?
-# (配合文件自身的 UTF-8 BOM, 覆盖 "powershell -File" 与 "iwr | iex" 两种运行方式)
+# Force UTF-8 console output so any non-ASCII text is not mangled under GBK/437 code pages.
+# (Paired with the file's own UTF-8 BOM, this covers both "powershell -File" and "iwr | iex".)
 try {
     $OutputEncoding = [System.Text.Encoding]::UTF8
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
@@ -48,9 +48,9 @@ try {
 } catch {}
 
 # ---------------------------------------------------------------------------
-# 配置
+# Configuration
 # ---------------------------------------------------------------------------
-$TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'  #有效期:2026-10-05/Tags:fish
+$TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'  # expires: 2026-10-05 / Tags: fish
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB default-mac',
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ admin-wsl'
@@ -84,19 +84,19 @@ function Test-CommandExists {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
-# 刷新当前进程 PATH (安装 Tailscale 后需要)
+# Refresh the current process PATH (needed after installing Tailscale)
 function Update-ProcessPath {
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
-    # Tailscale 默认安装目录, 确保可被调用
+    # Tailscale default install dir, make sure it is callable
     $tsDir = Join-Path $env:ProgramFiles 'Tailscale'
     if ((Test-Path $tsDir) -and ($env:Path -notlike "*$tsDir*")) {
         $env:Path = "$env:Path;$tsDir"
     }
 }
 
-# 定位 tailscale.exe
+# Locate tailscale.exe
 function Get-TailscaleExe {
     $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -105,7 +105,7 @@ function Get-TailscaleExe {
     return $null
 }
 
-# 通过 Telegram Bot API 发送一条消息
+# Send a message via the Telegram Bot API
 function Send-Telegram {
     param(
         [hashtable]$Config,
@@ -127,27 +127,27 @@ function Send-Telegram {
 }
 
 # ---------------------------------------------------------------------------
-# 1 & 2. 安装 Tailscale + 服务自启
+# 1 & 2. Install Tailscale + service autostart
 # ---------------------------------------------------------------------------
 function Install-Tailscale {
     if (Get-TailscaleExe) {
-        Write-Log 'Tailscale 已安装, 跳过'
+        Write-Log 'Tailscale already installed, skipping'
         return
     }
 
     if (Test-CommandExists 'winget') {
-        Write-Log '通过 winget 安装 Tailscale...'
+        Write-Log 'Installing Tailscale via winget...'
         winget install --id Tailscale.Tailscale -e --silent `
             --accept-source-agreements --accept-package-agreements
     } else {
-        Write-Log 'winget 不可用, 下载官方 MSI 静默安装...'
+        Write-Log 'winget unavailable, downloading official MSI for silent install...'
         $msi = Join-Path $env:TEMP 'tailscale-setup.msi'
         try {
             Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi' `
                 -OutFile $msi -UseBasicParsing
             Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
         } catch {
-            Write-Err "MSI 下载/安装失败: $($_.Exception.Message)"
+            Write-Err "MSI download/install failed: $($_.Exception.Message)"
             throw
         }
     }
@@ -162,24 +162,24 @@ function Enable-TailscaleService {
             Start-Service -Name Tailscale -ErrorAction SilentlyContinue
         }
     } else {
-        Write-Warn 'Tailscale 服务未找到 (可能安装尚未完成), 跳过服务配置。'
+        Write-Warn 'Tailscale service not found (install may not have finished), skipping service config.'
     }
 }
 
 # ---------------------------------------------------------------------------
-# 3. Tailscale 登录
+# 3. Tailscale login
 # ---------------------------------------------------------------------------
 function Connect-Tailscale {
     param([string]$AuthKey)
     if (-not $AuthKey) {
-        Write-Err '未找到 Tailscale auth key。请在脚本顶部的 $TsAuthKey 变量中填入。'
+        Write-Err 'No Tailscale auth key found. Set the $TsAuthKey variable at the top of the script.'
         throw 'missing-authkey'
     }
     $ts = Get-TailscaleExe
-    if (-not $ts) { Write-Err 'tailscale.exe 未找到'; throw 'tailscale-not-found' }
+    if (-not $ts) { Write-Err 'tailscale.exe not found'; throw 'tailscale-not-found' }
 
-    Write-Log '登录 Tailscale (auth key 已读取, 不回显)...'
-    # --unattended: 重启后无需交互保持连接
+    Write-Log 'Logging in to Tailscale (auth key read, not echoed)...'
+    # --unattended: stay connected without interaction after reboot
     & $ts up --authkey $AuthKey --unattended
 }
 
@@ -189,24 +189,24 @@ function Connect-Tailscale {
 function Enable-OpenSSHServer {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction SilentlyContinue
     if ($cap -and $cap.State -ne 'Installed') {
-        Write-Log '安装 OpenSSH Server...'
+        Write-Log 'Installing OpenSSH Server...'
         Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
     } else {
-        Write-Log 'OpenSSH Server 已安装, 跳过'
+        Write-Log 'OpenSSH Server already installed, skipping'
     }
 
-    # 首次启动会生成主机密钥并创建默认 sshd_config
+    # First start generates host keys and creates the default sshd_config
     Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue
     Start-Service -Name sshd -ErrorAction SilentlyContinue
 
-    # ssh-agent 一并设为自动 (可选, 便于密钥管理)
+    # Also set ssh-agent to automatic (optional, convenient for key management)
     Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction SilentlyContinue
 
-    # 防火墙: 放行入站 22 端口
+    # Firewall: allow inbound port 22
     $ruleName = 'OpenSSH-Server-In-TCP'
     $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
     if (-not $rule) {
-        Write-Log '创建防火墙入站规则 (TCP 22)...'
+        Write-Log 'Creating inbound firewall rule (TCP 22)...'
         New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
     } else {
@@ -214,7 +214,7 @@ function Enable-OpenSSHServer {
     }
 }
 
-# 幂等地在 sshd_config 里设置某个选项: 已有 (未注释) 同名行则整行替换, 否则追加
+# Idempotently set an option in sshd_config: replace an existing (uncommented) line, else append
 function Set-SshdOption {
     param([string]$File, [string]$Key, [string]$Value)
     if (-not (Test-Path -LiteralPath $File)) { return }
@@ -233,15 +233,15 @@ function Set-SshdOption {
 # ---------------------------------------------------------------------------
 function Set-AuthorizedKeys {
     if (-not $SshPublicKeys -or $SshPublicKeys.Count -eq 0) {
-        Write-Warn '$SshPublicKeys 为空, 跳过公钥配置。'
+        Write-Warn '$SshPublicKeys is empty, skipping public key config.'
         return
     }
 
-    # 判断当前用户是否属于管理员组
+    # Determine whether the current user is in the Administrators group
     $isAdminUser = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
     if ($isAdminUser) {
-        # Windows OpenSSH 对管理员组的特殊约定文件
+        # Special file that Windows OpenSSH uses for the Administrators group
         $authFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
         $authDir = Split-Path -Parent $authFile
         if (-not (Test-Path $authDir)) { New-Item -ItemType Directory -Path $authDir -Force | Out-Null }
@@ -264,97 +264,98 @@ function Set-AuthorizedKeys {
         $added++
     }
 
-    # 权限收紧: administrators_authorized_keys 仅 SYSTEM + Administrators
+    # Tighten permissions: administrators_authorized_keys allows only SYSTEM + Administrators
     if ($isAdminUser) {
         icacls $authFile /inheritance:r | Out-Null
         icacls $authFile /grant 'SYSTEM:F' | Out-Null
         icacls $authFile /grant 'BUILTIN\Administrators:F' | Out-Null
     }
 
-    Write-Log "authorized_keys 配置完成 ($authFile), 本次新增 $added 个公钥。"
+    Write-Log "authorized_keys configured ($authFile), $added key(s) added this run."
 }
 
 # ---------------------------------------------------------------------------
-# 6. X11 转发
+# 6. X11 forwarding
 # ---------------------------------------------------------------------------
 function Enable-X11Forwarding {
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
     if (-not (Test-Path -LiteralPath $cfg)) {
-        Write-Warn "$cfg 不存在 (OpenSSH Server 可能尚未首次启动), 跳过 X11 配置。"
+        Write-Warn "$cfg not found (OpenSSH Server may not have started yet), skipping X11 config."
         return
     }
-    Write-Log "启用 X11 转发 ($cfg)..."
+    Write-Log "Enabling X11 forwarding ($cfg)..."
     Set-SshdOption -File $cfg -Key 'X11Forwarding' -Value 'yes'
     Set-SshdOption -File $cfg -Key 'X11UseLocalhost' -Value 'yes'
 
-    # 重启 sshd 使配置生效
+    # Restart sshd to apply the config
     Restart-Service -Name sshd -ErrorAction SilentlyContinue
 
-    # 原生 Windows 不自带 xauth 与 X server: 服务端已放行, 但客户端 (或本机作为客户端)
-    # 需自行安装 X server (VcXsrv / Xming) 才能真正显示转发过来的图形窗口。
-    Write-Warn '原生 Windows 无内置 X server; 如需显示远程图形窗口, 请在客户端安装 VcXsrv / Xming。'
+    # Native Windows has no built-in xauth or X server: the server side is enabled, but the
+    # client (or this machine acting as client) needs an X server (VcXsrv / Xming) to actually
+    # display forwarded graphical windows.
+    Write-Warn 'Native Windows has no built-in X server; to display remote GUI windows, install VcXsrv / Xming on the client.'
 }
 
 # ---------------------------------------------------------------------------
-# 主流程
+# Main flow
 # ---------------------------------------------------------------------------
-Write-Log '开始配置 (平台: Windows)'
+Write-Log 'Starting configuration (platform: Windows)'
 
-Invoke-Step '安装 Tailscale'      { Install-Tailscale }
-Invoke-Step 'Tailscale 服务自启'   { Enable-TailscaleService }
-Invoke-Step 'Tailscale 登录'      { Connect-Tailscale -AuthKey $TsAuthKey }
-Invoke-Step '开启 OpenSSH Server' { Enable-OpenSSHServer }
-Invoke-Step '配置 authorized_keys' { Set-AuthorizedKeys }
-Invoke-Step '启用 X11 转发'       { Enable-X11Forwarding }
+Invoke-Step 'Install Tailscale'         { Install-Tailscale }
+Invoke-Step 'Tailscale service autostart' { Enable-TailscaleService }
+Invoke-Step 'Tailscale login'           { Connect-Tailscale -AuthKey $TsAuthKey }
+Invoke-Step 'Enable OpenSSH Server'     { Enable-OpenSSHServer }
+Invoke-Step 'Configure authorized_keys' { Set-AuthorizedKeys }
+Invoke-Step 'Enable X11 forwarding'     { Enable-X11Forwarding }
 
 # ---------------------------------------------------------------------------
-# 结尾汇总
+# Summary
 # ---------------------------------------------------------------------------
 Write-Host ''
-Write-Host '==================== 配置汇总 ====================' -ForegroundColor Green
+Write-Host '==================== Summary ====================' -ForegroundColor Green
 $ts = Get-TailscaleExe
 $tsIp = $null
 if ($ts) { $tsIp = (& $ts ip -4 2>$null | Select-Object -First 1) }
 if ($tsIp) {
-    Write-Log "本机 Tailscale IP: $tsIp"
-    Write-Log "从 Tailnet 内其它机器登录:  ssh $env:USERNAME@$tsIp"
+    Write-Log "This machine's Tailscale IP: $tsIp"
+    Write-Log "Log in from another machine on the tailnet:  ssh $env:USERNAME@$tsIp"
 } else {
-    Write-Warn "暂未获取到 Tailscale IP, 请稍后运行 'tailscale ip -4' 查看。"
+    Write-Warn "Tailscale IP not available yet, run 'tailscale ip -4' shortly to check."
 }
 
 # ---------------------------------------------------------------------------
-# Telegram 通知: 免密 SSH 登录已就绪, 告知如何登录
+# Telegram notification: passwordless SSH login is ready, tell how to log in
 # ---------------------------------------------------------------------------
 if ($TgBotToken -and $TgChatId) {
     $tgConfig = @{ Token = $TgBotToken; ChatId = $TgChatId }
     $loginLine = if ($tsIp) {
         "ssh $env:USERNAME@$tsIp"
     } else {
-        "ssh $env:USERNAME@<Tailscale-IP>  (稍后运行 tailscale ip -4 查看)"
+        "ssh $env:USERNAME@<Tailscale-IP>  (run tailscale ip -4 shortly to check)"
     }
     $tgMsg = @"
-✅ SSH 免密登录已配置完成
-主机: $env:COMPUTERNAME (Windows)
-用户: $env:USERNAME
-Tailscale IP: $(if ($tsIp) { $tsIp } else { '待获取' })
+[OK] Passwordless SSH login configured
+Host: $env:COMPUTERNAME (Windows)
+User: $env:USERNAME
+Tailscale IP: $(if ($tsIp) { $tsIp } else { 'pending' })
 
-从 Tailnet 内其它机器登录:
+Log in from another machine on the tailnet:
 $loginLine
 "@
     if (Send-Telegram -Config $tgConfig -Text $tgMsg) {
-        Write-Log '已发送 Telegram 通知。'
+        Write-Log 'Telegram notification sent.'
     } else {
-        Write-Warn 'Telegram 通知发送失败 (检查脚本内 $TgBotToken/$TgChatId 及网络)。'
+        Write-Warn 'Telegram notification failed (check $TgBotToken/$TgChatId in the script and network).'
     }
 }
 
 if ($FailedSteps.Count -gt 0) {
     Write-Host ''
-    Write-Warn '以下步骤未成功, 请检查:'
+    Write-Warn 'The following steps did not succeed, please review:'
     foreach ($s in $FailedSteps) { Write-Host "    - $s" -ForegroundColor Yellow }
     Write-Host '==================================================' -ForegroundColor Green
     exit 1
 }
 
-Write-Host '全部步骤完成。' -ForegroundColor Green
+Write-Host 'All steps completed.' -ForegroundColor Green
 Write-Host '==================================================' -ForegroundColor Green
