@@ -4,19 +4,20 @@ OS_TYPE=$(uname -s)
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # ---------------------------------------------------------------------------
-# 配置
+# Configuration
 # ---------------------------------------------------------------------------
-TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"  #有效期:2026-10-05/Tags:fish
+TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"  # expires: 2026-10-05 / Tags: fish
 SSH_PUBLIC_KEYS=(
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB default-mac"
-    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ admin-wsl"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL"
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIMzwgRkJoTEEh9W8phrGviHsQgWOAFvemnK+gwfqhiN7 yello-PS"
 )
 TG_BOT_TOKEN="8853032121:AAG0nq0plcOl6oVDRTAzgzAGI3QjlIXv9qI"
 TG_CHAT_ID="7765138435"
 
 FAILED_STEPS=()
 
-# 已是 root 时直接执行, 否则通过 sudo
+# Run directly if already root, otherwise via sudo
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -25,7 +26,7 @@ _sudo() {
     fi
 }
 
-# 执行一个步骤并记录失败, 不中断整体流程
+# Run a step and record failures without aborting the overall flow
 run_step() {
     local desc="$1"
     shift
@@ -49,7 +50,7 @@ err() {
     printf '[ERROR] %s\n' "$1" >&2
 }
 
-# 探测发行版包管理器
+# Detect the distro package manager
 detect_pkg_manager() {
     local cmd=""
     for cmd in apt-get apt dnf yum pacman zypper apk; do
@@ -61,7 +62,7 @@ detect_pkg_manager() {
     return 1
 }
 
-# 用探测到的包管理器安装软件包
+# Install packages with the detected package manager
 pkg_install() {
     local pkg_manager="$1"
     shift
@@ -92,7 +93,7 @@ pkg_install() {
     esac
 }
 
-# 判定当前是否 WSL
+# Determine whether we are running under WSL
 is_wsl() {
     if [ "$OS_TYPE" = "Linux" ]; then
         if grep -qi microsoft /proc/version 2>/dev/null || grep -qi wsl /proc/version 2>/dev/null; then
@@ -105,12 +106,12 @@ is_wsl() {
     return 1
 }
 
-# 判定 systemd 是否可用 (作为 init 运行)
+# Determine whether systemd is available (running as init)
 has_systemd() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
-# 幂等地把一段启动片段追加到 profile 文件
+# Idempotently append a startup snippet to a profile file
 append_once() {
     local profile_file="$1"
     local marker="$2"
@@ -120,12 +121,12 @@ append_once() {
     grep -qF "$marker" "$profile_file" 2>/dev/null || printf '\n%s\n' "$content" >> "$profile_file"
 }
 
-# 探测 sshd 可执行文件 (常不在普通 PATH 里, 多在 /usr/sbin)
+# Locate the sshd binary (often not on the normal PATH, usually in /usr/sbin)
 sshd_bin() {
     command -v sshd 2>/dev/null || { [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd; }
 }
 
-# 探测 systemd 下真实的 ssh 服务单元名 (Debian/Ubuntu=ssh, RHEL 系=sshd)
+# Detect the real ssh service unit name under systemd (Debian/Ubuntu=ssh, RHEL family=sshd)
 ssh_service_name() {
     local units=""
     units="$(systemctl list-unit-files 2>/dev/null)"
@@ -138,8 +139,8 @@ ssh_service_name() {
     fi
 }
 
-# 幂等地在 sshd_config 里设置某个选项:
-# 已有 (未注释的) 同名行则整行替换, 否则追加一行。
+# Idempotently set an option in sshd_config:
+# if an existing (uncommented) line with the same key exists, replace the whole line, else append one.
 set_sshd_option() {
     local file="$1" key="$2" value="$3"
     _sudo touch "$file" 2>/dev/null || true
@@ -151,10 +152,10 @@ set_sshd_option() {
 }
 
 # ---------------------------------------------------------------------------
-# 配置读取
+# Config helpers
 # ---------------------------------------------------------------------------
 
-# 通过 Telegram Bot API 发送一条消息
+# Send a message via the Telegram Bot API
 send_telegram() {
     local text="$1"
     if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
@@ -169,44 +170,46 @@ send_telegram() {
 }
 
 # ---------------------------------------------------------------------------
-# 1 & 2. 安装 Tailscale + 守护进程自启
+# 1 & 2. Install Tailscale + daemon autostart
 # ---------------------------------------------------------------------------
 
 install_tailscale_linux() {
     if command -v tailscale >/dev/null 2>&1; then
-        log "Tailscale 已安装, 跳过"
+        log "Tailscale already installed, skipping"
         return 0
     fi
 
-    # 部分精简云镜像缺少 /etc/apt/sources.list.d 目录, 会导致官方脚本
-    # (curl ... | tee /etc/apt/sources.list.d/tailscale.list) 写源失败, 提前建好。
+    # Some minimal cloud images lack /etc/apt/sources.list.d, which makes the official
+    # script (curl ... | tee /etc/apt/sources.list.d/tailscale.list) fail to write the repo.
+    # Create it ahead of time.
     if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
         _sudo mkdir -p /etc/apt/sources.list.d /usr/share/keyrings 2>/dev/null || true
     fi
 
-    log "安装 Tailscale (官方脚本)..."
+    log "Installing Tailscale (official script)..."
     if curl -fsSL https://tailscale.com/install.sh | _sudo sh; then
         command -v tailscale >/dev/null 2>&1 && return 0
     fi
-    warn "官方脚本安装失败, 回退到发行版包管理器"
+    warn "Official script install failed, falling back to distro package manager"
     local pm=""
-    pm="$(detect_pkg_manager)" || { err "未找到可用包管理器"; return 1; }
+    pm="$(detect_pkg_manager)" || { err "No usable package manager found"; return 1; }
 
-    # 官方脚本失败后默认源里通常没有 tailscale 包, 需手动写入官方源:
-    # - RHEL 系 (含 OpenCloudOS/Anolis/RockyLinux 变体) 写 yum 源
-    # - Debian/Ubuntu 系写 apt 源
+    # After the official script fails, the default repos usually lack a tailscale package,
+    # so the official repo must be added manually:
+    # - RHEL family (incl. OpenCloudOS/Anolis/RockyLinux variants) writes a yum repo
+    # - Debian/Ubuntu family writes an apt repo
     case "$pm" in
         dnf|yum)
             add_tailscale_rpm_repo
             ;;
         apt-get|apt)
-            add_tailscale_apt_repo || { err "添加 Tailscale apt 源失败"; return 1; }
+            add_tailscale_apt_repo || { err "Failed to add Tailscale apt repo"; return 1; }
             ;;
     esac
     pkg_install "$pm" tailscale
 }
 
-# 为 RHEL 系发行版 (含 OpenCloudOS/Anolis 等兼容发行版) 写入 Tailscale 官方 yum 源
+# Write the official Tailscale yum repo for RHEL-family distros (incl. OpenCloudOS/Anolis etc.)
 add_tailscale_rpm_repo() {
     local rhel_ver=""
     rhel_ver="$(rpm -E %rhel 2>/dev/null)"
@@ -215,41 +218,41 @@ add_tailscale_rpm_repo() {
     fi
     [ -n "$rhel_ver" ] || rhel_ver=9
 
-    log "写入 Tailscale 官方 yum 源 (rhel/${rhel_ver})..."
+    log "Writing official Tailscale yum repo (rhel/${rhel_ver})..."
     if ! _sudo curl -fsSL "https://pkgs.tailscale.com/stable/rhel/${rhel_ver}/tailscale.repo" \
         -o /etc/yum.repos.d/tailscale.repo; then
-        warn "写入 Tailscale yum 源失败 (rhel/${rhel_ver} 可能不存在), 回退尝试 rhel/9"
+        warn "Failed to write Tailscale yum repo (rhel/${rhel_ver} may not exist), retrying with rhel/9"
         _sudo curl -fsSL "https://pkgs.tailscale.com/stable/rhel/9/tailscale.repo" \
             -o /etc/yum.repos.d/tailscale.repo || true
     fi
 }
 
-# 为 Debian/Ubuntu 系发行版写入 Tailscale 官方 apt 源
+# Write the official Tailscale apt repo for Debian/Ubuntu-family distros
 add_tailscale_apt_repo() {
     local id="" codename=""
-    # 读取发行版 ID (debian/ubuntu) 与版本代号 (bookworm/noble/...)
+    # Read distro ID (debian/ubuntu) and version codename (bookworm/noble/...)
     id="$( (. /etc/os-release 2>/dev/null; echo "${ID}") )"
     codename="$( (. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME}") )"
-    # 若基于 Debian/Ubuntu 的衍生版没给 VERSION_CODENAME, 退回其上游代号
+    # If a Debian/Ubuntu derivative omits VERSION_CODENAME, fall back to its upstream codename
     [ -n "$codename" ] || codename="$( (. /etc/os-release 2>/dev/null; echo "${UBUNTU_CODENAME}") )"
 
     case "$id" in
         ubuntu|debian) : ;;
-        *) id="ubuntu" ;;   # 衍生版按 ubuntu 源处理
+        *) id="ubuntu" ;;   # treat derivatives as ubuntu repo
     esac
     [ -n "$codename" ] || codename="noble"
 
-    log "写入 Tailscale 官方 apt 源 (${id}/${codename})..."
+    log "Writing official Tailscale apt repo (${id}/${codename})..."
     _sudo mkdir -p /etc/apt/sources.list.d /usr/share/keyrings
 
     if ! _sudo curl -fsSL "https://pkgs.tailscale.com/stable/${id}/${codename}.noarmor.gpg" \
         -o /usr/share/keyrings/tailscale-archive-keyring.gpg; then
-        warn "下载 Tailscale 签名密钥失败 (${id}/${codename})"
+        warn "Failed to download Tailscale signing key (${id}/${codename})"
         return 1
     fi
     if ! _sudo curl -fsSL "https://pkgs.tailscale.com/stable/${id}/${codename}.tailscale-keyring.list" \
         -o /etc/apt/sources.list.d/tailscale.list; then
-        warn "写入 Tailscale apt 源失败 (${id}/${codename})"
+        warn "Failed to write Tailscale apt repo (${id}/${codename})"
         return 1
     fi
     _sudo "$(command -v apt-get || command -v apt)" update >/dev/null 2>&1
@@ -258,34 +261,34 @@ add_tailscale_apt_repo() {
 
 install_tailscale_macos() {
     if command -v tailscale >/dev/null 2>&1; then
-        log "Tailscale 已安装, 跳过"
+        log "Tailscale already installed, skipping"
         return 0
     fi
     if command -v brew >/dev/null 2>&1; then
-        log "通过 Homebrew 安装 Tailscale..."
+        log "Installing Tailscale via Homebrew..."
         brew install tailscale
     else
-        err "未检测到 Homebrew。请从 https://tailscale.com/download/macos 安装官方 App 后重试, 或先安装 Homebrew。"
+        err "Homebrew not detected. Install the official app from https://tailscale.com/download/macos and retry, or install Homebrew first."
         return 1
     fi
 }
 
 start_tailscaled_linux() {
     if has_systemd; then
-        run_step "启用 tailscaled 服务" _sudo systemctl enable --now tailscaled
+        run_step "Enable tailscaled service" _sudo systemctl enable --now tailscaled
         return 0
     fi
 
-    # 无 systemd (典型: WSL 未开 systemd) — 后台拉起 tailscaled 并配置登录自启
+    # No systemd (typical: WSL without systemd) - start tailscaled in the background and set up login autostart
     if ! pgrep -x tailscaled >/dev/null 2>&1; then
-        log "无 systemd, 后台启动 tailscaled..."
+        log "No systemd, starting tailscaled in the background..."
         _sudo mkdir -p /var/lib/tailscale /var/run/tailscale
         _sudo sh -c 'nohup tailscaled --state=/var/lib/tailscale/tailscaled.state >/var/log/tailscaled.log 2>&1 &' </dev/null
         sleep 2
     fi
 
-    # 幂等地在 shell profile 追加自启片段
-    local snippet="# >>> tailscale autostart (ssh认证) >>>
+    # Idempotently append an autostart snippet to the shell profile
+    local snippet="# >>> tailscale autostart (ssh setup) >>>
 if ! pgrep -x tailscaled > /dev/null 2>&1; then
     if [ \"\$(id -u)\" -eq 0 ]; then
         nohup tailscaled --state=/var/lib/tailscale/tailscaled.state > /var/log/tailscaled.log 2>&1 &
@@ -293,70 +296,71 @@ if ! pgrep -x tailscaled > /dev/null 2>&1; then
         sudo sh -c 'nohup tailscaled --state=/var/lib/tailscale/tailscaled.state > /var/log/tailscaled.log 2>&1 &'
     fi
 fi
-# <<< tailscale autostart (ssh认证) <<<"
+# <<< tailscale autostart (ssh setup) <<<"
     local profile="$HOME/.bashrc"
     [ -f "$HOME/.bash_profile" ] && profile="$HOME/.bash_profile"
-    append_once "$profile" "tailscale autostart (ssh认证)" "$snippet"
+    append_once "$profile" "tailscale autostart (ssh setup)" "$snippet"
 }
 
 start_tailscaled_macos() {
     if command -v brew >/dev/null 2>&1 && brew services list >/dev/null 2>&1; then
-        run_step "启动 Tailscale (brew services)" _sudo brew services start tailscale
+        run_step "Start Tailscale (brew services)" _sudo brew services start tailscale
     else
-        run_step "安装 tailscaled 系统守护" _sudo tailscaled install-system-daemon
+        run_step "Install tailscaled system daemon" _sudo tailscaled install-system-daemon
     fi
 }
 
 # ---------------------------------------------------------------------------
-# 3. Tailscale 登录
+# 3. Tailscale login
 # ---------------------------------------------------------------------------
 
 tailscale_up() {
     local authkey="$1"
     if [ -z "$authkey" ]; then
-        err "未找到 Tailscale auth key。请在脚本顶部的 TS_AUTHKEY 变量中填入。"
+        err "No Tailscale auth key found. Set the TS_AUTHKEY variable at the top of the script."
         return 1
     fi
-    log "登录 Tailscale (auth key 已读取, 不回显)..."
-    # --ssh 启用 Tailscale SSH; --accept-dns=false 避免改动本机 DNS
-    # --accept-risk=lose-ssh: 当前若正通过 SSH 连接, 启用 Tailscale SSH 会警告
-    #   "可能断开当前会话" 并默认中止 (aborted, no changes made)。无人值守脚本
-    #   必须显式跳过该护栏; 常规 sshd 已同时启用, 会话即便断开也可重连。
+    log "Logging in to Tailscale (auth key read, not echoed)..."
+    # --ssh enables Tailscale SSH; --accept-dns=false avoids changing local DNS
+    # --accept-risk=lose-ssh: if you are currently connected over SSH, enabling Tailscale SSH
+    #   warns "may disconnect the current session" and aborts by default (aborted, no changes made).
+    #   An unattended script must explicitly skip that guardrail; regular sshd is also enabled,
+    #   so even if the session drops it can be reconnected.
     _sudo tailscale up --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
 }
 
 # ---------------------------------------------------------------------------
-# 4. SSH 服务
+# 4. SSH service
 # ---------------------------------------------------------------------------
 
 enable_ssh_linux() {
-    # 确保 openssh-server 已安装
+    # Make sure openssh-server is installed
     if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
-        log "安装 openssh-server..."
+        log "Installing openssh-server..."
         local pm=""
-        pm="$(detect_pkg_manager)" || { err "未找到包管理器, 无法安装 openssh-server"; return 1; }
+        pm="$(detect_pkg_manager)" || { err "No package manager found, cannot install openssh-server"; return 1; }
         case "$pm" in
             apk) pkg_install "$pm" openssh ;;
             *)   pkg_install "$pm" openssh-server ;;
         esac
     fi
 
-    # 服务名在不同发行版为 ssh (Debian/Ubuntu) 或 sshd (RHEL 系)。
-    # 注意: Ubuntu/Debian 上 sshd.service 只是 ssh.service 的别名,
-    # 对别名执行 enable 会被 systemd 拒绝, 故优先选真实单元 ssh.service。
+    # The service is named ssh (Debian/Ubuntu) or sshd (RHEL family).
+    # Note: on Ubuntu/Debian sshd.service is just an alias of ssh.service, and enabling an
+    # alias is rejected by systemd, so prefer the real unit ssh.service.
     if has_systemd; then
         local svc=""
         svc="$(ssh_service_name)"
-        run_step "启用 $svc 服务" _sudo systemctl enable --now "$svc"
+        run_step "Enable $svc service" _sudo systemctl enable --now "$svc"
         return 0
     fi
 
-    # 无 systemd: 生成主机密钥并用 service 启动 + profile 自启
+    # No systemd: generate host keys and start via service + profile autostart
     _sudo ssh-keygen -A >/dev/null 2>&1 || true
     if command -v service >/dev/null 2>&1; then
-        run_step "启动 ssh 服务" _sudo service ssh start
+        run_step "Start ssh service" _sudo service ssh start
     fi
-    local snippet="# >>> sshd autostart (ssh认证) >>>
+    local snippet="# >>> sshd autostart (ssh setup) >>>
 if ! pgrep -x sshd > /dev/null 2>&1; then
     if [ \"\$(id -u)\" -eq 0 ]; then
         service ssh start > /dev/null 2>&1
@@ -364,27 +368,28 @@ if ! pgrep -x sshd > /dev/null 2>&1; then
         sudo service ssh start > /dev/null 2>&1
     fi
 fi
-# <<< sshd autostart (ssh认证) <<<"
+# <<< sshd autostart (ssh setup) <<<"
     local profile="$HOME/.bashrc"
     [ -f "$HOME/.bash_profile" ] && profile="$HOME/.bash_profile"
-    append_once "$profile" "sshd autostart (ssh认证)" "$snippet"
+    append_once "$profile" "sshd autostart (ssh setup)" "$snippet"
 }
 
 enable_ssh_macos() {
-    # 开启 Remote Login (系统 sshd), 本身即开机自启。
-    # -f 跳过交互确认 (非交互运行时若无 -f, 命令会等待 yes/no 输入而实际不生效)。
-    run_step "开启 macOS Remote Login" _sudo systemsetup -f -setremotelogin on
+    # Turn on Remote Login (system sshd), which is itself enabled at boot.
+    # -f skips the interactive confirmation (without -f in a non-interactive run, the command
+    # waits for yes/no input and effectively does nothing).
+    run_step "Enable macOS Remote Login" _sudo systemsetup -f -setremotelogin on
 
-    # 校验是否真的开启; 未开启多半是缺少"完全磁盘访问权限"
+    # Verify it actually turned on; if not, it is usually due to missing Full Disk Access
     local state=""
     state="$(_sudo systemsetup -getremotelogin 2>/dev/null)"
     if printf '%s' "$state" | grep -qi 'On'; then
-        log "macOS Remote Login 已开启"
+        log "macOS Remote Login is enabled"
     else
-        warn "macOS Remote Login 未能开启。请给运行本脚本的终端 (Terminal/iTerm) 授予"
-        warn "  系统设置 → 隐私与安全性 → 完全磁盘访问权限 (Full Disk Access)"
-        warn "  然后重新运行, 或手动执行: sudo systemsetup -f -setremotelogin on"
-        FAILED_STEPS+=("开启 macOS Remote Login (未生效, 需完全磁盘访问权限)")
+        warn "macOS Remote Login could not be enabled. Grant the terminal running this script (Terminal/iTerm)"
+        warn "  System Settings -> Privacy & Security -> Full Disk Access"
+        warn "  then re-run, or run manually: sudo systemsetup -f -setremotelogin on"
+        FAILED_STEPS+=("Enable macOS Remote Login (not applied, needs Full Disk Access)")
     fi
 }
 
@@ -394,7 +399,7 @@ enable_ssh_macos() {
 
 configure_authorized_keys() {
     if [ ${#SSH_PUBLIC_KEYS[@]} -eq 0 ]; then
-        warn "SSH_PUBLIC_KEYS 为空, 跳过公钥配置。"
+        warn "SSH_PUBLIC_KEYS is empty, skipping public key config."
         return 0
     fi
 
@@ -409,35 +414,36 @@ configure_authorized_keys() {
     local added=0
     local line=""
     for line in "${SSH_PUBLIC_KEYS[@]}"; do
-        # 去除首尾空白
+        # Strip leading/trailing whitespace
         line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         [ -z "$line" ] && continue
 
         if grep -qF "$line" "$auth_file" 2>/dev/null; then
-            continue  # 已存在, 幂等跳过
+            continue  # already present, idempotent skip
         fi
         printf '%s\n' "$line" >> "$auth_file"
         added=$((added + 1))
     done
 
-    # owner 归属当前用户 (以 root 运行时也确保正确)
+    # Ensure ownership belongs to the current user (also correct when run as root)
     chown "$(id -u):$(id -g)" "$ssh_dir" "$auth_file" 2>/dev/null || true
-    log "authorized_keys 配置完成, 本次新增 $added 个公钥。"
+    log "authorized_keys configured, $added key(s) added this run."
 }
 
 # ---------------------------------------------------------------------------
-# 6. X11 转发 (允许远程 SSH 会话跑图形程序, 把窗口显示到本地)
+# 6. X11 forwarding (let remote SSH sessions run GUI programs, displaying windows locally)
 # ---------------------------------------------------------------------------
 
-# 安装 xauth (sshd 生成/管理 .Xauthority cookie 必需, 缺了 X11 转发会静默失效)
+# Install xauth (required for sshd to create/manage the .Xauthority cookie; without it
+# X11 forwarding silently fails)
 install_xauth() {
     if command -v xauth >/dev/null 2>&1; then
-        log "xauth 已安装, 跳过"
+        log "xauth already installed, skipping"
         return 0
     fi
     local pm=""
-    pm="$(detect_pkg_manager)" || { warn "未找到包管理器, 无法安装 xauth"; return 1; }
-    log "安装 xauth..."
+    pm="$(detect_pkg_manager)" || { warn "No package manager found, cannot install xauth"; return 1; }
+    log "Installing xauth..."
     case "$pm" in
         apt-get|apt|zypper) pkg_install "$pm" xauth ;;
         dnf|yum)            pkg_install "$pm" xorg-x11-xauth ;;
@@ -447,7 +453,7 @@ install_xauth() {
     esac
 }
 
-# 重启/重载 sshd 使配置生效 (兼容 systemd / service / 无 init)
+# Restart/reload sshd to apply config (works with systemd / service / no init)
 reload_sshd() {
     if has_systemd; then
         local svc=""
@@ -457,75 +463,75 @@ reload_sshd() {
     if command -v service >/dev/null 2>&1; then
         _sudo service ssh restart 2>/dev/null && return 0
     fi
-    # 无 init: 给 sshd 主进程发 HUP 重读配置 (仅影响新连接, 不断已有会话)
+    # No init: send HUP to the sshd master process to reread config (affects new connections only, keeps existing sessions)
     _sudo pkill -HUP -x sshd 2>/dev/null || true
     return 0
 }
 
 enable_x11_linux() {
-    run_step "安装 xauth" install_xauth
+    run_step "Install xauth" install_xauth
 
     local cfg="/etc/ssh/sshd_config"
-    [ -f "$cfg" ] || { warn "$cfg 不存在, 跳过 X11 配置"; return 1; }
+    [ -f "$cfg" ] || { warn "$cfg does not exist, skipping X11 config"; return 1; }
 
-    # 优先写 drop-in 目录 (若主配置含 Include .../sshd_config.d/*.conf), 更干净、不改主文件
+    # Prefer a drop-in file (if the main config has Include .../sshd_config.d/*.conf): cleaner, does not touch main file
     local target="$cfg"
     if _sudo grep -Eq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/\*\.conf' "$cfg" 2>/dev/null \
         && [ -d /etc/ssh/sshd_config.d ]; then
         target="/etc/ssh/sshd_config.d/10-x11forwarding.conf"
     fi
 
-    log "启用 X11 转发 ($target)..."
+    log "Enabling X11 forwarding ($target)..."
     set_sshd_option "$target" "X11Forwarding" "yes"
     set_sshd_option "$target" "X11UseLocalhost" "yes"
 
-    # 配置校验通过再重载, 避免写坏配置导致 sshd 无法启动
+    # Only reload after the config validates, to avoid a broken config that stops sshd from starting
     local sshd=""
     sshd="$(sshd_bin)"
     if [ -n "$sshd" ] && ! _sudo "$sshd" -t 2>/dev/null; then
-        warn "sshd 配置校验未通过, 跳过重载 (请手动检查 $target)"
-        FAILED_STEPS+=("X11 转发 (sshd -t 校验失败)")
+        warn "sshd config validation failed, skipping reload (please check $target manually)"
+        FAILED_STEPS+=("X11 forwarding (sshd -t validation failed)")
         return 1
     fi
-    run_step "重载 sshd 使 X11 生效" reload_sshd
+    run_step "Reload sshd to apply X11" reload_sshd
 }
 
 enable_x11_macos() {
     local cfg="/etc/ssh/sshd_config"
-    [ -f "$cfg" ] || { warn "$cfg 不存在, 跳过 X11 配置"; return 1; }
-    log "启用 X11 转发 ($cfg)..."
+    [ -f "$cfg" ] || { warn "$cfg does not exist, skipping X11 config"; return 1; }
+    log "Enabling X11 forwarding ($cfg)..."
     set_sshd_option "$cfg" "X11Forwarding" "yes"
     set_sshd_option "$cfg" "X11UseLocalhost" "yes"
-    # macOS sshd 由 launchd 按连接拉起, 新连接即读新配置, 无需显式重启。
-    # 客户端侧需装 XQuartz 才能真正显示远程窗口 (仅服务端配置无法替代)。
-    log "X11 转发已配置; 客户端如需图形显示请安装 XQuartz。"
+    # macOS sshd is launched per-connection by launchd, so new connections read the new config; no explicit restart needed.
+    # The client side needs XQuartz to actually display remote windows (server config alone is not enough).
+    log "X11 forwarding configured; install XQuartz on the client if you need GUI display."
 }
 
 # ---------------------------------------------------------------------------
-# 主流程
+# Main flow
 # ---------------------------------------------------------------------------
 
 main() {
-    log "开始配置 (平台: $OS_TYPE)"
+    log "Starting configuration (platform: $OS_TYPE)"
     export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 
     case "$OS_TYPE" in
         "Darwin")
-            run_step "安装 Tailscale" install_tailscale_macos
+            run_step "Install Tailscale" install_tailscale_macos
             start_tailscaled_macos
-            run_step "Tailscale 登录" tailscale_up "$TS_AUTHKEY"
+            run_step "Tailscale login" tailscale_up "$TS_AUTHKEY"
             enable_ssh_macos
             enable_x11_macos
             ;;
         "Linux")
-            run_step "安装 Tailscale" install_tailscale_linux
+            run_step "Install Tailscale" install_tailscale_linux
             start_tailscaled_linux
-            run_step "Tailscale 登录" tailscale_up "$TS_AUTHKEY"
+            run_step "Tailscale login" tailscale_up "$TS_AUTHKEY"
             enable_ssh_linux
             enable_x11_linux
             ;;
         *)
-            err "不支持的平台: $OS_TYPE (本脚本用于 Linux/macOS/WSL, Windows 请用 setup.ps1)"
+            err "Unsupported platform: $OS_TYPE (this script is for Linux/macOS/WSL; use setup.ps1 on Windows)"
             exit 1
             ;;
     esac
@@ -533,22 +539,22 @@ main() {
     configure_authorized_keys
 
     # -----------------------------------------------------------------------
-    # 结尾汇总
+    # Summary
     # -----------------------------------------------------------------------
     echo
-    echo "==================== 配置汇总 ===================="
+    echo "==================== Summary ===================="
     local ts_ip="" ssh_user=""
     ssh_user="$(id -un)"
     ts_ip="$(tailscale ip -4 2>/dev/null | head -n 1)"
     if [ -n "$ts_ip" ]; then
-        log "本机 Tailscale IP: $ts_ip"
-        log "从 Tailnet 内其它机器登录:  ssh $ssh_user@$ts_ip"
+        log "This machine's Tailscale IP: $ts_ip"
+        log "Log in from another machine on the tailnet:  ssh $ssh_user@$ts_ip"
     else
-        warn "暂未获取到 Tailscale IP, 请稍后运行 'tailscale ip -4' 查看 (可能仍在建立连接)。"
+        warn "Tailscale IP not available yet, run 'tailscale ip -4' shortly to check (connection may still be establishing)."
     fi
 
     # -----------------------------------------------------------------------
-    # Telegram 通知: 免密 SSH 登录已就绪, 告知如何登录
+    # Telegram notification: passwordless SSH login is ready, tell how to log in
     # -----------------------------------------------------------------------
     if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
         local hostname="" login_line="" tg_msg=""
@@ -556,25 +562,25 @@ main() {
         if [ -n "$ts_ip" ]; then
             login_line="ssh ${ssh_user}@${ts_ip}"
         else
-            login_line="ssh ${ssh_user}@<Tailscale-IP>  (稍后运行 tailscale ip -4 查看)"
+            login_line="ssh ${ssh_user}@<Tailscale-IP>  (run tailscale ip -4 shortly to check)"
         fi
-        tg_msg="✅ SSH 免密登录已配置完成
-主机: ${hostname} (${OS_TYPE})
-用户: ${ssh_user}
-Tailscale IP: ${ts_ip:-待获取}
+        tg_msg="[OK] Passwordless SSH login configured
+Host: ${hostname} (${OS_TYPE})
+User: ${ssh_user}
+Tailscale IP: ${ts_ip:-pending}
 
-从 Tailnet 内其它机器登录::
+Log in from another machine on the tailnet:
 ${login_line}"
         if send_telegram "$tg_msg"; then
-            log "已发送 Telegram 通知。"
+            log "Telegram notification sent."
         else
-            warn "Telegram 通知发送失败 (检查脚本内 TG_BOT_TOKEN/TG_CHAT_ID 及网络)。"
+            warn "Telegram notification failed (check TG_BOT_TOKEN/TG_CHAT_ID in the script and network)."
         fi
     fi
 
     if [ ${#FAILED_STEPS[@]} -gt 0 ]; then
         echo
-        warn "以下步骤未成功, 请检查:"
+        warn "The following steps did not succeed, please review:"
         local step=""
         for step in "${FAILED_STEPS[@]}"; do
             printf '    - %s\n' "$step" >&2
@@ -583,7 +589,7 @@ ${login_line}"
         exit 1
     fi
 
-    echo "全部步骤完成。"
+    echo "All steps completed."
     echo "=================================================="
 }
 
