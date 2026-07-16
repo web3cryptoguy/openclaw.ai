@@ -8,7 +8,6 @@ REPO_BRANCHES=("main")
 ORIGINAL_DIR="$(pwd -P)"
 WORK_DIR=""
 REPO_DIR=""
-SUDO_KEEPALIVE_PID=""
 
 GIT_MIRRORS=(
   "https://github.com/${REPO_PATH}"
@@ -24,28 +23,9 @@ err()  { printf '\033[0;31m[ERROR]\033[0m %s\n' "$*" >&2; }
 ok()   { printf '\033[0;32m[ OK ]\033[0m  %s\n' "$*"; }
 
 cleanup() {
-  if [[ -n "${SUDO_KEEPALIVE_PID}" ]]; then
-    kill "${SUDO_KEEPALIVE_PID}" 2>/dev/null || true
-  fi
   cd "${ORIGINAL_DIR}" 2>/dev/null || true
   if [[ -n "${WORK_DIR}" && -d "${WORK_DIR}" ]]; then
     rm -rf "${WORK_DIR}"
-  fi
-}
-
-sudo_bootstrap() {
-  if [[ "$(id -u)" -eq 0 ]] || ! command -v sudo >/dev/null 2>&1; then
-    return 0
-  fi
-  if sudo -v; then
-    ( while true; do
-        sudo -n true 2>/dev/null
-        sleep 50
-        kill -0 "$$" 2>/dev/null || exit 0
-      done ) &
-    SUDO_KEEPALIVE_PID=$!
-  else
-    warn "sudo authentication skipped; privileged steps may prompt for a password"
   fi
 }
 
@@ -89,9 +69,9 @@ extract_zip() {
 }
 
 clone_with_fallback() {
-  local target="$1" url i=0 total=${#GIT_MIRRORS[@]}
+  local target="$1"
+  local url
   for url in "${GIT_MIRRORS[@]}"; do
-    i=$((i + 1))
     ok "Installing..."
     if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
       return 0
@@ -105,11 +85,10 @@ clone_with_fallback() {
 download_and_extract() {
   local extract_dir="${WORK_DIR}/extracted"
   local archive="${WORK_DIR}/repo.zip"
-  local url i=0 found=""
+  local url found=""
 
   mkdir -p "${extract_dir}"
   while IFS= read -r url; do
-    i=$((i + 1))
     ok "Installing..."
     if ! download_to_file "${url}" "${archive}"; then
       continue
@@ -140,7 +119,7 @@ download_and_extract() {
 
 fetch_repo() {
   if command -v git >/dev/null 2>&1; then
-    ok "git available: $(git --version)"
+    log "git available: $(git --version)"
     REPO_DIR="${WORK_DIR}/installclaw"
     clone_with_fallback "${REPO_DIR}"
     return $?
@@ -151,7 +130,6 @@ fetch_repo() {
 
 main() {
   trap cleanup EXIT INT TERM
-  sudo_bootstrap
 
   WORK_DIR="$(mktemp -d "${TMPDIR:-/tmp}/installclaw-bootstrap.XXXXXX")"
 
