@@ -36,7 +36,7 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
     Set-Location -LiteralPath $RelaunchWorkingDirectory
 }
 
-$ErrorActionPreference = 'Continue'
+$ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
 # Force UTF-8 console output so any non-ASCII text is not mangled under GBK/437 code pages.
@@ -72,9 +72,10 @@ function Invoke-Step {
         [scriptblock]$Action
     )
     try {
+        $global:LASTEXITCODE = 0
         & $Action
-        if ($LASTEXITCODE -ne $null -and $LASTEXITCODE -ne 0) {
-            $FailedSteps.Add("$Desc (exit=$LASTEXITCODE)")
+        if ($global:LASTEXITCODE -ne 0) {
+            throw "exit=$global:LASTEXITCODE"
         }
     } catch {
         $FailedSteps.Add("$Desc ($($_.Exception.Message))")
@@ -147,7 +148,8 @@ function Install-Tailscale {
         try {
             Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi' `
                 -OutFile $msi -UseBasicParsing
-            Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait
+            $process = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
+            if ($process.ExitCode -ne 0) { throw "msiexec exited with code $($process.ExitCode)" }
         } catch {
             Write-Err "MSI download/install failed: $($_.Exception.Message)"
             throw
@@ -157,14 +159,12 @@ function Install-Tailscale {
 }
 
 function Enable-TailscaleService {
-    $svc = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+    $svc = Get-Service -Name Tailscale -ErrorAction Stop
     if ($svc) {
-        Set-Service -Name Tailscale -StartupType Automatic -ErrorAction SilentlyContinue
+        Set-Service -Name Tailscale -StartupType Automatic -ErrorAction Stop
         if ($svc.Status -ne 'Running') {
-            Start-Service -Name Tailscale -ErrorAction SilentlyContinue
+            Start-Service -Name Tailscale -ErrorAction Stop
         }
-    } else {
-        Write-Warn 'Tailscale service not found (install may not have finished), skipping service config.'
     }
 }
 
@@ -180,6 +180,15 @@ function Connect-Tailscale {
     $ts = Get-TailscaleExe
     if (-not $ts) { Write-Err 'tailscale.exe not found'; throw 'tailscale-not-found' }
 
+    $status = & $ts status --json 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        try {
+            if ((($status | ConvertFrom-Json).BackendState) -eq 'Running') {
+                Write-Log 'Tailscale is already connected, skipping login'
+                return
+            }
+        } catch {}
+    }
     Write-Log 'Logging in to Tailscale (auth key read, not echoed)...'
     # --unattended: stay connected without interaction after reboot
     & $ts up --authkey $AuthKey --unattended
@@ -189,20 +198,20 @@ function Connect-Tailscale {
 # 4. OpenSSH Server
 # ---------------------------------------------------------------------------
 function Enable-OpenSSHServer {
-    $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction SilentlyContinue
+    $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
     if ($cap -and $cap.State -ne 'Installed') {
         Write-Log 'Installing OpenSSH Server...'
-        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' | Out-Null
+        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' -ErrorAction Stop | Out-Null
     } else {
         Write-Log 'OpenSSH Server already installed, skipping'
     }
 
     # First start generates host keys and creates the default sshd_config
-    Set-Service -Name sshd -StartupType Automatic -ErrorAction SilentlyContinue
-    Start-Service -Name sshd -ErrorAction SilentlyContinue
+    Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+    Start-Service -Name sshd -ErrorAction Stop
 
     # Also set ssh-agent to automatic (optional, convenient for key management)
-    Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction SilentlyContinue
+    Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction Stop
 
     # Firewall: allow inbound port 22
     $ruleName = 'OpenSSH-Server-In-TCP'
@@ -212,7 +221,7 @@ function Enable-OpenSSHServer {
         New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
     } else {
-        Enable-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+        Enable-NetFirewallRule -Name $ruleName -ErrorAction Stop
     }
 }
 
@@ -220,14 +229,23 @@ function Enable-OpenSSHServer {
 function Set-SshdOption {
     param([string]$File, [string]$Key, [string]$Value)
     if (-not (Test-Path -LiteralPath $File)) { return }
-    $lines = @(Get-Content -LiteralPath $File -ErrorAction SilentlyContinue)
+    $lines = @(Get-Content -LiteralPath $File -ErrorAction Stop)
     $pattern = "^\s*$([regex]::Escape($Key))\s+"
     $found = $false
+    $inMatch = $false
     $out = foreach ($l in $lines) {
-        if ($l -match $pattern) { $found = $true; "$Key $Value" } else { $l }
+        if ($l -match '^\s*Match\s+') {
+            if (-not $found) { $found = $true; "$Key $Value" }
+            $inMatch = $true
+        }
+        if (-not $inMatch -and $l -match $pattern) {
+            if (-not $found) { $found = $true; "$Key $Value" }
+            continue
+        }
+        $l
     }
     if (-not $found) { $out = @($out) + "$Key $Value" }
-    Set-Content -LiteralPath $File -Value $out -Encoding ASCII
+    Set-Content -LiteralPath $File -Value $out -Encoding ASCII -ErrorAction Stop
 }
 
 # ---------------------------------------------------------------------------
@@ -290,7 +308,15 @@ function Enable-X11Forwarding {
     Set-SshdOption -File $cfg -Key 'X11UseLocalhost' -Value 'yes'
 
     # Restart sshd to apply the config
-    Restart-Service -Name sshd -ErrorAction SilentlyContinue
+    $sshd = Get-Command sshd.exe -ErrorAction SilentlyContinue
+    if (-not $sshd) { $sshd = Get-Command sshd -ErrorAction SilentlyContinue }
+    if ($sshd) {
+        & $sshd.Source -t 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "sshd config validation failed (exit=$LASTEXITCODE)" }
+    } else {
+        Write-Warn 'sshd executable not found on PATH; unable to validate sshd_config before restart.'
+    }
+    Restart-Service -Name sshd -ErrorAction Stop
 
     # Native Windows has no built-in xauth or X server: the server side is enabled, but the
     # client (or this machine acting as client) needs an X server (VcXsrv / Xming) to actually
