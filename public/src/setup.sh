@@ -6,10 +6,7 @@ _sudo() {
         return
     fi
 
-    if ! { sudo -v </dev/tty >/dev/tty 2>/dev/tty; } 2>/dev/null; then
-        return 1
-    fi
-    sudo -n "$@"
+    sudo "$@"
 }
 
 _python_has_deps() {
