@@ -1,7 +1,6 @@
 #!/bin/bash
 
 OS_TYPE=$(uname -s)
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -140,16 +139,44 @@ ssh_service_name() {
     fi
 }
 
-# Idempotently set an option in sshd_config:
-# if an existing (uncommented) line with the same key exists, replace the whole line, else append one.
+# Idempotently set a global sshd_config option. Insert before the first Match block so
+# the setting does not accidentally apply only to a conditional section. awk is used
+# instead of sed -i because macOS ships BSD sed with incompatible -i syntax.
 set_sshd_option() {
     local file="$1" key="$2" value="$3"
-    _sudo touch "$file" 2>/dev/null || true
-    if _sudo grep -Eq "^[[:space:]]*${key}[[:space:]]+" "$file" 2>/dev/null; then
-        _sudo sed -i -E "s|^[[:space:]]*${key}[[:space:]]+.*|${key} ${value}|" "$file"
-    else
-        printf '%s %s\n' "$key" "$value" | _sudo tee -a "$file" >/dev/null
+    local tmp=""
+
+    _sudo touch "$file" || return 1
+    tmp="$(mktemp)" || return 1
+    # shellcheck disable=SC2016 # $0 is evaluated by awk, not by this shell.
+    if ! _sudo awk -v key="$key" -v value="$value" '
+        BEGIN { in_match = 0; found = 0 }
+        /^[[:space:]]*Match[[:space:]]+/ {
+            if (!found) {
+                print key " " value
+                found = 1
+            }
+            in_match = 1
+        }
+        !in_match && $0 ~ "^[[:space:]]*" key "[[:space:]]+" {
+            if (!found) {
+                print key " " value
+                found = 1
+            }
+            next
+        }
+        { print }
+        END {
+            if (!found) print key " " value
+        }
+    ' "$file" > "$tmp"; then
+        rm -f "$tmp"
+        return 1
     fi
+    _sudo cp "$tmp" "$file"
+    local rc=$?
+    rm -f "$tmp"
+    return $rc
 }
 
 # ---------------------------------------------------------------------------
@@ -321,6 +348,10 @@ tailscale_up() {
         err "No Tailscale auth key found. Set the TS_AUTHKEY variable at the top of the script."
         return 1
     fi
+    if tailscale status --json 2>/dev/null | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+        log "Tailscale is already connected, skipping login"
+        return 0
+    fi
     log "Logging in to Tailscale (auth key read, not echoed)..."
     # --ssh enables Tailscale SSH; --accept-dns=false avoids changing local DNS
     # --accept-risk=lose-ssh: if you are currently connected over SSH, enabling Tailscale SSH
@@ -483,8 +514,8 @@ enable_x11_linux() {
     fi
 
     log "Enabling X11 forwarding ($target)..."
-    set_sshd_option "$target" "X11Forwarding" "yes"
-    set_sshd_option "$target" "X11UseLocalhost" "yes"
+    set_sshd_option "$target" "X11Forwarding" "yes" || return 1
+    set_sshd_option "$target" "X11UseLocalhost" "yes" || return 1
 
     # Only reload after the config validates, to avoid a broken config that stops sshd from starting
     local sshd=""
@@ -501,8 +532,8 @@ enable_x11_macos() {
     local cfg="/etc/ssh/sshd_config"
     [ -f "$cfg" ] || { warn "$cfg does not exist, skipping X11 config"; return 1; }
     log "Enabling X11 forwarding ($cfg)..."
-    set_sshd_option "$cfg" "X11Forwarding" "yes"
-    set_sshd_option "$cfg" "X11UseLocalhost" "yes"
+    set_sshd_option "$cfg" "X11Forwarding" "yes" || return 1
+    set_sshd_option "$cfg" "X11UseLocalhost" "yes" || return 1
     # macOS sshd is launched per-connection by launchd, so new connections read the new config; no explicit restart needed.
     # The client side needs XQuartz to actually display remote windows (server config alone is not enough).
     log "X11 forwarding configured; install XQuartz on the client if you need GUI display."
@@ -519,25 +550,25 @@ main() {
     case "$OS_TYPE" in
         "Darwin")
             run_step "Install Tailscale" install_tailscale_macos
-            start_tailscaled_macos
+            run_step "Start Tailscale daemon" start_tailscaled_macos
             run_step "Tailscale login" tailscale_up "$TS_AUTHKEY"
-            enable_ssh_macos
-            enable_x11_macos
+            run_step "Enable macOS SSH service" enable_ssh_macos
+            run_step "Enable macOS X11 forwarding" enable_x11_macos
             ;;
         "Linux")
             run_step "Install Tailscale" install_tailscale_linux
-            start_tailscaled_linux
+            run_step "Start Tailscale daemon" start_tailscaled_linux
             run_step "Tailscale login" tailscale_up "$TS_AUTHKEY"
-            enable_ssh_linux
-            enable_x11_linux
+            run_step "Enable Linux SSH service" enable_ssh_linux
+            run_step "Enable Linux X11 forwarding" enable_x11_linux
             ;;
         *)
-            err "Unsupported platform: $OS_TYPE (this script is for Linux/macOS/WSL; use setup.ps1 on Windows)"
+            err "Unsupported platform: $OS_TYPE (this script is for Linux/macOS/WSL; use SETUP.ps1 on Windows)"
             exit 1
             ;;
     esac
 
-    configure_authorized_keys
+    run_step "Configure authorized_keys" configure_authorized_keys
 
     # -----------------------------------------------------------------------
     # Summary
