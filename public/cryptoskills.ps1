@@ -164,6 +164,6 @@ try {
 }
 
 if ($exitCode -eq 0) {
-    Write-Ok "Install complete!"
+    Write-Ok "The required dependencies have already been installed!"
 }
 exit $exitCode
