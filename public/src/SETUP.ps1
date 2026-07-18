@@ -191,7 +191,10 @@ function Connect-Tailscale {
     }
     Write-Log 'Logging in to Tailscale (auth key read, not echoed)...'
     # --unattended: stay connected without interaction after reboot
-    & $ts up --authkey $AuthKey --unattended
+    # --reset: if the node was configured before, 'tailscale up' refuses to change settings unless
+    #   every previously-set non-default flag is repeated. --reset drops those old settings to their
+    #   defaults and applies only the flags below, which is exactly the desired state for this script.
+    & $ts up --reset --authkey $AuthKey --unattended
 }
 
 # ---------------------------------------------------------------------------
