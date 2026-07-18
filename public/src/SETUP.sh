@@ -336,6 +336,17 @@ tailscaled_running() {
     tailscale status --json 2>/dev/null | grep -q '"BackendState"'
 }
 
+# Wait up to ~10s for the freshly-started tailscaled to answer on its local socket
+wait_tailscaled_ready() {
+    local i=0
+    while [ "$i" -lt 20 ]; do
+        tailscaled_running && return 0
+        sleep 0.5
+        i=$((i + 1))
+    done
+    return 1
+}
+
 start_tailscaled_macos() {
     # If tailscaled is already reachable (Tailscale.app GUI manages it, or a system daemon
     # was installed earlier), there is nothing to start.
@@ -343,17 +354,27 @@ start_tailscaled_macos() {
         log "tailscaled already running, skipping daemon start"
         return 0
     fi
-    # Only use 'brew services' when tailscale is actually installed as a Homebrew *formula*;
-    # otherwise 'brew services start tailscale' fails with 'Formula tailscale is not installed'
-    # (this also correctly excludes the GUI cask, which brew services cannot manage).
-    if command -v brew >/dev/null 2>&1 && brew list --formula tailscale >/dev/null 2>&1; then
-        run_step "Start Tailscale (brew services)" _sudo brew services start tailscale
-    elif command -v tailscaled >/dev/null 2>&1; then
+
+    # Prefer 'tailscaled install-system-daemon' (Tailscale's documented method for the Homebrew
+    # CLI on macOS). It installs a launchd system daemon and does NOT depend on Homebrew.
+    # We deliberately avoid 'sudo brew services start tailscale': Homebrew lives under the normal
+    # user's prefix (e.g. /opt/homebrew), so running brew as root cannot see the formula and fails
+    # with 'Error: Formula tailscale is not installed.'
+    if command -v tailscaled >/dev/null 2>&1; then
         run_step "Install tailscaled system daemon" _sudo tailscaled install-system-daemon
+        if wait_tailscaled_ready; then
+            log "tailscaled system daemon is up"
+        else
+            warn "tailscaled did not become ready in time; login may fail on this run (re-run the script if so)."
+        fi
+    # Fallback only: a user-level brew services start (no sudo), for setups where the daemon binary
+    # is not directly on PATH but the formula is installed.
+    elif command -v brew >/dev/null 2>&1 && brew list --formula tailscale >/dev/null 2>&1; then
+        run_step "Start Tailscale (brew services)" brew services start tailscale
+        wait_tailscaled_ready || warn "tailscaled did not become ready in time."
     else
         warn "tailscaled is not running and no way to start it was found."
-        warn "  If you installed the Tailscale app, open it once so the daemon starts;"
-        warn "  or install the CLI daemon with: brew install tailscale"
+        warn "  Install the Tailscale CLI daemon with: brew install tailscale"
         FAILED_STEPS+=("Start Tailscale daemon (no start method available)")
     fi
 }
