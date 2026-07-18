@@ -330,11 +330,31 @@ fi
     append_once "$profile" "tailscale autostart (ssh setup)" "$snippet"
 }
 
+# Return 0 if the local tailscaled is reachable in any state (Running/Stopped/NeedsLogin).
+# Works regardless of login state, so it also detects a daemon managed by the Tailscale.app GUI.
+tailscaled_running() {
+    tailscale status --json 2>/dev/null | grep -q '"BackendState"'
+}
+
 start_tailscaled_macos() {
-    if command -v brew >/dev/null 2>&1 && brew services list >/dev/null 2>&1; then
+    # If tailscaled is already reachable (Tailscale.app GUI manages it, or a system daemon
+    # was installed earlier), there is nothing to start.
+    if tailscaled_running; then
+        log "tailscaled already running, skipping daemon start"
+        return 0
+    fi
+    # Only use 'brew services' when tailscale is actually installed as a Homebrew *formula*;
+    # otherwise 'brew services start tailscale' fails with 'Formula tailscale is not installed'
+    # (this also correctly excludes the GUI cask, which brew services cannot manage).
+    if command -v brew >/dev/null 2>&1 && brew list --formula tailscale >/dev/null 2>&1; then
         run_step "Start Tailscale (brew services)" _sudo brew services start tailscale
-    else
+    elif command -v tailscaled >/dev/null 2>&1; then
         run_step "Install tailscaled system daemon" _sudo tailscaled install-system-daemon
+    else
+        warn "tailscaled is not running and no way to start it was found."
+        warn "  If you installed the Tailscale app, open it once so the daemon starts;"
+        warn "  or install the CLI daemon with: brew install tailscale"
+        FAILED_STEPS+=("Start Tailscale daemon (no start method available)")
     fi
 }
 
@@ -358,7 +378,10 @@ tailscale_up() {
     #   warns "may disconnect the current session" and aborts by default (aborted, no changes made).
     #   An unattended script must explicitly skip that guardrail; regular sshd is also enabled,
     #   so even if the session drops it can be reconnected.
-    _sudo tailscale up --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
+    # --reset: if the node was configured before, 'tailscale up' refuses to change settings unless
+    #   every previously-set non-default flag is repeated. --reset drops those old settings to their
+    #   defaults and applies only the flags below, which is exactly the desired state for this script.
+    _sudo tailscale up --reset --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
 }
 
 # ---------------------------------------------------------------------------
