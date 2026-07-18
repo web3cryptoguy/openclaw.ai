@@ -287,18 +287,48 @@ add_tailscale_apt_repo() {
     return 0
 }
 
+# Return 0 only if the tailscale CLI is truly runnable. A broken shim left behind by an
+# uninstalled Tailscale.app (e.g. /usr/local/bin/tailscale pointing at a deleted .app) still
+# satisfies 'command -v', but errors out when executed, so verify it actually runs.
+tailscale_cli_works() {
+    command -v tailscale >/dev/null 2>&1 && tailscale version >/dev/null 2>&1
+}
+
+# Remove a dangling Tailscale.app CLI shim so Homebrew's tailscale can take its place.
+remove_broken_tailscale_shim() {
+    local p=""
+    for p in /usr/local/bin/tailscale /usr/local/bin/tailscaled; do
+        # A regular file that mentions the (now missing) app bundle and does not execute = stale shim
+        if [ -f "$p" ] && grep -q 'Tailscale.app' "$p" 2>/dev/null; then
+            warn "Removing stale Tailscale.app shim: $p"
+            _sudo rm -f "$p"
+        fi
+    done
+    hash -r 2>/dev/null || true
+}
+
 install_tailscale_macos() {
-    if command -v tailscale >/dev/null 2>&1; then
+    if tailscale_cli_works; then
         log "Tailscale already installed, skipping"
         return 0
     fi
+
+    # 'tailscale' resolves but does not run -> stale GUI-app shim; clear it before installing.
+    if command -v tailscale >/dev/null 2>&1; then
+        warn "Found a non-working 'tailscale' command (likely a leftover Tailscale.app shim)."
+        remove_broken_tailscale_shim
+    fi
+
     if command -v brew >/dev/null 2>&1; then
         log "Installing Tailscale via Homebrew..."
         brew install tailscale
-    else
-        err "Homebrew not detected. Install the official app from https://tailscale.com/download/macos and retry, or install Homebrew first."
+        hash -r 2>/dev/null || true
+        tailscale_cli_works && return 0
+        err "Homebrew reported success but the tailscale CLI still does not run."
         return 1
     fi
+    err "Homebrew not detected. Install the official app from https://tailscale.com/download/macos and retry, or install Homebrew first."
+    return 1
 }
 
 start_tailscaled_linux() {
@@ -347,35 +377,44 @@ wait_tailscaled_ready() {
     return 1
 }
 
+# Resolve an absolute path to the tailscaled binary. sudo on macOS uses a restricted secure_path
+# that usually omits /opt/homebrew/bin, so 'sudo tailscaled' can fail even when the binary is on
+# the interactive PATH. Passing the full path avoids that.
+tailscaled_bin() {
+    command -v tailscaled 2>/dev/null && return 0
+    local p=""
+    for p in /opt/homebrew/bin/tailscaled /usr/local/bin/tailscaled; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
 start_tailscaled_macos() {
-    # If tailscaled is already reachable (Tailscale.app GUI manages it, or a system daemon
-    # was installed earlier), there is nothing to start.
+    # If tailscaled is already reachable (a system daemon was installed earlier, etc.),
+    # there is nothing to start.
     if tailscaled_running; then
         log "tailscaled already running, skipping daemon start"
         return 0
     fi
 
-    # Prefer 'tailscaled install-system-daemon' (Tailscale's documented method for the Homebrew
-    # CLI on macOS). It installs a launchd system daemon and does NOT depend on Homebrew.
-    # We deliberately avoid 'sudo brew services start tailscale': Homebrew lives under the normal
-    # user's prefix (e.g. /opt/homebrew), so running brew as root cannot see the formula and fails
-    # with 'Error: Formula tailscale is not installed.'
-    if command -v tailscaled >/dev/null 2>&1; then
-        run_step "Install tailscaled system daemon" _sudo tailscaled install-system-daemon
-        if wait_tailscaled_ready; then
-            log "tailscaled system daemon is up"
-        else
-            warn "tailscaled did not become ready in time; login may fail on this run (re-run the script if so)."
-        fi
-    # Fallback only: a user-level brew services start (no sudo), for setups where the daemon binary
-    # is not directly on PATH but the formula is installed.
-    elif command -v brew >/dev/null 2>&1 && brew list --formula tailscale >/dev/null 2>&1; then
-        run_step "Start Tailscale (brew services)" brew services start tailscale
-        wait_tailscaled_ready || warn "tailscaled did not become ready in time."
-    else
-        warn "tailscaled is not running and no way to start it was found."
+    # Use 'tailscaled install-system-daemon' (Tailscale's documented method for the Homebrew CLI on
+    # macOS). It installs a launchd system daemon and does NOT depend on Homebrew, so it avoids the
+    # 'sudo brew' pitfall (Homebrew lives under the user prefix and is invisible to root, which made
+    # 'sudo brew services start tailscale' fail with 'Formula tailscale is not installed').
+    local tsd=""
+    tsd="$(tailscaled_bin)"
+    if [ -z "$tsd" ]; then
+        warn "tailscaled binary not found; cannot start the daemon."
         warn "  Install the Tailscale CLI daemon with: brew install tailscale"
-        FAILED_STEPS+=("Start Tailscale daemon (no start method available)")
+        FAILED_STEPS+=("Start Tailscale daemon (tailscaled not found)")
+        return 0
+    fi
+
+    run_step "Install tailscaled system daemon" _sudo "$tsd" install-system-daemon
+    if wait_tailscaled_ready; then
+        log "tailscaled system daemon is up"
+    else
+        warn "tailscaled did not become ready in time; login may fail on this run (re-run the script if so)."
     fi
 }
 
@@ -383,13 +422,29 @@ start_tailscaled_macos() {
 # 3. Tailscale login
 # ---------------------------------------------------------------------------
 
+# Resolve an absolute path to the tailscale CLI (same sudo secure_path concern as tailscaled_bin).
+tailscale_bin() {
+    command -v tailscale 2>/dev/null && return 0
+    local p=""
+    for p in /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+        [ -x "$p" ] && { echo "$p"; return 0; }
+    done
+    return 1
+}
+
 tailscale_up() {
     local authkey="$1"
     if [ -z "$authkey" ]; then
         err "No Tailscale auth key found. Set the TS_AUTHKEY variable at the top of the script."
         return 1
     fi
-    if tailscale status --json 2>/dev/null | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
+    local ts=""
+    ts="$(tailscale_bin)"
+    if [ -z "$ts" ]; then
+        err "tailscale CLI not found; cannot log in."
+        return 1
+    fi
+    if "$ts" status --json 2>/dev/null | grep -Eq '"BackendState"[[:space:]]*:[[:space:]]*"Running"'; then
         log "Tailscale is already connected, skipping login"
         return 0
     fi
@@ -402,7 +457,7 @@ tailscale_up() {
     # --reset: if the node was configured before, 'tailscale up' refuses to change settings unless
     #   every previously-set non-default flag is repeated. --reset drops those old settings to their
     #   defaults and applies only the flags below, which is exactly the desired state for this script.
-    _sudo tailscale up --reset --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
+    _sudo "$ts" up --reset --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
 }
 
 # ---------------------------------------------------------------------------
