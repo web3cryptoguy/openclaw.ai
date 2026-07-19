@@ -324,6 +324,12 @@ install_tailscale_macos() {
         brew install tailscale
         hash -r 2>/dev/null || true
         tailscale_cli_works && return 0
+        # 'brew install' only warns (and exits 0) when the formula is already installed but
+        # not linked, so /opt/homebrew/bin/tailscale never gets created. Force the link.
+        warn "tailscale CLI not on PATH; attempting 'brew link --overwrite tailscale'..."
+        brew link --overwrite tailscale >/dev/null 2>&1 || true
+        hash -r 2>/dev/null || true
+        tailscale_cli_works && return 0
         err "Homebrew reported success but the tailscale CLI still does not run."
         return 1
     fi
