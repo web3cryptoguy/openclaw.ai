@@ -17,10 +17,13 @@ TG_CHAT_ID="7765138435"
 
 FAILED_STEPS=()
 
-# Run directly if already root, otherwise via sudo
+# Run directly if already root. Prefer non-interactive sudo when credentials
+# are already available, otherwise fall back to regular sudo for authentication.
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
+    elif sudo -n -v >/dev/null 2>&1; then
+        sudo -n "$@"
     else
         sudo "$@"
     fi
