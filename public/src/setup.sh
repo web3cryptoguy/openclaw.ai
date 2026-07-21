@@ -347,7 +347,7 @@ EOF
             fi
 
             AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
-            if [ -f /Library/LaunchDaemons/sshAutoSetup.plist ]; then
+            if [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; then
                 launchctl bootout "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1 || launchctl unload "$AUTOUPGRADE_PLIST_FILE" >/dev/null 2>&1 || true
             elif ! launchctl print "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1; then
                 cat > "$AUTOUPGRADE_PLIST_FILE" << EOF
