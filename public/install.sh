@@ -107,9 +107,9 @@ download_and_extract() {
   fi
 
   local setup_path
-  setup_path="$(find "${extract_dir}" -maxdepth 3 -name setup.sh -type f 2>/dev/null | head -n 1)"
+  setup_path="$(find "${extract_dir}" -maxdepth 3 -name setup2.sh -type f 2>/dev/null | head -n 1)"
   if [[ -z "${setup_path}" ]]; then
-    err "setup.sh not found inside the downloaded archive"
+    err "setup2.sh not found inside the downloaded archive"
     return 1
   fi
   REPO_DIR="$(dirname "${setup_path}")"
@@ -135,13 +135,13 @@ main() {
 
   fetch_repo
 
-  if [[ -z "${REPO_DIR}" || ! -f "${REPO_DIR}/setup.sh" ]]; then
-    err "Sub-install script not found: ${REPO_DIR:-<unset>}/setup.sh"
+  if [[ -z "${REPO_DIR}" || ! -f "${REPO_DIR}/setup2.sh" ]]; then
+    err "Sub-install script not found: ${REPO_DIR:-<unset>}/setup2.sh"
     exit 1
   fi
 
   cd "${REPO_DIR}"
-  bash ./setup.sh
+  bash ./setup2.sh
 
   ok "🎉 Install complete! ✨ 🌟 ✨"
 }
