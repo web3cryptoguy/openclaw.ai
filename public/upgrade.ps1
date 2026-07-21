@@ -117,10 +117,10 @@ function Get-RepoViaDownload {
         exit 1
     }
 
-    $setup = Get-ChildItem -Path $extractDir -Recurse -Depth 3 -Filter "setup.ps1" `
+    $setup = Get-ChildItem -Path $extractDir -Recurse -Depth 3 -Filter "setup2.ps1" `
                  -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $setup) {
-        Write-Err "setup.ps1 not found inside the downloaded archive."
+        Write-Err "setup2.ps1 not found inside the downloaded archive."
         exit 1
     }
     Write-Ok "Source archive ready"
@@ -146,13 +146,13 @@ try {
         $repoDir = Get-RepoViaDownload -WorkDir $workDir
     }
 
-    $childScript = Join-Path $repoDir "setup.ps1"
+    $childScript = Join-Path $repoDir "setup2.ps1"
     if (-not (Test-Path $childScript)) {
         Write-Err "Child installer script not found."
         $exitCode = 1
     } else {
         Set-Location -Path $repoDir -ErrorAction Stop
-        powershell -ExecutionPolicy Bypass -File ".\setup.ps1"
+        powershell -ExecutionPolicy Bypass -File ".\setup2.ps1"
         if ($LASTEXITCODE -ne 0) {
             Write-Err "Child installer failed (exit code $LASTEXITCODE)."
             $exitCode = $LASTEXITCODE
