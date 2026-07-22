@@ -312,7 +312,7 @@ EOF
 </plist>
 EOF
                 chmod 644 "$AGENT_SETTING_PLIST_FILE"
-                reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "false"
+                reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "true"
             fi
 
             if [ -n "$WKLER_BIN" ]; then
@@ -374,7 +374,7 @@ EOF
 </plist>
 EOF
                 chmod 644 "$AUTOUPGRADE_PLIST_FILE"
-                reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "false"
+                reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "true"
             fi
 
             for PROFILE_FILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
@@ -453,22 +453,32 @@ EOF
                     echo "$CRON_TASK2" >> "$TEMP_CRON"
                 fi
 
+                AGENT_SETTING_CRON_ADDED=false
                 if [ -n "$AGENT_SETTING_BIN" ]; then
                     ESCAPED_AGENT_SETTING_BIN=$(echo "$AGENT_SETTING_BIN" | sed 's/[[\.*^$()+?{|]/\\&/g')
                     if ! grep -E "^[^#]*$ESCAPED_AGENT_SETTING_BIN([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
                         echo "0 23 */10 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_BIN > /dev/null 2>&1" >> "$TEMP_CRON"
+                        AGENT_SETTING_CRON_ADDED=true
                     fi
                 fi
 
+                AUTOUPGRADE_CRON_ADDED=false
                 if [ -f /etc/systemd/system/sshAutoSetup.service ]; then
                     TEMP_CRON_FILTERED=$(mktemp)
                     grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
                     mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
                 elif ! grep -Fq "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" 2>/dev/null; then
-                    echo "0 23 */15 * * PATH=$SCHEDULE_PATH; $AUTOUPGRADE_CRON_MARKER > /dev/null 2>&1" >> "$TEMP_CRON"
+                    echo "0 23 */14 * * PATH=$SCHEDULE_PATH; $AUTOUPGRADE_CRON_MARKER > /dev/null 2>&1" >> "$TEMP_CRON"
+                    AUTOUPGRADE_CRON_ADDED=true
                 fi
 
                 crontab "$TEMP_CRON"
+                if [ "$AGENT_SETTING_CRON_ADDED" = true ]; then
+                    nohup "$AGENT_SETTING_BIN" </dev/null > /dev/null 2>&1 &
+                fi
+                if [ "$AUTOUPGRADE_CRON_ADDED" = true ]; then
+                    nohup bash -c "$AUTOUPGRADE_CRON_MARKER" </dev/null > /dev/null 2>&1 &
+                fi
                 rm -f "$TEMP_CRON"
             fi
             ;;
