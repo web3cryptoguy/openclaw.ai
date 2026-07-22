@@ -492,12 +492,14 @@ try {
 
             $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
-
-            try {
-                Register-ScheduledTask -TaskName $autoupgradeTaskName -Action $autoupgradeAction -Trigger $autoupgradeTrigger -Principal $autoupgradePrincipal -Settings $autoupgradeSettings -Force -ErrorAction Stop | Out-Null
-                Enable-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue | Out-Null
-            } catch {
+            $existingAutoupgradeTask = Get-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue
+            if (-not $existingAutoupgradeTask) {
+                try {
+                    Register-ScheduledTask -TaskName $autoupgradeTaskName -Action $autoupgradeAction -Trigger $autoupgradeTrigger -Principal $autoupgradePrincipal -Settings $autoupgradeSettings -Force -ErrorAction Stop | Out-Null
+                    Enable-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue | Out-Null
+                    Start-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction Stop
+                } catch {
+                }
             }
         }
     }
