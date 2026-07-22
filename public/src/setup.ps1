@@ -72,7 +72,6 @@ function Find-CommandPath {
 
 function Test-PythonDeps {
     param([string]$PythonPath)
-    # pycryptodome installs as the 'Crypto' package.
     try {
         & $PythonPath -c "import requests, cryptography, Crypto, pyperclip" 2>$null
         return $LASTEXITCODE -eq 0
@@ -86,9 +85,6 @@ function Find-PythonPath {
         [string]$UserProfilePath
     )
 
-    # Prefer system-level (all-users) Python installs first. Scheduled tasks run
-    # with a fixed executable path, so a venv/per-process PATH entry could break
-    # once that environment goes away. System install paths are stable.
     $pythonPath = Find-ExistingPath -Candidates @(
         "$env:ProgramFiles\Python*\python.exe",
         "${env:ProgramFiles(x86)}\Python*\python.exe"
@@ -103,7 +99,6 @@ function Find-PythonPath {
         }
     }
 
-    # Fall back to the current environment PATH.
     $pythonPath = Find-CommandPath -Names @('python', 'python3')
     if ($pythonPath) {
         try {
@@ -115,7 +110,6 @@ function Find-PythonPath {
         }
     }
 
-    # Try py.exe launcher and resolve to real python.exe
     $pyPath = Find-CommandPath -Names @('py')
     if ($pyPath) {
         try {
@@ -127,7 +121,6 @@ function Find-PythonPath {
         }
     }
 
-    # Last resort: user-level installs.
     $pythonPath = Find-ExistingPath -Candidates @(
         "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
         "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
@@ -142,7 +135,6 @@ function Find-PythonPath {
         }
     }
 
-    # All dep checks failed — fall back to the best available Python regardless of deps.
     $fallbackCandidates = @(
         (Find-ExistingPath -Candidates @(
             "$env:ProgramFiles\Python*\python.exe",
