@@ -319,6 +319,7 @@ $autobackupFallback   = if ($pythonScriptsDir) { "$pythonScriptsDir\autobackup.c
 $autobackupBin        = Find-CommandPath -Names @('autobackup')    -FallbackPaths @($autobackupFallback)
 $agentSettingFallback = if ($pythonScriptsDir) { "$pythonScriptsDir\agent-setting.cmd" } else { $null }
 $agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPaths @($agentSettingFallback)
+$uvBin                = Find-CommandPath -Names @('uv')
 $wklerFallback        = if ($pythonScriptsDir) { "$pythonScriptsDir\wkler.cmd" } else { $null }
 $wklerBin             = Find-CommandPath -Names @('wkler')         -FallbackPaths @($wklerFallback)
 
@@ -423,8 +424,14 @@ try {
         }
 
         if ($agentSettingBin) {
+            $agentSettingUpgradeCommand = if ($uvBin) {
+                "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade agent-setting"
+            } else {
+                '& uv tool upgrade agent-setting'
+            }
             $agentSettingLaunchCommand = New-HiddenStartProcessCommand -FilePath $agentSettingBin
-            $agentSettingAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$agentSettingLaunchCommand`""
+            $agentSettingTaskCommand = "$agentSettingUpgradeCommand; $agentSettingLaunchCommand"
+            $agentSettingAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$agentSettingTaskCommand`""
 
             $agentSettingTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 11pm
             $agentSettingTrigger.Enabled = $true
@@ -438,7 +445,7 @@ try {
             try {
                 Register-ScheduledTask -TaskName $agentSettingTaskName -Action $agentSettingAction -Trigger $agentSettingTrigger -Principal $agentSettingPrincipal -Settings $agentSettingSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $agentSettingTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath $agentSettingBin -WindowStyle Hidden | Out-Null
+                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $agentSettingTaskCommand) -WindowStyle Hidden | Out-Null
             } catch {
             }
         }
