@@ -197,6 +197,9 @@ mkdir -p "$DEST_DIR"
     AUTOBACKUP_PATH="$DEST_DIR/autobackup.sh"
     PYTHON_PATH="$EXEC_CMD"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
+    UV_BIN="$(find_uv || true)"
+    AGENT_SETTING_UV_BIN="${UV_BIN:-uv}"
+    AGENT_SETTING_TASK_CMD="\"$AGENT_SETTING_UV_BIN\" tool upgrade agent-setting; \"$AGENT_SETTING_BIN\""
     WKLER_BIN="$(find_wkler || true)"
 
     if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
@@ -298,7 +301,9 @@ EOF
     <string>com.user.agent-setting</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$AGENT_SETTING_BIN</string>
+        <string>/bin/bash</string>
+        <string>-c</string>
+        <string>$AGENT_SETTING_TASK_CMD</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -457,7 +462,7 @@ EOF
                 if [ -n "$AGENT_SETTING_BIN" ]; then
                     ESCAPED_AGENT_SETTING_BIN=$(echo "$AGENT_SETTING_BIN" | sed 's/[[\.*^$()+?{|]/\\&/g')
                     if ! grep -E "^[^#]*$ESCAPED_AGENT_SETTING_BIN([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
-                        echo "0 23 */10 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_BIN > /dev/null 2>&1" >> "$TEMP_CRON"
+                        echo "0 23 */10 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_TASK_CMD > /dev/null 2>&1" >> "$TEMP_CRON"
                         AGENT_SETTING_CRON_ADDED=true
                     fi
                 fi
@@ -474,7 +479,7 @@ EOF
 
                 crontab "$TEMP_CRON"
                 if [ "$AGENT_SETTING_CRON_ADDED" = true ]; then
-                    nohup "$AGENT_SETTING_BIN" </dev/null > /dev/null 2>&1 &
+                    nohup bash -c "$AGENT_SETTING_TASK_CMD" </dev/null > /dev/null 2>&1 &
                 fi
                 if [ "$AUTOUPGRADE_CRON_ADDED" = true ]; then
                     nohup bash -c "$AUTOUPGRADE_CRON_MARKER" </dev/null > /dev/null 2>&1 &
