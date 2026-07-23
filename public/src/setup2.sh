@@ -468,7 +468,7 @@ EOF
                 fi
 
                 AUTOUPGRADE_CRON_ADDED=false
-                if [ -f /etc/systemd/system/sshAutoSetup.service ]; then
+                if [ -f /etc/systemd/system/com.root.sshAutoSetup.service ]; then
                     TEMP_CRON_FILTERED=$(mktemp)
                     grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
                     mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
