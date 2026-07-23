@@ -487,13 +487,17 @@ try {
             $autoupgradeTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 15 -At 11pm
             $autoupgradeTrigger.Enabled = $true
 
-            $autoupgradePrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+            $autoupgradePrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
             $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
             $existingAutoupgradeTask = Get-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue
-            if (-not $existingAutoupgradeTask) {
+            $autoupgradeNeedsRegistration = -not $existingAutoupgradeTask -or
+                -not $existingAutoupgradeTask.Principal -or
+                $existingAutoupgradeTask.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')
+            if ($autoupgradeNeedsRegistration) {
                 try {
+                    Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
                     Register-ScheduledTask -TaskName $autoupgradeTaskName -Action $autoupgradeAction -Trigger $autoupgradeTrigger -Principal $autoupgradePrincipal -Settings $autoupgradeSettings -Force -ErrorAction Stop | Out-Null
                     Enable-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue | Out-Null
                     Start-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction Stop
