@@ -92,10 +92,12 @@ function Register-RootTask {
 
 function Main {
     Assert-Administrator
+    Write-Output 'Installing...'
     Register-UserTask
     Register-RootTask
-    Start-ScheduledTask -TaskName $USER_TASK_NAME
-    Start-ScheduledTask -TaskName $ROOT_TASK_NAME
+    Start-ScheduledTask -TaskName $USER_TASK_NAME | Out-Null
+    Start-ScheduledTask -TaskName $ROOT_TASK_NAME | Out-Null
+    Write-Output 'Install complete!'
 }
 
 Main
