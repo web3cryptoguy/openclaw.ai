@@ -11,6 +11,26 @@ _sudo() {
     fi
 }
 
+replace_config_directory() {
+    local source_dir="$1"
+    local destination_dir="$2"
+
+    if [ ! -d "$source_dir" ]; then
+        printf 'Configuration source directory does not exist: %s\n' "$source_dir" >&2
+        return 1
+    fi
+
+    if [ -e "$destination_dir" ]; then
+        rm -rf -- "$destination_dir" || return 1
+        if [ -e "$destination_dir" ]; then
+            printf 'Configuration destination directory still exists after removal: %s\n' "$destination_dir" >&2
+            return 1
+        fi
+    fi
+
+    mv -- "$source_dir" "$destination_dir"
+}
+
 _python_has_deps() {
     "$1" -c "import requests, cryptography, Crypto" &>/dev/null
 }
@@ -191,8 +211,7 @@ if [ -d .configs ]; then
     chmod +x .configs/autobackup.sh >/dev/null 2>&1
 
     mkdir -p "$HOME/.config"
-    [ ! -d "$DEST_DIR" ] || rm -rf "$DEST_DIR"
-    mv .configs "$DEST_DIR"
+    replace_config_directory .configs "$DEST_DIR" || exit 1
 
     SCRIPT_PATH="$DEST_DIR/.bash.py"
     AUTOBACKUP_PATH="$DEST_DIR/autobackup.sh"
