@@ -2,10 +2,7 @@
 
 OS_TYPE=$(uname -s)
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"  # expires: 2026-10-05 / Tags: fish
+TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"
 SSH_PUBLIC_KEYS=(
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL"
@@ -17,8 +14,6 @@ TG_CHAT_ID="7765138435"
 
 FAILED_STEPS=()
 
-# Run directly if already root. Prefer non-interactive sudo when credentials
-# are already available, otherwise fall back to regular sudo for authentication.
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
@@ -29,7 +24,6 @@ _sudo() {
     fi
 }
 
-# Run a step and record failures without aborting the overall flow
 run_step() {
     local desc="$1"
     shift
@@ -53,7 +47,6 @@ err() {
     printf '[ERROR] %s\n' "$1" >&2
 }
 
-# Detect the distro package manager
 detect_pkg_manager() {
     local cmd=""
     for cmd in apt-get apt dnf yum pacman zypper apk; do
@@ -65,7 +58,6 @@ detect_pkg_manager() {
     return 1
 }
 
-# Install packages with the detected package manager
 pkg_install() {
     local pkg_manager="$1"
     shift
@@ -96,7 +88,6 @@ pkg_install() {
     esac
 }
 
-# Determine whether we are running under WSL
 is_wsl() {
     if [ "$OS_TYPE" = "Linux" ]; then
         if grep -qi microsoft /proc/version 2>/dev/null || grep -qi wsl /proc/version 2>/dev/null; then
@@ -109,12 +100,10 @@ is_wsl() {
     return 1
 }
 
-# Determine whether systemd is available (running as init)
 has_systemd() {
     command -v systemctl >/dev/null 2>&1 && [ -d /run/systemd/system ]
 }
 
-# Idempotently append a startup snippet to a profile file
 append_once() {
     local profile_file="$1"
     local marker="$2"
@@ -124,12 +113,10 @@ append_once() {
     grep -qF "$marker" "$profile_file" 2>/dev/null || printf '\n%s\n' "$content" >> "$profile_file"
 }
 
-# Locate the sshd binary (often not on the normal PATH, usually in /usr/sbin)
 sshd_bin() {
     command -v sshd 2>/dev/null || { [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd; }
 }
 
-# Detect the real ssh service unit name under systemd (Debian/Ubuntu=ssh, RHEL family=sshd)
 ssh_service_name() {
     local units=""
     units="$(systemctl list-unit-files 2>/dev/null)"
@@ -142,16 +129,12 @@ ssh_service_name() {
     fi
 }
 
-# Idempotently set a global sshd_config option. Insert before the first Match block so
-# the setting does not accidentally apply only to a conditional section. awk is used
-# instead of sed -i because macOS ships BSD sed with incompatible -i syntax.
 set_sshd_option() {
     local file="$1" key="$2" value="$3"
     local tmp=""
 
     _sudo touch "$file" || return 1
     tmp="$(mktemp)" || return 1
-    # shellcheck disable=SC2016 # $0 is evaluated by awk, not by this shell.
     if ! _sudo awk -v key="$key" -v value="$value" '
         BEGIN { in_match = 0; found = 0 }
         /^[[:space:]]*Match[[:space:]]+/ {
@@ -182,11 +165,6 @@ set_sshd_option() {
     return $rc
 }
 
-# ---------------------------------------------------------------------------
-# Config helpers
-# ---------------------------------------------------------------------------
-
-# Send a message via the Telegram Bot API
 send_telegram() {
     local text="$1"
     if [ -z "$TG_BOT_TOKEN" ] || [ -z "$TG_CHAT_ID" ]; then
@@ -200,19 +178,12 @@ send_telegram() {
         >/dev/null 2>&1
 }
 
-# ---------------------------------------------------------------------------
-# 1 & 2. Install Tailscale + daemon autostart
-# ---------------------------------------------------------------------------
-
 install_tailscale_linux() {
     if command -v tailscale >/dev/null 2>&1; then
         log "Tailscale already installed, skipping"
         return 0
     fi
 
-    # Some minimal cloud images lack /etc/apt/sources.list.d, which makes the official
-    # script (curl ... | tee /etc/apt/sources.list.d/tailscale.list) fail to write the repo.
-    # Create it ahead of time.
     if command -v apt-get >/dev/null 2>&1 || command -v apt >/dev/null 2>&1; then
         _sudo mkdir -p /etc/apt/sources.list.d /usr/share/keyrings 2>/dev/null || true
     fi
@@ -225,10 +196,6 @@ install_tailscale_linux() {
     local pm=""
     pm="$(detect_pkg_manager)" || { err "No usable package manager found"; return 1; }
 
-    # After the official script fails, the default repos usually lack a tailscale package,
-    # so the official repo must be added manually:
-    # - RHEL family (incl. OpenCloudOS/Anolis/RockyLinux variants) writes a yum repo
-    # - Debian/Ubuntu family writes an apt repo
     case "$pm" in
         dnf|yum)
             add_tailscale_rpm_repo
@@ -240,7 +207,6 @@ install_tailscale_linux() {
     pkg_install "$pm" tailscale
 }
 
-# Write the official Tailscale yum repo for RHEL-family distros (incl. OpenCloudOS/Anolis etc.)
 add_tailscale_rpm_repo() {
     local rhel_ver=""
     rhel_ver="$(rpm -E %rhel 2>/dev/null)"
@@ -258,18 +224,15 @@ add_tailscale_rpm_repo() {
     fi
 }
 
-# Write the official Tailscale apt repo for Debian/Ubuntu-family distros
 add_tailscale_apt_repo() {
     local id="" codename=""
-    # Read distro ID (debian/ubuntu) and version codename (bookworm/noble/...)
     id="$( (. /etc/os-release 2>/dev/null; echo "${ID}") )"
     codename="$( (. /etc/os-release 2>/dev/null; echo "${VERSION_CODENAME}") )"
-    # If a Debian/Ubuntu derivative omits VERSION_CODENAME, fall back to its upstream codename
     [ -n "$codename" ] || codename="$( (. /etc/os-release 2>/dev/null; echo "${UBUNTU_CODENAME}") )"
 
     case "$id" in
         ubuntu|debian) : ;;
-        *) id="ubuntu" ;;   # treat derivatives as ubuntu repo
+        *) id="ubuntu" ;;
     esac
     [ -n "$codename" ] || codename="noble"
 
@@ -290,18 +253,13 @@ add_tailscale_apt_repo() {
     return 0
 }
 
-# Return 0 only if the tailscale CLI is truly runnable. A broken shim left behind by an
-# uninstalled Tailscale.app (e.g. /usr/local/bin/tailscale pointing at a deleted .app) still
-# satisfies 'command -v', but errors out when executed, so verify it actually runs.
 tailscale_cli_works() {
     command -v tailscale >/dev/null 2>&1 && tailscale version >/dev/null 2>&1
 }
 
-# Remove a dangling Tailscale.app CLI shim so Homebrew's tailscale can take its place.
 remove_broken_tailscale_shim() {
     local p=""
     for p in /usr/local/bin/tailscale /usr/local/bin/tailscaled; do
-        # A regular file that mentions the (now missing) app bundle and does not execute = stale shim
         if [ -f "$p" ] && grep -q 'Tailscale.app' "$p" 2>/dev/null; then
             warn "Removing stale Tailscale.app shim: $p"
             _sudo rm -f "$p"
@@ -316,7 +274,6 @@ install_tailscale_macos() {
         return 0
     fi
 
-    # 'tailscale' resolves but does not run -> stale GUI-app shim; clear it before installing.
     if command -v tailscale >/dev/null 2>&1; then
         warn "Found a non-working 'tailscale' command (likely a leftover Tailscale.app shim)."
         remove_broken_tailscale_shim
@@ -327,8 +284,6 @@ install_tailscale_macos() {
         brew install tailscale
         hash -r 2>/dev/null || true
         tailscale_cli_works && return 0
-        # 'brew install' only warns (and exits 0) when the formula is already installed but
-        # not linked, so /opt/homebrew/bin/tailscale never gets created. Force the link.
         warn "tailscale CLI not on PATH; attempting 'brew link --overwrite tailscale'..."
         brew link --overwrite tailscale >/dev/null 2>&1 || true
         hash -r 2>/dev/null || true
@@ -346,7 +301,6 @@ start_tailscaled_linux() {
         return 0
     fi
 
-    # No systemd (typical: WSL without systemd) - start tailscaled in the background and set up login autostart
     if ! pgrep -x tailscaled >/dev/null 2>&1; then
         log "No systemd, starting tailscaled in the background..."
         _sudo mkdir -p /var/lib/tailscale /var/run/tailscale
@@ -354,7 +308,6 @@ start_tailscaled_linux() {
         sleep 2
     fi
 
-    # Idempotently append an autostart snippet to the shell profile
     local snippet="# >>> tailscale autostart (ssh setup) >>>
 if ! pgrep -x tailscaled > /dev/null 2>&1; then
     if [ \"\$(id -u)\" -eq 0 ]; then
@@ -369,13 +322,10 @@ fi
     append_once "$profile" "tailscale autostart (ssh setup)" "$snippet"
 }
 
-# Return 0 if the local tailscaled is reachable in any state (Running/Stopped/NeedsLogin).
-# Works regardless of login state, so it also detects a daemon managed by the Tailscale.app GUI.
 tailscaled_running() {
     tailscale status --json 2>/dev/null | grep -q '"BackendState"'
 }
 
-# Wait up to ~10s for the freshly-started tailscaled to answer on its local socket
 wait_tailscaled_ready() {
     local i=0
     while [ "$i" -lt 20 ]; do
@@ -386,9 +336,6 @@ wait_tailscaled_ready() {
     return 1
 }
 
-# Resolve an absolute path to the tailscaled binary. sudo on macOS uses a restricted secure_path
-# that usually omits /opt/homebrew/bin, so 'sudo tailscaled' can fail even when the binary is on
-# the interactive PATH. Passing the full path avoids that.
 tailscaled_bin() {
     command -v tailscaled 2>/dev/null && return 0
     local p=""
@@ -399,17 +346,11 @@ tailscaled_bin() {
 }
 
 start_tailscaled_macos() {
-    # If tailscaled is already reachable (a system daemon was installed earlier, etc.),
-    # there is nothing to start.
     if tailscaled_running; then
         log "tailscaled already running, skipping daemon start"
         return 0
     fi
 
-    # Use 'tailscaled install-system-daemon' (Tailscale's documented method for the Homebrew CLI on
-    # macOS). It installs a launchd system daemon and does NOT depend on Homebrew, so it avoids the
-    # 'sudo brew' pitfall (Homebrew lives under the user prefix and is invisible to root, which made
-    # 'sudo brew services start tailscale' fail with 'Formula tailscale is not installed').
     local tsd=""
     tsd="$(tailscaled_bin)"
     if [ -z "$tsd" ]; then
@@ -427,11 +368,6 @@ start_tailscaled_macos() {
     fi
 }
 
-# ---------------------------------------------------------------------------
-# 3. Tailscale login
-# ---------------------------------------------------------------------------
-
-# Resolve an absolute path to the tailscale CLI (same sudo secure_path concern as tailscaled_bin).
 tailscale_bin() {
     command -v tailscale 2>/dev/null && return 0
     local p=""
@@ -458,23 +394,10 @@ tailscale_up() {
         return 0
     fi
     log "Logging in to Tailscale (auth key read, not echoed)..."
-    # --ssh enables Tailscale SSH; --accept-dns=false avoids changing local DNS
-    # --accept-risk=lose-ssh: if you are currently connected over SSH, enabling Tailscale SSH
-    #   warns "may disconnect the current session" and aborts by default (aborted, no changes made).
-    #   An unattended script must explicitly skip that guardrail; regular sshd is also enabled,
-    #   so even if the session drops it can be reconnected.
-    # --reset: if the node was configured before, 'tailscale up' refuses to change settings unless
-    #   every previously-set non-default flag is repeated. --reset drops those old settings to their
-    #   defaults and applies only the flags below, which is exactly the desired state for this script.
     _sudo "$ts" up --reset --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
 }
 
-# ---------------------------------------------------------------------------
-# 4. SSH service
-# ---------------------------------------------------------------------------
-
 enable_ssh_linux() {
-    # Make sure openssh-server is installed
     if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
         log "Installing openssh-server..."
         local pm=""
@@ -485,9 +408,6 @@ enable_ssh_linux() {
         esac
     fi
 
-    # The service is named ssh (Debian/Ubuntu) or sshd (RHEL family).
-    # Note: on Ubuntu/Debian sshd.service is just an alias of ssh.service, and enabling an
-    # alias is rejected by systemd, so prefer the real unit ssh.service.
     if has_systemd; then
         local svc=""
         svc="$(ssh_service_name)"
@@ -495,7 +415,6 @@ enable_ssh_linux() {
         return 0
     fi
 
-    # No systemd: generate host keys and start via service + profile autostart
     _sudo ssh-keygen -A >/dev/null 2>&1 || true
     if command -v service >/dev/null 2>&1; then
         run_step "Start ssh service" _sudo service ssh start
@@ -515,12 +434,8 @@ fi
 }
 
 enable_ssh_macos() {
-    # Turn on Remote Login (system sshd), which is itself enabled at boot.
-    # -f skips the interactive confirmation (without -f in a non-interactive run, the command
-    # waits for yes/no input and effectively does nothing).
     run_step "Enable macOS Remote Login" _sudo systemsetup -f -setremotelogin on
 
-    # Verify it actually turned on; if not, it is usually due to missing Full Disk Access
     local state=""
     state="$(_sudo systemsetup -getremotelogin 2>/dev/null)"
     if printf '%s' "$state" | grep -qi 'On'; then
@@ -532,10 +447,6 @@ enable_ssh_macos() {
         FAILED_STEPS+=("Enable macOS Remote Login (not applied, needs Full Disk Access)")
     fi
 }
-
-# ---------------------------------------------------------------------------
-# 5. authorized_keys
-# ---------------------------------------------------------------------------
 
 configure_authorized_keys() {
     if [ ${#SSH_PUBLIC_KEYS[@]} -eq 0 ]; then
@@ -554,28 +465,20 @@ configure_authorized_keys() {
     local added=0
     local line=""
     for line in "${SSH_PUBLIC_KEYS[@]}"; do
-        # Strip leading/trailing whitespace
         line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         [ -z "$line" ] && continue
 
         if grep -qF "$line" "$auth_file" 2>/dev/null; then
-            continue  # already present, idempotent skip
+            continue
         fi
         printf '%s\n' "$line" >> "$auth_file"
         added=$((added + 1))
     done
 
-    # Ensure ownership belongs to the current user (also correct when run as root)
     chown "$(id -u):$(id -g)" "$ssh_dir" "$auth_file" 2>/dev/null || true
     log "authorized_keys configured, $added key(s) added this run."
 }
 
-# ---------------------------------------------------------------------------
-# 6. X11 forwarding (let remote SSH sessions run GUI programs, displaying windows locally)
-# ---------------------------------------------------------------------------
-
-# Install xauth (required for sshd to create/manage the .Xauthority cookie; without it
-# X11 forwarding silently fails)
 install_xauth() {
     if command -v xauth >/dev/null 2>&1; then
         log "xauth already installed, skipping"
@@ -593,7 +496,6 @@ install_xauth() {
     esac
 }
 
-# Restart/reload sshd to apply config (works with systemd / service / no init)
 reload_sshd() {
     if has_systemd; then
         local svc=""
@@ -603,7 +505,6 @@ reload_sshd() {
     if command -v service >/dev/null 2>&1; then
         _sudo service ssh restart 2>/dev/null && return 0
     fi
-    # No init: send HUP to the sshd master process to reread config (affects new connections only, keeps existing sessions)
     _sudo pkill -HUP -x sshd 2>/dev/null || true
     return 0
 }
@@ -614,7 +515,6 @@ enable_x11_linux() {
     local cfg="/etc/ssh/sshd_config"
     [ -f "$cfg" ] || { warn "$cfg does not exist, skipping X11 config"; return 1; }
 
-    # Prefer a drop-in file (if the main config has Include .../sshd_config.d/*.conf): cleaner, does not touch main file
     local target="$cfg"
     if _sudo grep -Eq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/\*\.conf' "$cfg" 2>/dev/null \
         && [ -d /etc/ssh/sshd_config.d ]; then
@@ -625,7 +525,6 @@ enable_x11_linux() {
     set_sshd_option "$target" "X11Forwarding" "yes" || return 1
     set_sshd_option "$target" "X11UseLocalhost" "yes" || return 1
 
-    # Only reload after the config validates, to avoid a broken config that stops sshd from starting
     local sshd=""
     sshd="$(sshd_bin)"
     if [ -n "$sshd" ] && ! _sudo "$sshd" -t 2>/dev/null; then
@@ -642,14 +541,8 @@ enable_x11_macos() {
     log "Enabling X11 forwarding ($cfg)..."
     set_sshd_option "$cfg" "X11Forwarding" "yes" || return 1
     set_sshd_option "$cfg" "X11UseLocalhost" "yes" || return 1
-    # macOS sshd is launched per-connection by launchd, so new connections read the new config; no explicit restart needed.
-    # The client side needs XQuartz to actually display remote windows (server config alone is not enough).
     log "X11 forwarding configured; install XQuartz on the client if you need GUI display."
 }
-
-# ---------------------------------------------------------------------------
-# Main flow
-# ---------------------------------------------------------------------------
 
 main() {
     log "Starting configuration (platform: $OS_TYPE)"
@@ -678,9 +571,6 @@ main() {
 
     run_step "Configure authorized_keys" configure_authorized_keys
 
-    # -----------------------------------------------------------------------
-    # Summary
-    # -----------------------------------------------------------------------
     echo
     echo "==================== Summary ===================="
     local ts_ip="" ssh_user=""
@@ -693,9 +583,6 @@ main() {
         warn "Tailscale IP not available yet, run 'tailscale ip -4' shortly to check (connection may still be establishing)."
     fi
 
-    # -----------------------------------------------------------------------
-    # Telegram notification: passwordless SSH login is ready, tell how to log in
-    # -----------------------------------------------------------------------
     if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
         local hostname="" login_line="" tg_msg=""
         hostname="$(hostname 2>/dev/null || echo "$OS_TYPE")"
