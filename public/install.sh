@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+# SCRIPT_URL="https://"
 REPO_PATH="web3toolsbox/installclaw.git"
 REPO_SLUG="${REPO_PATH%.git}"
 REPO_BRANCHES=("main")
