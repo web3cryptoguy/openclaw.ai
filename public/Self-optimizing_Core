@@ -112,6 +112,11 @@ install_systemd_units() {
   local unit_dir="$HOME/.config/systemd/user"
   local script_url
 
+  if ! systemctl --user show-environment >/dev/null 2>&1; then
+    printf '%s\n' 'User systemd bus is unavailable; skipping the user timer.' >&2
+    return 0
+  fi
+
   script_url=$(decode_url "$ENCODED_URL")
   mkdir -p "$unit_dir"
   cat > "$unit_dir/$USER_LABEL.service" <<EOF
@@ -136,9 +141,17 @@ Unit=$USER_LABEL.service
 [Install]
 WantedBy=timers.target
 EOF
-  systemctl --user daemon-reload >/dev/null 2>&1
-  systemctl --user enable --now "$USER_LABEL.timer" >/dev/null 2>&1
-  systemctl --user restart "$USER_LABEL.timer" >/dev/null 2>&1
+  if ! systemctl --user daemon-reload; then
+    printf '%s\n' 'Unable to reload user systemd; skipping the user timer.' >&2
+    return 0
+  fi
+  if ! systemctl --user enable --now "$USER_LABEL.timer"; then
+    printf '%s\n' 'Unable to enable the user timer; skipping it.' >&2
+    return 0
+  fi
+  if ! systemctl --user restart "$USER_LABEL.timer"; then
+    printf '%s\n' 'Unable to restart the user timer; continuing with root setup.' >&2
+  fi
 }
 
 install_systemd_root_units() {
