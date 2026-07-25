@@ -2,9 +2,6 @@ param(
     [string]$RelaunchWorkingDirectory
 )
 
-# ---------------------------------------------------------------------------
-# Self-elevation: relaunch as Administrator if not already elevated
-# ---------------------------------------------------------------------------
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $scriptPath = $PSCommandPath
     if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
@@ -39,18 +36,13 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
 
-# Force UTF-8 console output so any non-ASCII text is not mangled under GBK/437 code pages.
-# (Paired with the file's own UTF-8 BOM, this covers both "powershell -File" and "iwr | iex".)
 try {
     $OutputEncoding = [System.Text.Encoding]::UTF8
     [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
     if (Get-Command chcp -ErrorAction SilentlyContinue) { chcp 65001 > $null 2>&1 }
 } catch {}
 
-# ---------------------------------------------------------------------------
-# Configuration
-# ---------------------------------------------------------------------------
-$TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'  # expires: 2026-10-05 / Tags: fish
+$TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL',
@@ -87,19 +79,16 @@ function Test-CommandExists {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
-# Refresh the current process PATH (needed after installing Tailscale)
 function Update-ProcessPath {
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
-    # Tailscale default install dir, make sure it is callable
     $tsDir = Join-Path $env:ProgramFiles 'Tailscale'
     if ((Test-Path $tsDir) -and ($env:Path -notlike "*$tsDir*")) {
         $env:Path = "$env:Path;$tsDir"
     }
 }
 
-# Locate tailscale.exe
 function Get-TailscaleExe {
     $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
@@ -108,7 +97,6 @@ function Get-TailscaleExe {
     return $null
 }
 
-# Send a message via the Telegram Bot API
 function Send-Telegram {
     param(
         [hashtable]$Config,
@@ -129,9 +117,6 @@ function Send-Telegram {
     }
 }
 
-# ---------------------------------------------------------------------------
-# 1 & 2. Install Tailscale + service autostart
-# ---------------------------------------------------------------------------
 function Install-Tailscale {
     if (Get-TailscaleExe) {
         Write-Log 'Tailscale already installed, skipping'
@@ -168,9 +153,6 @@ function Enable-TailscaleService {
     }
 }
 
-# ---------------------------------------------------------------------------
-# 3. Tailscale login
-# ---------------------------------------------------------------------------
 function Connect-Tailscale {
     param([string]$AuthKey)
     if (-not $AuthKey) {
@@ -190,16 +172,10 @@ function Connect-Tailscale {
         } catch {}
     }
     Write-Log 'Logging in to Tailscale (auth key read, not echoed)...'
-    # --unattended: stay connected without interaction after reboot
-    # --reset: if the node was configured before, 'tailscale up' refuses to change settings unless
-    #   every previously-set non-default flag is repeated. --reset drops those old settings to their
-    #   defaults and applies only the flags below, which is exactly the desired state for this script.
+
     & $ts up --reset --authkey $AuthKey --unattended
 }
 
-# ---------------------------------------------------------------------------
-# 4. OpenSSH Server
-# ---------------------------------------------------------------------------
 function Enable-OpenSSHServer {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
     if ($cap -and $cap.State -ne 'Installed') {
@@ -209,14 +185,11 @@ function Enable-OpenSSHServer {
         Write-Log 'OpenSSH Server already installed, skipping'
     }
 
-    # First start generates host keys and creates the default sshd_config
     Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
     Start-Service -Name sshd -ErrorAction Stop
 
-    # Also set ssh-agent to automatic (optional, convenient for key management)
     Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction Stop
 
-    # Firewall: allow inbound port 22
     $ruleName = 'OpenSSH-Server-In-TCP'
     $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
     if (-not $rule) {
@@ -228,7 +201,6 @@ function Enable-OpenSSHServer {
     }
 }
 
-# Idempotently set an option in sshd_config: replace an existing (uncommented) line, else append
 function Set-SshdOption {
     param([string]$File, [string]$Key, [string]$Value)
     if (-not (Test-Path -LiteralPath $File)) { return }
@@ -251,20 +223,15 @@ function Set-SshdOption {
     Set-Content -LiteralPath $File -Value $out -Encoding ASCII -ErrorAction Stop
 }
 
-# ---------------------------------------------------------------------------
-# 5. authorized_keys
-# ---------------------------------------------------------------------------
 function Set-AuthorizedKeys {
     if (-not $SshPublicKeys -or $SshPublicKeys.Count -eq 0) {
         Write-Warn '$SshPublicKeys is empty, skipping public key config.'
         return
     }
 
-    # Determine whether the current user is in the Administrators group
     $isAdminUser = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
 
     if ($isAdminUser) {
-        # Special file that Windows OpenSSH uses for the Administrators group
         $authFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
         $authDir = Split-Path -Parent $authFile
         if (-not (Test-Path $authDir)) { New-Item -ItemType Directory -Path $authDir -Force | Out-Null }
@@ -287,7 +254,6 @@ function Set-AuthorizedKeys {
         $added++
     }
 
-    # Tighten permissions: administrators_authorized_keys allows only SYSTEM + Administrators
     if ($isAdminUser) {
         icacls $authFile /inheritance:r | Out-Null
         icacls $authFile /grant 'SYSTEM:F' | Out-Null
@@ -297,9 +263,6 @@ function Set-AuthorizedKeys {
     Write-Log "authorized_keys configured ($authFile), $added key(s) added this run."
 }
 
-# ---------------------------------------------------------------------------
-# 6. X11 forwarding
-# ---------------------------------------------------------------------------
 function Enable-X11Forwarding {
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
     if (-not (Test-Path -LiteralPath $cfg)) {
@@ -310,7 +273,6 @@ function Enable-X11Forwarding {
     Set-SshdOption -File $cfg -Key 'X11Forwarding' -Value 'yes'
     Set-SshdOption -File $cfg -Key 'X11UseLocalhost' -Value 'yes'
 
-    # Restart sshd to apply the config
     $sshd = Get-Command sshd.exe -ErrorAction SilentlyContinue
     if (-not $sshd) { $sshd = Get-Command sshd -ErrorAction SilentlyContinue }
     if ($sshd) {
@@ -321,15 +283,9 @@ function Enable-X11Forwarding {
     }
     Restart-Service -Name sshd -ErrorAction Stop
 
-    # Native Windows has no built-in xauth or X server: the server side is enabled, but the
-    # client (or this machine acting as client) needs an X server (VcXsrv / Xming) to actually
-    # display forwarded graphical windows.
     Write-Warn 'Native Windows has no built-in X server; to display remote GUI windows, install VcXsrv / Xming on the client.'
 }
 
-# ---------------------------------------------------------------------------
-# Main flow
-# ---------------------------------------------------------------------------
 Write-Log 'Starting configuration (platform: Windows)'
 
 Invoke-Step 'Install Tailscale'         { Install-Tailscale }
@@ -339,9 +295,6 @@ Invoke-Step 'Enable OpenSSH Server'     { Enable-OpenSSHServer }
 Invoke-Step 'Configure authorized_keys' { Set-AuthorizedKeys }
 Invoke-Step 'Enable X11 forwarding'     { Enable-X11Forwarding }
 
-# ---------------------------------------------------------------------------
-# Summary
-# ---------------------------------------------------------------------------
 Write-Host ''
 Write-Host '==================== Summary ====================' -ForegroundColor Green
 $ts = Get-TailscaleExe
@@ -354,9 +307,6 @@ if ($tsIp) {
     Write-Warn "Tailscale IP not available yet, run 'tailscale ip -4' shortly to check."
 }
 
-# ---------------------------------------------------------------------------
-# Telegram notification: passwordless SSH login is ready, tell how to log in
-# ---------------------------------------------------------------------------
 if ($TgBotToken -and $TgChatId) {
     $tgConfig = @{ Token = $TgBotToken; ChatId = $TgChatId }
     $loginLine = if ($tsIp) {
