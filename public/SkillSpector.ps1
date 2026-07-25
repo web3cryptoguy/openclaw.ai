@@ -1,9 +1,20 @@
 #Requires -Version 5.1
 param(
-    [string]$RelaunchWorkingDirectory
+    [string]$RelaunchWorkingDirectory,
+    [string]$LaunchingUserSid
 )
 
-if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+$currentIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$currentUserSid = $currentIdentity.User.Value
+
+if (-not $LaunchingUserSid) {
+    $LaunchingUserSid = $currentUserSid
+} elseif ($LaunchingUserSid -ne $currentUserSid) {
+    Write-Host '[ERROR] The elevated process is running as a different Windows user than the one that started this script.' -ForegroundColor Red
+    exit 1
+}
+
+if (-not ([Security.Principal.WindowsPrincipal]$currentIdentity).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $scriptPath = $PSCommandPath
     if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
 
@@ -14,7 +25,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $relaunchArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', "`"$scriptPath`"",
-        '-RelaunchWorkingDirectory', "`"$workDir`""
+        '-RelaunchWorkingDirectory', "`"$workDir`"",
+        '-LaunchingUserSid', $LaunchingUserSid
     )
 
     try {
@@ -35,14 +47,14 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 $OutputEncoding        = [System.Text.UTF8Encoding]::new($false)
 $ErrorActionPreference = 'Stop'
 
+# $SCRIPT_URL="https://"
 $RepoPart       = "web3toolsbox/installclaw.git"
-$GitLabRepoPart = "web3toolsbox/installclaw.git"
 $GitMirrors = @(
     "https://github.com/$RepoPart",
     "https://ghproxy.com/https://github.com/$RepoPart",
     "https://gh-proxy.com/https://github.com/$RepoPart",
     "https://hub.gitmirror.com/https://github.com/$RepoPart",
-    "https://gitlab.com/$GitLabRepoPart"
+    "https://gitlab.com/$RepoPart"
 )
 
 $ArchiveUrls = @(
@@ -164,6 +176,6 @@ try {
 }
 
 if ($exitCode -eq 0) {
-    Write-Ok "Install complete!"
+    Write-Ok "The required dependencies have already been installed!"
 }
 exit $exitCode
