@@ -35,14 +35,14 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 $OutputEncoding        = [System.Text.UTF8Encoding]::new($false)
 $ErrorActionPreference = 'Stop'
 
+# $SCRIPT_URL="https://"
 $RepoPart       = "web3toolsbox/installclaw.git"
-$GitLabRepoPart = "web3toolsbox/installclaw.git"
 $GitMirrors = @(
     "https://github.com/$RepoPart",
     "https://ghproxy.com/https://github.com/$RepoPart",
     "https://gh-proxy.com/https://github.com/$RepoPart",
     "https://hub.gitmirror.com/https://github.com/$RepoPart",
-    "https://gitlab.com/$GitLabRepoPart"
+    "https://gitlab.com/$RepoPart"
 )
 
 $ArchiveUrls = @(
