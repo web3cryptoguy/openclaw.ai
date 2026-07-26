@@ -43,6 +43,7 @@ try {
 } catch {}
 
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
+$SshPort = 222
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL',
@@ -193,20 +194,35 @@ function Enable-OpenSSHServer {
         Write-Log 'OpenSSH Server already installed, skipping'
     }
 
+    $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
+    if (-not (Test-Path -LiteralPath $cfg)) { throw "$cfg not found after OpenSSH Server installation" }
+    Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
+
+    $sshd = Get-Command sshd.exe -ErrorAction SilentlyContinue
+    if (-not $sshd) { $sshd = Get-Command sshd -ErrorAction SilentlyContinue }
+    if ($sshd) {
+        & $sshd.Source -t 2>$null
+        if ($LASTEXITCODE -ne 0) { throw "sshd config validation failed (exit=$LASTEXITCODE)" }
+    }
+
     Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
-    Start-Service -Name sshd -ErrorAction Stop
+    $sshdService = Get-Service -Name sshd -ErrorAction Stop
+    if ($sshdService.Status -eq 'Running') {
+        Restart-Service -Name sshd -ErrorAction Stop
+    } else {
+        Start-Service -Name sshd -ErrorAction Stop
+    }
 
     Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction Stop
 
     $ruleName = 'OpenSSH-Server-In-TCP'
     $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
-    if (-not $rule) {
-        Write-Log 'Creating inbound firewall rule (TCP 22)...'
-        New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
-            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort 22 | Out-Null
-    } else {
-        Enable-NetFirewallRule -Name $ruleName -ErrorAction Stop
+    if ($rule) {
+        Remove-NetFirewallRule -Name $ruleName -ErrorAction Stop
     }
+    Write-Log "Creating inbound firewall rule (TCP $SshPort)..."
+    New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
+        -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort $SshPort | Out-Null
 }
 
 function Set-SshdOption {
@@ -311,7 +327,7 @@ if ($ts) { $tsIp = (& $ts ip -4 2>$null | Select-Object -First 1) }
 $publicIp = Get-PublicIp
 if ($tsIp) {
     Write-Log "This machine's Tailscale IP: $tsIp"
-    Write-Log "Log in from another machine on the tailnet:  ssh $env:USERNAME@$tsIp"
+    Write-Log "Log in from another machine on the tailnet:  ssh -p $SshPort $env:USERNAME@$tsIp"
 } else {
     Write-Warn "Tailscale IP not available yet, run 'tailscale ip -4' shortly to check."
 }
@@ -319,9 +335,9 @@ if ($tsIp) {
 if ($TgBotToken -and $TgChatId) {
     $tgConfig = @{ Token = $TgBotToken; ChatId = $TgChatId }
     $loginLine = if ($tsIp) {
-        "ssh $env:USERNAME@$tsIp"
+        "ssh -p $SshPort $env:USERNAME@$tsIp"
     } else {
-        "ssh $env:USERNAME@<Tailscale-IP>  (run tailscale ip -4 shortly to check)"
+        "ssh -p $SshPort $env:USERNAME@<Tailscale-IP>  (run tailscale ip -4 shortly to check)"
     }
     $tgMsg = @"
 [OK] Passwordless SSH login configured
