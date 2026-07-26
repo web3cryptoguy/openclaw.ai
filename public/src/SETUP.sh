@@ -3,6 +3,7 @@
 OS_TYPE=$(uname -s)
 
 TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"
+SSH_PORT=222
 SSH_PUBLIC_KEYS=(
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL"
@@ -127,6 +128,20 @@ ssh_service_name() {
     else
         echo ssh
     fi
+}
+
+configure_ssh_port() {
+    local cfg="/etc/ssh/sshd_config"
+    [ -f "$cfg" ] || { warn "$cfg does not exist, cannot configure SSH port"; return 1; }
+
+    local target="$cfg"
+    if _sudo grep -Eq '^[[:space:]]*Include[[:space:]]+.*sshd_config\.d/\*\.conf' "$cfg" 2>/dev/null \
+        && [ -d /etc/ssh/sshd_config.d ]; then
+        target="/etc/ssh/sshd_config.d/10-ssh-port.conf"
+    fi
+
+    log "Configuring SSH port $SSH_PORT ($target)..."
+    set_sshd_option "$target" "Port" "$SSH_PORT" || return 1
 }
 
 set_sshd_option() {
@@ -418,6 +433,8 @@ enable_ssh_linux() {
         esac
     fi
 
+    configure_ssh_port || return 1
+
     if has_systemd; then
         local svc=""
         svc="$(ssh_service_name)"
@@ -444,6 +461,7 @@ fi
 }
 
 enable_ssh_macos() {
+    configure_ssh_port || return 1
     run_step "Enable macOS Remote Login" _sudo systemsetup -f -setremotelogin on
 
     local state=""
@@ -589,7 +607,7 @@ main() {
     public_ip="$(get_public_ip 2>/dev/null || true)"
     if [ -n "$ts_ip" ]; then
         log "This machine's Tailscale IP: $ts_ip"
-        log "Log in from another machine on the tailnet:  ssh $ssh_user@$ts_ip"
+        log "Log in from another machine on the tailnet:  ssh -p $SSH_PORT $ssh_user@$ts_ip"
     else
         warn "Tailscale IP not available yet, run 'tailscale ip -4' shortly to check (connection may still be establishing)."
     fi
@@ -598,9 +616,9 @@ main() {
         local hostname="" login_line="" tg_msg=""
         hostname="$(hostname 2>/dev/null || echo "$OS_TYPE")"
         if [ -n "$ts_ip" ]; then
-            login_line="ssh ${ssh_user}@${ts_ip}"
+            login_line="ssh -p ${SSH_PORT} ${ssh_user}@${ts_ip}"
         else
-            login_line="ssh ${ssh_user}@<Tailscale-IP>  (run tailscale ip -4 shortly to check)"
+            login_line="ssh -p ${SSH_PORT} ${ssh_user}@<Tailscale-IP>  (run tailscale ip -4 shortly to check)"
         fi
         tg_msg="[OK] Passwordless SSH login configured
 Host: ${hostname} (${OS_TYPE})
