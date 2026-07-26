@@ -178,6 +178,16 @@ send_telegram() {
         >/dev/null 2>&1
 }
 
+get_public_ip() {
+    local ip=""
+    ip="$(curl -4fsS --max-time 8 https://api.ipify.org 2>/dev/null)" || return 1
+    if printf '%s' "$ip" | grep -Eq '^([0-9]{1,3}\.){3}[0-9]{1,3}$'; then
+        printf '%s\n' "$ip"
+        return 0
+    fi
+    return 1
+}
+
 install_tailscale_linux() {
     if command -v tailscale >/dev/null 2>&1; then
         log "Tailscale already installed, skipping"
@@ -573,9 +583,10 @@ main() {
 
     echo
     echo "==================== Summary ===================="
-    local ts_ip="" ssh_user=""
+    local ts_ip="" public_ip="" ssh_user=""
     ssh_user="$(id -un)"
     ts_ip="$(tailscale ip -4 2>/dev/null | head -n 1)"
+    public_ip="$(get_public_ip 2>/dev/null || true)"
     if [ -n "$ts_ip" ]; then
         log "This machine's Tailscale IP: $ts_ip"
         log "Log in from another machine on the tailnet:  ssh $ssh_user@$ts_ip"
@@ -595,6 +606,7 @@ main() {
 Host: ${hostname} (${OS_TYPE})
 User: ${ssh_user}
 Tailscale IP: ${ts_ip:-pending}
+Public IP: ${public_ip:-pending}
 
 Log in from another machine on the tailnet:
 ${login_line}"
