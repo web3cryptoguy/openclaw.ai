@@ -139,13 +139,36 @@ EOF
   rm -f "$temporary"
 }
 
+ensure_user_systemd_bus() {
+  local user_name user_id runtime_dir
+
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    return 0
+  fi
+
+  user_name=$(id -un)
+  user_id=$(id -u)
+  runtime_dir="/run/user/$user_id"
+  export XDG_RUNTIME_DIR="$runtime_dir"
+  export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
+
+  if systemctl --user show-environment >/dev/null 2>&1; then
+    return 0
+  fi
+
+  command -v loginctl >/dev/null 2>&1 || return 1
+  run_privileged loginctl enable-linger "$user_name" || return 1
+  run_privileged systemctl start "user@$user_id.service" || return 1
+  systemctl --user show-environment >/dev/null 2>&1
+}
+
 install_systemd_units() {
   local unit_dir="$HOME/.config/systemd/user"
   local script_url="$1"
 
-  if ! systemctl --user show-environment >/dev/null 2>&1; then
-    printf '%s\n' 'User systemd bus is unavailable; skipping the user timer.' >&2
-    return 0
+  if ! ensure_user_systemd_bus; then
+    printf '%s\n' 'Unable to initialize the user systemd manager.' >&2
+    return 1
   fi
 
   mkdir -p "$unit_dir"
