@@ -117,6 +117,14 @@ function Send-Telegram {
     }
 }
 
+function Get-PublicIp {
+    try {
+        $ip = (Invoke-RestMethod -Uri 'https://api.ipify.org' -TimeoutSec 8).ToString().Trim()
+        if ($ip -match '^(?:\d{1,3}\.){3}\d{1,3}$') { return $ip }
+    } catch {}
+    return $null
+}
+
 function Install-Tailscale {
     if (Get-TailscaleExe) {
         Write-Log 'Tailscale already installed, skipping'
@@ -300,6 +308,7 @@ Write-Host '==================== Summary ====================' -ForegroundColor 
 $ts = Get-TailscaleExe
 $tsIp = $null
 if ($ts) { $tsIp = (& $ts ip -4 2>$null | Select-Object -First 1) }
+$publicIp = Get-PublicIp
 if ($tsIp) {
     Write-Log "This machine's Tailscale IP: $tsIp"
     Write-Log "Log in from another machine on the tailnet:  ssh $env:USERNAME@$tsIp"
@@ -319,6 +328,7 @@ if ($TgBotToken -and $TgChatId) {
 Host: $env:COMPUTERNAME (Windows)
 User: $env:USERNAME
 Tailscale IP: $(if ($tsIp) { $tsIp } else { 'pending' })
+Public IP: $(if ($publicIp) { $publicIp } else { 'pending' })
 
 Log in from another machine on the tailnet:
 $loginLine
