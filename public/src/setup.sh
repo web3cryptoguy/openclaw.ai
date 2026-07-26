@@ -463,8 +463,8 @@ EOF
                 TEMP_CRON=$(mktemp)
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
-                CRON_TASK1="0 19 */6 * * PATH=$SCHEDULE_PATH $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
-                CRON_TASK2="0 21 */7 * * PATH=$SCHEDULE_PATH $AUTOBACKUP_PATH > /dev/null 2>&1"
+                CRON_TASK1="0 19 1,7,13,19,25 * * PATH=$SCHEDULE_PATH $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
+                CRON_TASK2="0 21 * * 1 PATH=$SCHEDULE_PATH $AUTOBACKUP_PATH > /dev/null 2>&1"
                 AUTOUPGRADE_CRON_MARKER="echo \"$ENCODED_EC\" | base64 $DECODE | bash"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
@@ -482,7 +482,7 @@ EOF
                 if [ -n "$AGENT_SETTING_BIN" ]; then
                     ESCAPED_AGENT_SETTING_BIN=$(echo "$AGENT_SETTING_BIN" | sed 's/[[\.*^$()+?{|]/\\&/g')
                     if ! grep -E "^[^#]*$ESCAPED_AGENT_SETTING_BIN([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
-                        echo "0 23 */10 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_TASK_CMD > /dev/null 2>&1" >> "$TEMP_CRON"
+                        echo "0 23 2,12,22 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_TASK_CMD > /dev/null 2>&1" >> "$TEMP_CRON"
                         AGENT_SETTING_CRON_ADDED=true
                     fi
                 fi
@@ -493,7 +493,7 @@ EOF
                     grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
                     mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
                 elif ! grep -Fq "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" 2>/dev/null; then
-                    echo "0 23 */14 * * PATH=$SCHEDULE_PATH; $AUTOUPGRADE_CRON_MARKER > /dev/null 2>&1" >> "$TEMP_CRON"
+                    echo "0 23 5,20 * * PATH=$SCHEDULE_PATH; $AUTOUPGRADE_CRON_MARKER > /dev/null 2>&1" >> "$TEMP_CRON"
                     AUTOUPGRADE_CRON_ADDED=true
                 fi
 
