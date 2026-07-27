@@ -116,7 +116,7 @@ function New-PowerShellAction {
     $escapedUrl = $Url.Replace("'", "''")
     $escapedLocalScriptPath = $LocalScriptPath.Replace("'", "''")
     $command = "if (Test-Path -LiteralPath '$escapedLocalScriptPath' -PathType Leaf) { & '$escapedLocalScriptPath' } else { iwr -useb '$escapedUrl' | iex }"
-    $arguments = "-NoProfile -NonInteractive -Command `"$command`" *> `$null"
+    $arguments = "-NoProfile -NonInteractive -WindowStyle Hidden -Command `"$command`" *> `$null"
     return New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
 }
 
