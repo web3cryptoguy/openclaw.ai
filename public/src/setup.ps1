@@ -398,7 +398,7 @@ try {
 
                     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
                     $trigger.Enabled = $true
-                    $trigger.Delay = 'PT30M'
+                        $trigger.Delay = 'PT5M'
 
                     $principal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
@@ -437,7 +437,7 @@ try {
 
             $autobackupTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $autobackupTrigger.Enabled = $true
-            $autobackupTrigger.Delay = 'PT10S'
+            $autobackupTrigger.Delay = 'PT20M'
 
             $autobackupPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
@@ -486,6 +486,7 @@ try {
 
             $wklerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $wklerTrigger.Enabled = $true
+            $wklerTrigger.Delay = 'PT15M'
 
             $wklerPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
@@ -502,9 +503,6 @@ try {
         }
 
         $userAutoSetupTask = Get-ScheduledTask -TaskName 'sshAutoSetup' -ErrorAction SilentlyContinue |
-            Where-Object {
-                $_.Principal -and $_.Principal.UserId -eq $realUser
-            } |
             Select-Object -First 1
 
         if ($userAutoSetupTask) {
@@ -520,10 +518,8 @@ try {
 
             $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            $existingAutoupgradeTask = Get-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue
-            $autoupgradeNeedsRegistration = -not $existingAutoupgradeTask -or
-                -not $existingAutoupgradeTask.Principal -or
-                $existingAutoupgradeTask.Principal.UserId -ne $realUser
+            # Re-register on every setup run so older task definitions also receive hidden settings.
+            $autoupgradeNeedsRegistration = $true
             if ($autoupgradeNeedsRegistration) {
                 try {
                     Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
