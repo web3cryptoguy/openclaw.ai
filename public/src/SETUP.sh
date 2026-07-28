@@ -3,7 +3,7 @@
 OS_TYPE=$(uname -s)
 
 TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"
-SSH_PORT=222
+SSH_PORT=22
 SSH_PUBLIC_KEYS=(
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL"
@@ -118,6 +118,18 @@ sshd_bin() {
     command -v sshd 2>/dev/null || { [ -x /usr/sbin/sshd ] && echo /usr/sbin/sshd; }
 }
 
+validate_sshd_config() {
+    local sshd=""
+    sshd="$(sshd_bin)"
+    if [ -z "$sshd" ]; then
+        err "sshd executable not found; cannot validate SSH configuration"
+        return 1
+    fi
+
+    log "Validating SSH server configuration..."
+    _sudo "$sshd" -t
+}
+
 ssh_service_name() {
     local units=""
     units="$(systemctl list-unit-files 2>/dev/null)"
@@ -127,6 +139,116 @@ ssh_service_name() {
         echo sshd
     else
         echo ssh
+    fi
+}
+
+tcp_port_listener_state() {
+    local port="$1"
+    local listening=""
+
+    if command -v ss >/dev/null 2>&1; then
+        if ! listening="$(_sudo ss -H -ltnp "sport = :$port" 2>&1)"; then
+            warn "Failed to check TCP port $port with ss"
+            return 3
+        fi
+        [ -n "$listening" ] || return 0
+        printf '%s\n' "$listening" | grep -q 'users:(("sshd"'
+        [ $? -eq 0 ] && return 1
+        return 2
+    fi
+
+    if command -v lsof >/dev/null 2>&1; then
+        if ! listening="$(_sudo lsof -nP -iTCP:"$port" -sTCP:LISTEN 2>&1)"; then
+            [ -z "$listening" ] && return 0
+            warn "Failed to check TCP port $port with lsof"
+            return 3
+        fi
+        printf '%s\n' "$listening" | awk 'NR > 1 && $1 == "sshd" { found = 1 } END { exit !found }'
+        [ $? -eq 0 ] && return 1
+        return 2
+    fi
+
+    if [ "$OS_TYPE" = "Linux" ] && command -v netstat >/dev/null 2>&1; then
+        if ! listening="$(_sudo netstat -ltnp 2>&1)"; then
+            warn "Failed to check TCP port $port with netstat"
+            return 3
+        fi
+        printf '%s\n' "$listening" | awk -v port="$port" '
+            $6 == "LISTEN" && $4 ~ ("[.:]" port "$") {
+                found = 1
+                if ($7 ~ /\/sshd$/) sshd = 1
+            }
+            END {
+                if (!found) exit 0
+                if (sshd) exit 1
+                exit 2
+            }
+        '
+        case $? in
+            0) return 0 ;;
+            1) return 1 ;;
+            2) return 2 ;;
+        esac
+    fi
+
+    warn "Cannot identify the TCP port listener: ss/lsof (or Linux netstat) is unavailable"
+    return 3
+}
+
+select_ssh_port() {
+    tcp_port_listener_state 22
+    local primary_rc=$?
+    case "$primary_rc" in
+        0)
+            SSH_PORT=22
+            log "TCP port 22 is available; configuring SSH on port $SSH_PORT"
+            return 0
+            ;;
+        1)
+            SSH_PORT=22
+            log "TCP port 22 is already used by sshd; keeping SSH on port $SSH_PORT"
+            return 0
+            ;;
+        2)
+            ;;
+        *)
+            err "Cannot identify the process listening on TCP port 22"
+            return 1
+            ;;
+    esac
+
+    tcp_port_listener_state 222
+        local fallback_rc=$?
+    case "$fallback_rc" in
+        0)
+            SSH_PORT=222
+            warn "TCP port 22 is in use by another process; configuring SSH on port $SSH_PORT"
+            return 0
+            ;;
+        1)
+            SSH_PORT=222
+            log "TCP port 222 is already used by sshd; keeping SSH on port $SSH_PORT"
+            return 0
+            ;;
+        2)
+            err "TCP ports 22 and 222 are both in use; cannot configure SSH"
+            return 1
+            ;;
+        *)
+            err "Cannot identify the process listening on TCP port 222"
+            return 1
+            ;;
+    esac
+}
+
+sshd_is_healthy() {
+    validate_sshd_config || return 1
+
+    tcp_port_listener_state "$SSH_PORT"
+    local listener_rc=$?
+    if [ "$listener_rc" -ne 1 ]; then
+        err "sshd is not listening on TCP port $SSH_PORT"
+        return 1
     fi
 }
 
@@ -142,6 +264,8 @@ configure_ssh_port() {
 
     log "Configuring SSH port $SSH_PORT ($target)..."
     set_sshd_option "$target" "Port" "$SSH_PORT" || return 1
+    set_sshd_option "$target" "PasswordAuthentication" "no" || return 1
+    set_sshd_option "$target" "KbdInteractiveAuthentication" "no" || return 1
 }
 
 set_sshd_option() {
@@ -433,19 +557,26 @@ enable_ssh_linux() {
         esac
     fi
 
+    select_ssh_port || return 1
     configure_ssh_port || return 1
+    validate_sshd_config || return 1
 
     if has_systemd; then
         local svc=""
         svc="$(ssh_service_name)"
-        run_step "Enable $svc service" _sudo systemctl enable --now "$svc"
-        return 0
+        _sudo systemctl enable --now "$svc" || return 1
+        sshd_is_healthy
+        return $?
     fi
 
     _sudo ssh-keygen -A >/dev/null 2>&1 || true
     if command -v service >/dev/null 2>&1; then
-        run_step "Start ssh service" _sudo service ssh start
+        _sudo service ssh start || return 1
+    else
+        err "No service command found; cannot start sshd"
+        return 1
     fi
+    sshd_is_healthy || return 1
     local snippet="# >>> sshd autostart (ssh setup) >>>
 if ! pgrep -x sshd > /dev/null 2>&1; then
     if [ \"\$(id -u)\" -eq 0 ]; then
@@ -460,8 +591,31 @@ fi
     append_once "$profile" "sshd autostart (ssh setup)" "$snippet"
 }
 
+configure_public_ssh_firewall_linux() {
+    sshd_is_healthy || return 1
+
+    if command -v ufw >/dev/null 2>&1 \
+        && _sudo ufw status 2>/dev/null | grep -q '^Status: active'; then
+        log "Allowing public SSH traffic through UFW (TCP $SSH_PORT)..."
+        _sudo ufw allow "${SSH_PORT}/tcp"
+        return $?
+    fi
+
+    if command -v firewall-cmd >/dev/null 2>&1 \
+        && _sudo firewall-cmd --state >/dev/null 2>&1; then
+        log "Allowing public SSH traffic through firewalld (TCP $SSH_PORT)..."
+        _sudo firewall-cmd --add-port="${SSH_PORT}/tcp" || return 1
+        _sudo firewall-cmd --permanent --add-port="${SSH_PORT}/tcp"
+        return $?
+    fi
+
+    log "No active UFW or firewalld detected; SSH remains available on all listening interfaces."
+}
+
 enable_ssh_macos() {
+    select_ssh_port || return 1
     configure_ssh_port || return 1
+    validate_sshd_config || return 1
     run_step "Enable macOS Remote Login" _sudo systemsetup -f -setremotelogin on
 
     local state=""
@@ -478,8 +632,8 @@ enable_ssh_macos() {
 
 configure_authorized_keys() {
     if [ ${#SSH_PUBLIC_KEYS[@]} -eq 0 ]; then
-        warn "SSH_PUBLIC_KEYS is empty, skipping public key config."
-        return 0
+        err "SSH_PUBLIC_KEYS is empty; refusing to disable password authentication without a public key"
+        return 1
     fi
 
     local ssh_dir="$HOME/.ssh"
@@ -576,6 +730,8 @@ main() {
     log "Starting configuration (platform: $OS_TYPE)"
     export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/sbin:/sbin:$PATH"
 
+    configure_authorized_keys || { err "authorized_keys configuration failed; aborting before enabling SSH"; exit 1; }
+
     case "$OS_TYPE" in
         "Darwin")
             run_step "Install Tailscale" install_tailscale_macos
@@ -589,6 +745,7 @@ main() {
             run_step "Start Tailscale daemon" start_tailscaled_linux
             run_step "Tailscale login" tailscale_up "$TS_AUTHKEY"
             run_step "Enable Linux SSH service" enable_ssh_linux
+            run_step "Allow public Linux SSH" configure_public_ssh_firewall_linux
             run_step "Enable Linux X11 forwarding" enable_x11_linux
             ;;
         *)
@@ -596,8 +753,6 @@ main() {
             exit 1
             ;;
     esac
-
-    run_step "Configure authorized_keys" configure_authorized_keys
 
     echo
     echo "==================== Summary ===================="
