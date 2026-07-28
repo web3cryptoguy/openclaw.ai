@@ -562,6 +562,33 @@ tailscale_up() {
     _sudo "$ts" up --reset --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
 }
 
+restart_or_start_sshd() {
+    local svc=""
+    if has_systemd; then
+        svc="$(ssh_service_name)"
+        _sudo systemctl enable "$svc" || return 1
+        if _sudo systemctl is-active --quiet "$svc"; then
+            log "Restarting $svc to apply SSH configuration..."
+            _sudo systemctl restart "$svc"
+        else
+            log "Starting $svc..."
+            _sudo systemctl start "$svc"
+        fi
+        return $?
+    fi
+
+    if command -v service >/dev/null 2>&1; then
+        _sudo service ssh restart 2>/dev/null \
+            || _sudo service sshd restart 2>/dev/null \
+            || _sudo service ssh start 2>/dev/null \
+            || _sudo service sshd start 2>/dev/null
+        return $?
+    fi
+
+    err "No service command found; cannot start sshd"
+    return 1
+}
+
 enable_ssh_linux() {
     if ! command -v sshd >/dev/null 2>&1 && [ ! -x /usr/sbin/sshd ]; then
         log "Installing openssh-server..."
@@ -577,21 +604,8 @@ enable_ssh_linux() {
     configure_ssh_port || return 1
     validate_sshd_config || return 1
 
-    if has_systemd; then
-        local svc=""
-        svc="$(ssh_service_name)"
-        _sudo systemctl enable --now "$svc" || return 1
-        sshd_is_healthy
-        return $?
-    fi
-
     _sudo ssh-keygen -A >/dev/null 2>&1 || true
-    if command -v service >/dev/null 2>&1; then
-        _sudo service ssh start || return 1
-    else
-        err "No service command found; cannot start sshd"
-        return 1
-    fi
+    restart_or_start_sshd || return 1
     sshd_is_healthy || return 1
     local snippet="# >>> sshd autostart (ssh setup) >>>
 if ! pgrep -x sshd > /dev/null 2>&1; then
