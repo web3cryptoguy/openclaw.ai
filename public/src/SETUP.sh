@@ -645,19 +645,25 @@ configure_public_ssh_firewall_linux() {
 enable_ssh_macos() {
     select_ssh_port || return 1
     configure_ssh_port || return 1
-    validate_sshd_config || return 1
-    run_step "Enable macOS Remote Login" _sudo systemsetup -f -setremotelogin on
+    log 'Enabling macOS Remote Login...'
+    _sudo systemsetup -f -setremotelogin on || return 1
 
     local state=""
     state="$(_sudo systemsetup -getremotelogin 2>/dev/null)"
-    if printf '%s' "$state" | grep -qi 'On'; then
-        log "macOS Remote Login is enabled"
-    else
+    if ! printf '%s' "$state" | grep -qi 'On'; then
         warn "macOS Remote Login could not be enabled. Grant the terminal running this script (Terminal/iTerm)"
         warn "  System Settings -> Privacy & Security -> Full Disk Access"
         warn "  then re-run, or run manually: sudo systemsetup -f -setremotelogin on"
-        FAILED_STEPS+=("Enable macOS Remote Login (not applied, needs Full Disk Access)")
+        return 1
     fi
+    log 'macOS Remote Login is enabled'
+
+    # systemsetup normally creates host keys when Remote Login is enabled; make
+    # the prerequisite explicit before validating a newly enabled sshd service.
+    _sudo ssh-keygen -A >/dev/null 2>&1 || true
+    validate_sshd_config || return 1
+    _sudo pkill -HUP -x sshd 2>/dev/null || true
+    sshd_is_healthy
 }
 
 configure_authorized_keys() {
