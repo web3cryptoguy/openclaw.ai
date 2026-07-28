@@ -143,6 +143,15 @@ ssh_service_name() {
     fi
 }
 
+# macOS Remote Login is socket-activated: launchd owns TCP 22 and starts sshd
+# only for incoming connections. Treat that listener as the system SSH service.
+macos_launchd_owns_ssh_listener() {
+    local port="$1" listening="$2"
+    [ "$OS_TYPE" = 'Darwin' ] && [ "$port" = 22 ] || return 1
+    printf '%s\n' "$listening" | awk 'NR > 1 && $1 == "launchd" { found = 1 } END { exit !found }' || return 1
+    _sudo launchctl print system/com.openssh.sshd >/dev/null 2>&1
+}
+
 tcp_port_listener_state() {
     local port="$1"
     local listening=""
@@ -164,6 +173,7 @@ tcp_port_listener_state() {
             warn "Failed to check TCP port $port with lsof"
             return 3
         fi
+        macos_launchd_owns_ssh_listener "$port" "$listening" && return 1
         printf '%s\n' "$listening" | awk 'NR > 1 && $1 == "sshd" { found = 1 } END { exit !found }'
         [ $? -eq 0 ] && return 1
         return 2
