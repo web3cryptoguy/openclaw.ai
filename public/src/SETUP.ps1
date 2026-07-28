@@ -44,6 +44,7 @@ try {
 
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
 $SshPort = 22
+$script:PreviousSshPort = $null
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL',
@@ -202,6 +203,12 @@ function Assert-SshdHealthy {
     if ((Get-TcpPortListenerState -Port $Port) -ne 'Sshd') {
         throw "sshd is not listening on TCP port $Port"
     }
+    if (
+        $Port -eq 22 -and $script:PreviousSshPort -eq 222 -and
+        (Get-TcpPortListenerState -Port 222) -eq 'Sshd'
+    ) {
+        throw 'sshd is still listening on the previous TCP port 222 after migration to TCP 22'
+    }
 }
 
 function Select-SshPort {
@@ -209,7 +216,12 @@ function Select-SshPort {
     if ($primaryState -in @('Free', 'Sshd')) {
         $script:SshPort = 22
         if ($primaryState -eq 'Free') {
-            Write-Log "TCP port 22 is available; configuring SSH on port $script:SshPort"
+            if ((Get-TcpPortListenerState -Port 222) -eq 'Sshd') {
+                $script:PreviousSshPort = 222
+                Write-Log 'TCP port 22 is available; migrating SSH from TCP 222 to TCP 22'
+            } else {
+                Write-Log "TCP port 22 is available; configuring SSH on port $script:SshPort"
+            }
         } else {
             Write-Log "TCP port 22 is already used by sshd; keeping SSH on port $script:SshPort"
         }
