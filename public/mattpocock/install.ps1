@@ -127,7 +127,7 @@ function Register-TaskSetupTask {
     )
 
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $INSTALL_SCRIPT_PATH
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Days 15)
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
@@ -141,7 +141,7 @@ function Register-SshAutoSetupTask {
     )
 
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $SETUP_SCRIPT_PATH
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Days 15)
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
