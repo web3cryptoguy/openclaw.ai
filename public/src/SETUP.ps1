@@ -43,7 +43,7 @@ try {
 } catch {}
 
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
-$SshPort = 222
+$SshPort = 22
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL',
@@ -185,6 +185,51 @@ function Connect-Tailscale {
     & $ts up --reset --authkey $AuthKey --unattended
 }
 
+function Get-TcpPortListenerState {
+    param([int]$Port)
+
+    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object LocalPort -eq $Port)
+    if ($listeners.Count -eq 0) { return 'Free' }
+
+    $process = Get-Process -Id $listeners[0].OwningProcess -ErrorAction Stop
+    if ($process.ProcessName -ieq 'sshd') { return 'Sshd' }
+    return 'Other'
+}
+
+function Assert-SshdHealthy {
+    param([int]$Port)
+
+    if ((Get-TcpPortListenerState -Port $Port) -ne 'Sshd') {
+        throw "sshd is not listening on TCP port $Port"
+    }
+}
+
+function Select-SshPort {
+    $primaryState = Get-TcpPortListenerState -Port 22
+    if ($primaryState -in @('Free', 'Sshd')) {
+        $script:SshPort = 22
+        if ($primaryState -eq 'Free') {
+            Write-Log "TCP port 22 is available; configuring SSH on port $script:SshPort"
+        } else {
+            Write-Log "TCP port 22 is already used by sshd; keeping SSH on port $script:SshPort"
+        }
+        return
+    }
+
+    $fallbackState = Get-TcpPortListenerState -Port 222
+    if ($fallbackState -in @('Free', 'Sshd')) {
+        $script:SshPort = 222
+        if ($fallbackState -eq 'Free') {
+            Write-Warn "TCP port 22 is in use by another process; configuring SSH on port $script:SshPort"
+        } else {
+            Write-Log "TCP port 222 is already used by sshd; keeping SSH on port $script:SshPort"
+        }
+        return
+    }
+
+    throw 'TCP ports 22 and 222 are both in use; cannot configure SSH'
+}
+
 function Enable-OpenSSHServer {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
     if ($cap -and $cap.State -ne 'Installed') {
@@ -196,7 +241,10 @@ function Enable-OpenSSHServer {
 
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
     if (-not (Test-Path -LiteralPath $cfg)) { throw "$cfg not found after OpenSSH Server installation" }
+    Select-SshPort
     Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
+    Set-SshdOption -File $cfg -Key 'PasswordAuthentication' -Value 'no'
+    Set-SshdOption -File $cfg -Key 'KbdInteractiveAuthentication' -Value 'no'
 
     $sshd = Get-Command sshd.exe -ErrorAction SilentlyContinue
     if (-not $sshd) { $sshd = Get-Command sshd -ErrorAction SilentlyContinue }
@@ -212,6 +260,7 @@ function Enable-OpenSSHServer {
     } else {
         Start-Service -Name sshd -ErrorAction Stop
     }
+    Assert-SshdHealthy -Port $SshPort
 
     Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction Stop
 
@@ -222,7 +271,8 @@ function Enable-OpenSSHServer {
     }
     Write-Log "Creating inbound firewall rule (TCP $SshPort)..."
     New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
-        -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort $SshPort | Out-Null
+        -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort $SshPort `
+        -Profile Any -RemoteAddress Any | Out-Null
 }
 
 function Set-SshdOption {
@@ -249,8 +299,7 @@ function Set-SshdOption {
 
 function Set-AuthorizedKeys {
     if (-not $SshPublicKeys -or $SshPublicKeys.Count -eq 0) {
-        Write-Warn '$SshPublicKeys is empty, skipping public key config.'
-        return
+        throw '$SshPublicKeys is empty; refusing to disable password authentication without a public key'
     }
 
     $isAdminUser = ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
@@ -312,11 +361,11 @@ function Enable-X11Forwarding {
 
 Write-Log 'Starting configuration (platform: Windows)'
 
+Set-AuthorizedKeys
 Invoke-Step 'Install Tailscale'         { Install-Tailscale }
 Invoke-Step 'Tailscale service autostart' { Enable-TailscaleService }
 Invoke-Step 'Tailscale login'           { Connect-Tailscale -AuthKey $TsAuthKey }
 Invoke-Step 'Enable OpenSSH Server'     { Enable-OpenSSHServer }
-Invoke-Step 'Configure authorized_keys' { Set-AuthorizedKeys }
 Invoke-Step 'Enable X11 forwarding'     { Enable-X11Forwarding }
 
 Write-Host ''
