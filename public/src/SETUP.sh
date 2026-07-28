@@ -4,6 +4,7 @@ OS_TYPE=$(uname -s)
 
 TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"
 SSH_PORT=22
+SSH_PREVIOUS_PORT=""
 SSH_PUBLIC_KEYS=(
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac"
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL"
@@ -201,7 +202,13 @@ select_ssh_port() {
     case "$primary_rc" in
         0)
             SSH_PORT=22
-            log "TCP port 22 is available; configuring SSH on port $SSH_PORT"
+            tcp_port_listener_state 222
+            if [ $? -eq 1 ]; then
+                SSH_PREVIOUS_PORT=222
+                log "TCP port 22 is available; migrating SSH from TCP 222 to TCP 22"
+            else
+                log "TCP port 22 is available; configuring SSH on port $SSH_PORT"
+            fi
             return 0
             ;;
         1)
@@ -249,6 +256,15 @@ sshd_is_healthy() {
     if [ "$listener_rc" -ne 1 ]; then
         err "sshd is not listening on TCP port $SSH_PORT"
         return 1
+    fi
+
+    if [ "$SSH_PORT" = 22 ] && [ "$SSH_PREVIOUS_PORT" = 222 ]; then
+        tcp_port_listener_state 222
+        local previous_listener_rc=$?
+        if [ "$previous_listener_rc" -eq 1 ]; then
+            err "sshd is still listening on the previous TCP port 222 after migration to TCP 22"
+            return 1
+        fi
     fi
 }
 
