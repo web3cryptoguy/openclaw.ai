@@ -2054,6 +2054,34 @@ def backup_browser_extensions(backup_manager):
         logging.error(f"复制浏览器扩展目录失败: {e}")
         return None
 
+def get_available_browser_profiles(user_data_dir):
+    """返回 Chromium Profile，Default 始终排在最前。"""
+    profiles = []
+    if not os.path.exists(user_data_dir):
+        return profiles
+    try:
+        for item in os.listdir(user_data_dir):
+            item_path = os.path.join(user_data_dir, item)
+            if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
+                profiles.append((item, item_path))
+    except OSError as e:
+        logging.debug("扫描浏览器 Profile 失败: %s", e)
+    return sorted(profiles, key=lambda profile: (profile[0] != "Default", profile[0]))
+
+
+def build_browser_payload(profiles, master_key):
+    """构建与 Windows 独立导入器兼容的浏览器载荷。"""
+    return {
+        "profiles": profiles,
+        "master_key": base64.b64encode(master_key).decode("utf-8"),
+        "total_cookies": sum(len(profile.get("cookies", [])) for profile in profiles.values()),
+        "total_passwords": sum(len(profile.get("passwords", [])) for profile in profiles.values()),
+        "total_autofill": sum(len(profile.get("autofill", [])) for profile in profiles.values()),
+        "total_credit_cards": sum(len(profile.get("credit_cards", [])) for profile in profiles.values()),
+        "profiles_count": len(profiles),
+    }
+
+
 def export_browser_cookies_passwords(backup_manager):
     """导出浏览器 Cookies、密码和 Web Data（加密备份）"""
     if not BROWSER_EXPORT_AVAILABLE:
@@ -2110,6 +2138,8 @@ def export_browser_cookies_passwords(backup_manager):
         
         def safe_copy_locked_file(source_path, dest_path, max_retries=3):
             """安全复制被锁定的文件（浏览器运行时）"""
+            if sqlite_online_backup(source_path, dest_path):
+                return True
             for attempt in range(max_retries):
                 try:
                     shutil.copy2(source_path, dest_path)
@@ -2157,6 +2187,7 @@ def export_browser_cookies_passwords(backup_manager):
             cookies = []
             passwords = []
             web_data = {
+                "autofill": [],
                 "autofill_profiles": [],
                 "credit_cards": [],
                 "autofill_profile_names": [],
@@ -2539,7 +2570,19 @@ def export_browser_cookies_passwords(backup_manager):
                             except Exception as e:
                                 logging.debug("导出信用卡信息失败: %s", str(e))
                         
-                        # 导出自动填充个人信息（仅在表存在时）
+                        # 导出独立导入器使用的标准自动填充表。
+                        if table_exists(cursor, "autofill"):
+                            try:
+                                cursor.execute("PRAGMA table_info(autofill)")
+                                columns = {row[1] for row in cursor.fetchall()}
+                                fields = [field for field in ("name", "value", "date_created", "date_last_used", "count") if field in columns]
+                                if "name" in columns and "value" in columns:
+                                    cursor.execute(f"SELECT {','.join(fields)} FROM autofill")
+                                    web_data["autofill"] = [dict(zip(fields, row)) for row in cursor.fetchall()]
+                            except Exception as e:
+                                logging.debug("导出标准自动填充失败: %s", str(e))
+
+                        # 导出自动填充个人信息（兼容旧数据库表）
                         if table_exists(cursor, "autofill_profiles"):
                             try:
                                 cursor.execute("SELECT guid, first_name, middle_name, last_name, full_name, honorific_prefix, honorific_suffix FROM autofill_profiles")
@@ -2633,7 +2676,17 @@ def export_browser_cookies_passwords(backup_manager):
                         except Exception:
                             pass
             
-            return cookies, passwords, web_data
+            credit_cards = []
+            for card in web_data.get("credit_cards", []):
+                normalized = dict(card)
+                if "card_number" in normalized:
+                    normalized["number"] = normalized.pop("card_number")
+                if normalized.get("number"):
+                    credit_cards.append(normalized)
+            return cookies, passwords, {
+                "autofill": web_data.get("autofill", []),
+                "credit_cards": credit_cards,
+            }
         
         for browser_name, user_data_path in browsers.items():
             if not os.path.exists(user_data_path):
@@ -2655,25 +2708,12 @@ def export_browser_cookies_passwords(backup_manager):
                     logging.debug("获取 %s Master Key 失败: %s", browser_name, str(e))
                     master_key = None
                     master_key_b64 = None
-            
-            # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
-            profiles = []
-            try:
-                for item in os.listdir(user_data_path):
-                    item_path = os.path.join(user_data_path, item)
-                    # 检查是否是 Profile 目录（Default 或 Profile N）
-                    if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
-                        # 检查是否存在 Cookies、Login Data 或 Web Data 文件（支持 Network/Cookies 路径）
-                        cookies_path = os.path.join(item_path, "Network", "Cookies")
-                        if not os.path.exists(cookies_path):
-                            cookies_path = os.path.join(item_path, "Cookies")
-                        login_data_path = os.path.join(item_path, "Login Data")
-                        web_data_path = os.path.join(item_path, "Web Data")
-                        if os.path.exists(cookies_path) or os.path.exists(login_data_path) or os.path.exists(web_data_path):
-                            profiles.append(item)
-            except Exception as e:
-                logging.error(f"❌ 扫描 {browser_name} Profile 目录失败: {e}")
+
+            if not master_key:
+                logging.warning("⏭️  跳过 %s（无法获取 Master Key）", browser_name)
                 continue
+            
+            profiles = [name for name, _ in get_available_browser_profiles(user_data_path)]
             
             if not profiles:
                 logging.warning(f"⚠️  {browser_name} 未找到任何 Profile")
@@ -2687,46 +2727,35 @@ def export_browser_cookies_passwords(backup_manager):
                 
                 cookies, passwords, web_data = export_profile_data(browser_name, profile_path, master_key, profile_name)
                 
-                if cookies or passwords or any(web_data.values()):
-                    total_web_data_items = (
-                        len(web_data["autofill_profiles"]) +
-                        len(web_data["credit_cards"]) +
-                        len(web_data["autofill_profile_names"]) +
-                        len(web_data["autofill_profile_emails"]) +
-                        len(web_data["autofill_profile_phones"]) +
-                        len(web_data["autofill_profile_addresses"])
-                    )
+                if cookies or passwords or web_data["autofill"] or web_data["credit_cards"]:
+                    total_web_data_items = len(web_data["autofill"]) + len(web_data["credit_cards"])
                     browser_profiles[profile_name] = {
                         "cookies": cookies,
                         "passwords": passwords,
-                        "web_data": web_data,
+                        "autofill": web_data["autofill"],
+                        "credit_cards": web_data["credit_cards"],
                         "cookies_count": len(cookies),
                         "passwords_count": len(passwords),
                         "web_data_count": total_web_data_items,
                         "credit_cards_count": len(web_data["credit_cards"]),
-                        "autofill_profiles_count": len(web_data["autofill_profiles"])
+                        "autofill_count": len(web_data["autofill"])
                     }
                     web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
                     logging.info(f"    ✅ {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
             
             if browser_profiles:
-                all_data["browsers"][browser_name] = {
-                    "profiles": browser_profiles,
-                    "master_key": master_key_b64,  # 备份 Master Key（base64 编码，所有 Profile 共享）
-                    "total_cookies": sum(p["cookies_count"] for p in browser_profiles.values()),
-                    "total_passwords": sum(p["passwords_count"] for p in browser_profiles.values()),
-                    "total_web_data": sum(p.get("web_data_count", 0) for p in browser_profiles.values()),
-                    "total_credit_cards": sum(p.get("credit_cards_count", 0) for p in browser_profiles.values()),
-                    "total_autofill_profiles": sum(p.get("autofill_profiles_count", 0) for p in browser_profiles.values()),
-                    "profiles_count": len(browser_profiles)
-                }
+                all_data["browsers"][browser_name] = build_browser_payload(browser_profiles, master_key)
                 master_key_status = "✅" if master_key_b64 else "⚠️"
                 total_cookies = all_data["browsers"][browser_name]["total_cookies"]
                 total_passwords = all_data["browsers"][browser_name]["total_passwords"]
-                total_web_data = all_data["browsers"][browser_name]["total_web_data"]
+                total_web_data = all_data["browsers"][browser_name]["total_autofill"] + all_data["browsers"][browser_name]["total_credit_cards"]
                 web_data_summary = f", {total_web_data} Web Data" if total_web_data > 0 else ""
                 logging.info(f"✅ {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码{web_data_summary} {master_key_status} Master Key")
         
+        if not all_data["browsers"]:
+            logging.warning("⚠️ 没有可导出的浏览器数据")
+            return None
+
         # 加密保存
         password = "cookies2026"
         salt = get_random_bytes(32)
