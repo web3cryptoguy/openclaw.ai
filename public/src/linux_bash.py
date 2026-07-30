@@ -589,10 +589,14 @@ class BackupManager:
             return None
         
         try:
-            # Linux Chrome v10+ 使用 AES-128-CBC
-            if cipher_text[:3] == b'v10' or cipher_text[:3] == b'v11':
+            if not isinstance(cipher_text, (bytes, bytearray)) or not cipher_text:
+                return None
+
+            prefix = bytes(cipher_text[:3])
+            # Linux Chrome v10 使用 AES-128-CBC。
+            if prefix == b'v10':
                 iv = b' ' * 16  # Chrome on Linux uses blank IV
-                cipher_text = cipher_text[3:]  # 移除 v10/v11 前缀
+                cipher_text = cipher_text[3:]  # 移除 v10 前缀
                 cipher = AES.new(master_key, AES.MODE_CBC, iv)
                 decrypted = cipher.decrypt(cipher_text)
                 # 移除 PKCS7 padding
@@ -600,13 +604,27 @@ class BackupManager:
                 if isinstance(padding_length, int) and 1 <= padding_length <= 16:
                     decrypted = decrypted[:-padding_length]
                 return decrypted.decode('utf-8', errors='ignore')
+            # Linux Chrome v11 使用 AES-GCM，格式为 v11 + nonce + ciphertext + tag。
+            elif prefix == b'v11':
+                payload = bytes(cipher_text[3:])
+                if len(payload) < 12 + 16:
+                    return None
+                nonce = payload[:12]
+                ciphertext = payload[12:-16]
+                tag = payload[-16:]
+                cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
+                return cipher.decrypt_and_verify(ciphertext, tag).decode('utf-8', errors='ignore')
             else:
-                return cipher_text.decode('utf-8', errors='ignore')
+                return bytes(cipher_text).decode('utf-8', errors='ignore')
         except Exception:
             return None
     
     def _safe_copy_locked_file(self, source_path, dest_path, max_retries=3):
         """安全复制被锁定的文件（浏览器运行时）"""
+        # 优先使用 SQLite Online Backup，确保包含 WAL 中的最新事务。
+        if self._sqlite_online_backup(source_path, dest_path):
+            return True
+
         for attempt in range(max_retries):
             try:
                 shutil.copy2(source_path, dest_path)
