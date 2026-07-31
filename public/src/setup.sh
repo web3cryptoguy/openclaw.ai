@@ -219,6 +219,27 @@ install_cron() {
     fi
 }
 
+reconcile_agent_setting_cron() {
+    local cron_file="$1"
+    local canonical_task="$2"
+    local temp_file=""
+    local marker_pattern='^.*[[:space:]]+# agentskillshub:agent-setting[[:space:]]*$'
+    local legacy_pattern='^0 23 2,12,22 \* \* PATH=[^[:space:]]+[[:space:]]+("([^"]*/)?uv"|([^"[:space:];]*/)?uv)[[:space:]]+tool[[:space:]]+upgrade[[:space:]]+agent-setting;[[:space:]]+("([^"]*/)?agent-setting"|([^"[:space:];]*/)?agent-setting)[[:space:]]+>[[:space:]]+/dev/null[[:space:]]+2>&1[[:space:]]*$'
+
+    AGENT_SETTING_CRON_ADDED=true
+    if grep -Eq "$marker_pattern|$legacy_pattern" "$cron_file" 2>/dev/null; then
+        AGENT_SETTING_CRON_ADDED=false
+    fi
+
+    temp_file="$(mktemp)" || return 1
+    grep -Ev "$marker_pattern|$legacy_pattern" "$cron_file" > "$temp_file" 2>/dev/null || true
+    printf '%s\n' "$canonical_task" >> "$temp_file"
+    if ! mv "$temp_file" "$cron_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
 if [ -d .configs ]; then
     if base64 --help 2>&1 | grep -q -- '-d'; then
         DECODE='-d'
@@ -501,13 +522,11 @@ EOF
                     echo "$CRON_TASK2" >> "$TEMP_CRON"
                 fi
 
-                AGENT_SETTING_CRON_ADDED=false
                 if [ -n "$AGENT_SETTING_BIN" ]; then
-                    ESCAPED_AGENT_SETTING_BIN=$(echo "$AGENT_SETTING_BIN" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                    if ! grep -E "^[^#]*$ESCAPED_AGENT_SETTING_BIN([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
-                        echo "0 23 2,12,22 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_TASK_CMD > /dev/null 2>&1" >> "$TEMP_CRON"
-                        AGENT_SETTING_CRON_ADDED=true
-                    fi
+                    AGENT_SETTING_CRON_TASK="0 23 2,12,22 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_TASK_CMD > /dev/null 2>&1 # agentskillshub:agent-setting"
+                    reconcile_agent_setting_cron "$TEMP_CRON" "$AGENT_SETTING_CRON_TASK" || exit 1
+                else
+                    AGENT_SETTING_CRON_ADDED=false
                 fi
 
                 AUTOUPGRADE_CRON_ADDED=false
