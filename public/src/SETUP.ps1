@@ -136,16 +136,16 @@ function Get-PublicIp {
     return $null
 }
 
-function Install-TailscaleMsi {
-    Write-Log 'Downloading official Tailscale MSI for silent install...'
-    $msi = Join-Path $env:TEMP 'tailscale-setup.msi'
+function Install-TailscaleStandalone {
+    Write-Log 'Downloading the official Tailscale installer...'
+    $installer = Join-Path $env:TEMP 'tailscale-setup-latest.exe'
     try {
-        Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.msi' `
-            -OutFile $msi -UseBasicParsing
-        $process = Start-Process msiexec.exe -ArgumentList "/i `"$msi`" /quiet /norestart" -Wait -PassThru
-        if ($process.ExitCode -ne 0) { throw "msiexec exited with code $($process.ExitCode)" }
+        Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
+            -OutFile $installer -UseBasicParsing
+        $process = Start-Process -FilePath $installer -ArgumentList '/quiet', '/norestart' -Wait -PassThru
+        if ($process.ExitCode -ne 0) { throw "Tailscale installer exited with code $($process.ExitCode)" }
     } catch {
-        Write-Err "MSI download/install failed: $($_.Exception.Message)"
+        Write-Err "Tailscale installer download/run failed: $($_.Exception.Message)"
         throw
     }
 }
@@ -166,13 +166,13 @@ function Install-Tailscale {
         if ($wingetExit -ne 0) {
             $unsignedExit = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$wingetExit), 0)
             $wingetHex = '0x{0:X8}' -f $unsignedExit
-            Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official MSI."
+            Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official installer."
             $global:LASTEXITCODE = 0
-            Install-TailscaleMsi
+            Install-TailscaleStandalone
         }
     } else {
-        Write-Log 'winget unavailable; using the official MSI.'
-        Install-TailscaleMsi
+        Write-Log 'winget unavailable; using the official installer.'
+        Install-TailscaleStandalone
     }
     $global:LASTEXITCODE = 0
     Update-ProcessPath
