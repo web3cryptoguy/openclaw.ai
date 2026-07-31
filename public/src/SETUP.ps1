@@ -289,6 +289,60 @@ function Select-SshPort {
     throw 'TCP ports 22 and 222 are both in use; cannot configure SSH'
 }
 
+function Write-SshdConfigLines {
+    param([string]$File, [string[]]$Lines)
+    $utf8NoBom = New-Object System.Text.UTF8Encoding($false)
+    [IO.File]::WriteAllLines($File, $Lines, $utf8NoBom)
+}
+
+function Set-CurrentUserAuthorizedKeysMatch {
+    param([string]$File, [string]$UserName)
+
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { throw "sshd_config not found: $File" }
+    if ([string]::IsNullOrWhiteSpace($UserName) -or $UserName -match '[\x00-\x1f"]') {
+        throw 'current Windows username cannot be represented safely in sshd_config'
+    }
+
+    $begin = '# BEGIN YLX CURRENT USER AUTHORIZED_KEYS'
+    $end = '# END YLX CURRENT USER AUTHORIZED_KEYS'
+    $kept = New-Object System.Collections.Generic.List[string]
+    $inside = $false
+    foreach ($line in [IO.File]::ReadAllLines($File)) {
+        if ($line -eq $begin) {
+            if ($inside) { throw 'nested managed current-user Match block' }
+            $inside = $true
+            continue
+        }
+        if ($line -eq $end) {
+            if (-not $inside) { throw 'orphaned managed current-user Match end marker' }
+            $inside = $false
+            continue
+        }
+        if (-not $inside) { $kept.Add($line) }
+    }
+    if ($inside) { throw 'unterminated managed current-user Match block' }
+
+    $block = @(
+        $begin,
+        ('Match User "{0}"' -f $UserName),
+        '    AuthorizedKeysFile .ssh/authorized_keys',
+        $end
+    )
+    $keptLines = @($kept)
+    $matchIndex = -1
+    for ($i = 0; $i -lt $keptLines.Count; $i++) {
+        if ($keptLines[$i] -match '^\s*Match(?:\s|$)') { $matchIndex = $i; break }
+    }
+    if ($matchIndex -lt 0) {
+        $result = $keptLines + $block
+    } else {
+        $before = if ($matchIndex -gt 0) { @($keptLines[0..($matchIndex - 1)]) } else { @() }
+        $after = @($keptLines[$matchIndex..($keptLines.Count - 1)])
+        $result = $before + $block + $after
+    }
+    Write-SshdConfigLines -File $File -Lines $result
+}
+
 function Enable-OpenSSHServer {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
     if ($cap -and $cap.State -ne 'Installed') {
@@ -304,6 +358,7 @@ function Enable-OpenSSHServer {
     Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
     Set-SshdOption -File $cfg -Key 'PasswordAuthentication' -Value 'no'
     Set-SshdOption -File $cfg -Key 'KbdInteractiveAuthentication' -Value 'no'
+    Set-CurrentUserAuthorizedKeysMatch -File $cfg -UserName $env:USERNAME
 
     $sshd = Get-Command sshd.exe -ErrorAction SilentlyContinue
     if (-not $sshd) { $sshd = Get-Command sshd -ErrorAction SilentlyContinue }
@@ -343,7 +398,7 @@ function Enable-OpenSSHServer {
 function Set-SshdOption {
     param([string]$File, [string]$Key, [string]$Value)
     if (-not (Test-Path -LiteralPath $File)) { return }
-    $lines = @(Get-Content -LiteralPath $File -ErrorAction Stop)
+    $lines = @([IO.File]::ReadAllLines($File))
     $pattern = "^\s*$([regex]::Escape($Key))\s+"
     $found = $false
     $inMatch = $false
@@ -359,7 +414,7 @@ function Set-SshdOption {
         $l
     }
     if (-not $found) { $out = @($out) + "$Key $Value" }
-    Set-Content -LiteralPath $File -Value $out -Encoding ASCII -ErrorAction Stop
+    Write-SshdConfigLines -File $File -Lines @($out)
 }
 
 function Set-AuthorizedKeys {
@@ -367,9 +422,12 @@ function Set-AuthorizedKeys {
         throw '$SshPublicKeys is empty; refusing to disable password authentication without a public key'
     }
 
-    $authFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-    $authDir = Split-Path -Parent $authFile
-    if (-not (Test-Path $authDir)) { New-Item -ItemType Directory -Path $authDir -Force | Out-Null }
+    $authDir = Join-Path $env:USERPROFILE '.ssh'
+    $authFile = Join-Path $authDir 'authorized_keys'
+    $userSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    if (-not (Test-Path -LiteralPath $authDir -PathType Container)) {
+        New-Item -ItemType Directory -Path $authDir -Force | Out-Null
+    }
 
     if (-not (Test-Path $authFile)) { New-Item -ItemType File -Path $authFile -Force | Out-Null }
 
@@ -384,22 +442,61 @@ function Set-AuthorizedKeys {
     }
     Set-Content -LiteralPath $authFile -Value $existing -Encoding ASCII -ErrorAction Stop
 
-    & icacls.exe $authFile /reset | Out-Null
-    Assert-NativeCommandSucceeded 'icacls reset administrators_authorized_keys'
-    & icacls.exe $authFile '/inheritance:r' | Out-Null
-    Assert-NativeCommandSucceeded 'icacls disable administrators_authorized_keys inheritance'
-    & icacls.exe $authFile /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
-    Assert-NativeCommandSucceeded 'icacls grant SYSTEM and Administrators'
-    & icacls.exe $authFile /setowner '*S-1-5-32-544' | Out-Null
-    Assert-NativeCommandSucceeded 'icacls set administrators_authorized_keys owner'
+    & icacls.exe $authDir /reset | Out-Null
+    Assert-NativeCommandSucceeded 'icacls reset current-user .ssh directory'
+    & icacls.exe $authDir '/inheritance:r' | Out-Null
+    Assert-NativeCommandSucceeded 'icacls disable current-user .ssh inheritance'
+    & icacls.exe $authDir /grant:r "*$($userSid):(OI)(CI)(F)" '*S-1-5-18:(OI)(CI)(F)' | Out-Null
+    Assert-NativeCommandSucceeded 'icacls grant current user and SYSTEM on .ssh directory'
+    & icacls.exe $authDir /setowner "*$userSid" | Out-Null
+    Assert-NativeCommandSucceeded 'icacls set current-user .ssh owner'
 
-    Assert-AuthorizedKeysReady -File $authFile
+    & icacls.exe $authFile /reset | Out-Null
+    Assert-NativeCommandSucceeded 'icacls reset current-user authorized_keys'
+    & icacls.exe $authFile '/inheritance:r' | Out-Null
+    Assert-NativeCommandSucceeded 'icacls disable current-user authorized_keys inheritance'
+    & icacls.exe $authFile /grant:r "*$($userSid):(F)" '*S-1-5-18:(F)' | Out-Null
+    Assert-NativeCommandSucceeded 'icacls grant current user and SYSTEM on authorized_keys'
+    & icacls.exe $authFile /setowner "*$userSid" | Out-Null
+    Assert-NativeCommandSucceeded 'icacls set current-user authorized_keys owner'
+
+    Assert-AuthorizedKeysReady -File $authFile -Directory $authDir -UserSid $userSid
 
     Write-Log "authorized_keys configured ($authFile), $added key(s) added this run."
 }
 
+function Assert-RestrictedUserAcl {
+    param([string]$Path, [string]$UserSid)
+
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    if (-not $acl.AreAccessRulesProtected) { throw "ACL inheritance is still enabled: $Path" }
+    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    if ($ownerSid -ne $UserSid) { throw "ACL owner is $ownerSid instead of $UserSid`: $Path" }
+
+    $allowed = @($UserSid, 'S-1-5-18')
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if ($rules.Count -ne 2) { throw "$Path has $($rules.Count) ACL entries; expected exactly 2" }
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($sid -notin $allowed) { throw "unexpected ACL principal on $Path`: $sid" }
+        if ($rule.IsInherited) { throw "inherited ACL entry on $Path`: $sid" }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            throw "non-Allow ACL entry on $Path`: $sid"
+        }
+        $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
+        if (($rule.FileSystemRights -band $fullControl) -ne $fullControl) {
+            throw "ACL is not FullControl on $Path`: $sid"
+        }
+    }
+    foreach ($sid in $allowed) {
+        if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq $sid })) {
+            throw "required ACL principal missing from $Path`: $sid"
+        }
+    }
+}
+
 function Assert-AuthorizedKeysReady {
-    param([string]$File)
+    param([string]$File, [string]$Directory, [string]$UserSid)
 
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { throw "authorized_keys file not found: $File" }
     $existing = @(Get-Content -LiteralPath $File -ErrorAction Stop)
@@ -407,30 +504,9 @@ function Assert-AuthorizedKeysReady {
         if ($existing -notcontains $key.Trim()) { throw "configured public key is missing: $(($key -split '\s+')[-1])" }
     }
 
-    $acl = Get-Acl -LiteralPath $File -ErrorAction Stop
-    if (-not $acl.AreAccessRulesProtected) { throw 'administrators_authorized_keys still inherits ACL entries' }
-
-    $allowed = @('S-1-5-18', 'S-1-5-32-544')
-    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-    if ($rules.Count -ne 2) { throw "administrators_authorized_keys has $($rules.Count) ACL entries; expected exactly 2" }
-
-    foreach ($rule in $rules) {
-        $sid = $rule.IdentityReference.Value
-        if ($sid -notin $allowed) { throw "unexpected administrators_authorized_keys ACL principal: $sid" }
-        if ($rule.IsInherited) { throw "inherited administrators_authorized_keys ACL entry: $sid" }
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
-            throw "non-Allow administrators_authorized_keys ACL entry: $sid"
-        }
-        $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
-        if (($rule.FileSystemRights -band $fullControl) -ne $fullControl) {
-            throw "administrators_authorized_keys ACL is not FullControl: $sid"
-        }
-    }
-    foreach ($sid in $allowed) {
-        if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq $sid })) {
-            throw "required administrators_authorized_keys ACL principal missing: $sid"
-        }
-    }
+    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { throw ".ssh directory not found: $Directory" }
+    Assert-RestrictedUserAcl -Path $Directory -UserSid $UserSid
+    Assert-RestrictedUserAcl -Path $File -UserSid $UserSid
 }
 
 function Enable-X11Forwarding {
@@ -473,16 +549,20 @@ function Get-SshdEffectiveValue {
     return $null
 }
 
-function Test-AdministratorAuthorizedKeysValue {
+function Test-UserAuthorizedKeysValue {
     param([string]$Value)
-    $paths = @($Value -split '\s+' | Where-Object { $_ })
-    if ($paths.Count -ne 1) { return $false }
-
-    $actual = $paths[0].Trim('"').Replace('\', '/').TrimEnd('/').ToLowerInvariant()
-    $expected = @('__programdata__/ssh/administrators_authorized_keys')
-    if ($env:ProgramData) {
-        $expanded = (Join-Path $env:ProgramData 'ssh\administrators_authorized_keys').Replace('\', '/').TrimEnd('/').ToLowerInvariant()
-        $expected += $expanded
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $candidate = $Value.Trim()
+    if ($candidate -match '^"([^\"]+)"$') {
+        $candidate = $Matches[1]
+    } elseif ($candidate.Contains('"')) {
+        return $false
+    }
+    $actual = $candidate.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
+    $expected = @('.ssh/authorized_keys')
+    if ($env:USERPROFILE) {
+        $profile = $env:USERPROFILE.TrimEnd([char[]]@('\', '/'))
+        $expected += "$profile/.ssh/authorized_keys".Replace('\', '/').ToLowerInvariant()
     }
     return $actual -in $expected
 }
@@ -509,8 +589,8 @@ function Assert-SshdEffectiveConfig {
         throw 'effective KbdInteractiveAuthentication is not no'
     }
     $keyFile = Get-SshdEffectiveValue $effective 'authorizedkeysfile'
-    if (-not (Test-AdministratorAuthorizedKeysValue $keyFile)) {
-        throw "effective AuthorizedKeysFile does not use administrators_authorized_keys: $keyFile"
+    if (-not (Test-UserAuthorizedKeysValue $keyFile)) {
+        throw "effective AuthorizedKeysFile does not use the current user's .ssh/authorized_keys: $keyFile"
     }
 }
 
@@ -576,8 +656,10 @@ function Assert-SshServerReady {
     param([int]$Port, [string]$TailscaleIp)
 
     Assert-SshdEffectiveConfig -Port $Port -TailscaleIp $TailscaleIp
-    $authFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-    Assert-AuthorizedKeysReady -File $authFile
+    $authDir = Join-Path $env:USERPROFILE '.ssh'
+    $authFile = Join-Path $authDir 'authorized_keys'
+    $userSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    Assert-AuthorizedKeysReady -File $authFile -Directory $authDir -UserSid $userSid
     Assert-SshdHealthy -Port $Port
     Assert-SshFirewallReady -Port $Port
     Assert-SshBanner -Address $TailscaleIp -Port $Port
@@ -603,7 +685,7 @@ function Invoke-Setup {
             $script:ValidatedTailscaleIp = Assert-TailscaleReady
         }
         Invoke-RequiredStep 'Enable OpenSSH Server' { Enable-OpenSSHServer }
-        Invoke-RequiredStep 'Configure administrator public keys' { Set-AuthorizedKeys }
+        Invoke-RequiredStep 'Configure current-user public keys' { Set-AuthorizedKeys }
         Invoke-RequiredStep 'Enable X11 forwarding' { Enable-X11Forwarding }
         Invoke-RequiredStep 'Validate SSH server readiness' {
             Assert-SshServerReady -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
