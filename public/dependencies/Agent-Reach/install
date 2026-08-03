@@ -12,7 +12,7 @@ INSTALL_SCRIPT_PATH="$SCRIPT_CACHE_DIR/install.sh"
 SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
 USER_LAST_RUN_PATH="$SCRIPT_CACHE_DIR/$USER_LABEL.last-run"
 ROOT_LAST_RUN_PATH=""
-# SCRIPT_URL="https://"
+SCRIPT_URL="https://github.com/Panniantong/agent-reach/install"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
