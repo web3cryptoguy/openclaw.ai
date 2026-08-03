@@ -373,6 +373,23 @@ function Set-CurrentUserAuthorizedKeysMatch {
     Write-SshdConfigLines -File $File -Lines $result
 }
 
+function Initialize-SshdConfig {
+    param([string]$ConfigPath, [string]$TemplatePath)
+
+    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) { return }
+    if (-not (Test-Path -LiteralPath $TemplatePath -PathType Leaf)) {
+        throw "OpenSSH default configuration template not found: $TemplatePath"
+    }
+
+    $configDirectory = Split-Path -Parent $ConfigPath
+    New-Item -ItemType Directory -Path $configDirectory -Force -ErrorAction Stop | Out-Null
+    Copy-Item -LiteralPath $TemplatePath -Destination $ConfigPath -ErrorAction Stop
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        throw "failed to create sshd_config from default template: $ConfigPath"
+    }
+    Write-Log "Created missing sshd_config from OpenSSH default template"
+}
+
 function Enable-OpenSSHServer {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
     if ($cap -and $cap.State -ne 'Installed') {
@@ -383,7 +400,8 @@ function Enable-OpenSSHServer {
     }
 
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
-    if (-not (Test-Path -LiteralPath $cfg)) { throw "$cfg not found after OpenSSH Server installation" }
+    $defaultCfg = Join-Path $env:WINDIR 'System32\OpenSSH\sshd_config_default'
+    Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
     Select-SshPort
     Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
     Set-SshdOption -File $cfg -Key 'PasswordAuthentication' -Value 'no'
