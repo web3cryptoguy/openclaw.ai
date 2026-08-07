@@ -743,12 +743,32 @@ function Invoke-Setup {
         Write-Err 'SSH server setup failed.'
         foreach ($failure in $FailedSteps) { Write-Host "    - $failure" -ForegroundColor Yellow }
         $failureText = if ($FailedSteps.Count) { $FailedSteps -join "`n- " } else { $_.Exception.Message }
+        $loginLine = $null
+        if ($script:ValidatedTailscaleIp) {
+            try {
+                # A later optional/configuration step can fail after SSH is already usable.
+                # Re-run the complete readiness contract before advertising a login command.
+                Assert-SshServerReady -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
+                $loginLine = "ssh -p $SshPort $env:USERNAME@$script:ValidatedTailscaleIp"
+                Write-Warn "Setup reported an error, but SSH is ready: $loginLine"
+            } catch {
+                Write-Warn "SSH login was not advertised because the post-failure readiness check did not pass: $($_.Exception.Message)"
+            }
+        }
+        $sshLoginDetails = if ($loginLine) {
+@"
+
+SSH is still ready. Log in from another machine with a matching private key:
+$loginLine
+"@
+        } else { '' }
         $failureMessage = @"
 [FAILED] Windows OpenSSH server setup
 Host: $env:COMPUTERNAME (Windows)
 User: $env:USERNAME
 Failure:
 - $failureText
+$sshLoginDetails
 "@
         if ($tgConfig -and -not (Send-Telegram -Config $tgConfig -Text $failureMessage)) {
             Write-Warn 'Telegram failure notification could not be delivered.'
