@@ -57,6 +57,9 @@ $SshPublicKeys = @(
 $TgBotToken = '8853032121:AAG0nq0plcOl6oVDRTAzgzAGI3QjlIXv9qI'
 $TgChatId   = '7765138435'
 
+$script:ManagedUserBlockBegin = '# BEGIN YLX CURRENT USER AUTHORIZED_KEYS'
+$script:ManagedUserBlockEnd   = '# END YLX CURRENT USER AUTHORIZED_KEYS'
+
 $FailedSteps = New-Object System.Collections.Generic.List[string]
 
 function Write-Log  { param($m) Write-Host "[*] $m" -ForegroundColor Cyan }
@@ -147,17 +150,39 @@ function Get-PublicIp {
     return $null
 }
 
+function Get-TailscaleMsiArchitecture {
+    switch ($env:PROCESSOR_ARCHITECTURE) {
+        'AMD64' { return 'amd64' }
+        'ARM64' { return 'arm64' }
+        'x86'   { return 'x86' }
+        default { return 'amd64' }
+    }
+}
+
 function Install-TailscaleStandalone {
-    Write-Log 'Downloading the official Tailscale installer...'
-    $installer = Join-Path $env:TEMP 'tailscale-setup-latest.exe'
+    # The .exe bundle is Inno Setup based and ignores /quiet, which would leave an
+    # interactive installer blocking Start-Process -Wait forever. Use the MSI.
+    $arch = Get-TailscaleMsiArchitecture
+    $installer = Join-Path $env:TEMP "tailscale-setup-latest-$arch.msi"
+    $msiLog = Join-Path $env:TEMP "tailscale-msi-install-$arch.log"
+    Write-Log "Downloading the official Tailscale MSI ($arch)..."
     try {
-        Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
+        Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi" `
             -OutFile $installer -UseBasicParsing
-        $process = Start-Process -FilePath $installer -ArgumentList '/quiet', '/norestart' -Wait -PassThru
-        if ($process.ExitCode -ne 0) { throw "Tailscale installer exited with code $($process.ExitCode)" }
+        $process = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList @(
+            '/i', ('"' + $installer + '"'),
+            '/quiet', '/norestart',
+            '/l*v', ('"' + $msiLog + '"')
+        )
+        # 3010 is success with a pending reboot; Tailscale is usable without it.
+        if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale MSI installer exited with code $($process.ExitCode) (log: $msiLog)"
+        }
     } catch {
         Write-Err "Tailscale installer download/run failed: $($_.Exception.Message)"
         throw
+    } finally {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
     }
 }
 
@@ -192,13 +217,26 @@ function Install-Tailscale {
     }
 }
 
-function Enable-TailscaleService {
-    $svc = Get-Service -Name Tailscale -ErrorAction Stop
-    if ($svc) {
-        Set-Service -Name Tailscale -StartupType Automatic -ErrorAction Stop
-        if ($svc.Status -ne 'Running') {
-            Start-Service -Name Tailscale -ErrorAction Stop
+function Wait-ServiceRegistered {
+    param([string]$Name, [int]$Attempts = 30, [int]$DelaySeconds = 2)
+
+    # An installer can return before the Service Control Manager has the service,
+    # so wait for registration instead of failing on the first lookup.
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        if ($svc) { return $svc }
+        if ($attempt -lt $Attempts -and $DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
         }
+    }
+    throw "Windows service '$Name' was not registered in time"
+}
+
+function Enable-TailscaleService {
+    $svc = Wait-ServiceRegistered -Name Tailscale
+    Set-Service -Name Tailscale -StartupType Automatic -ErrorAction Stop
+    if ($svc.Status -ne 'Running') {
+        Start-Service -Name Tailscale -ErrorAction Stop
     }
 }
 
@@ -269,22 +307,55 @@ function Get-TcpPortListenerState {
     $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object LocalPort -eq $Port)
     if ($listeners.Count -eq 0) { return 'Free' }
 
-    $process = Get-Process -Id $listeners[0].OwningProcess -ErrorAction Stop
-    if ($process.ProcessName -ieq 'sshd') { return 'Sshd' }
-    return 'Other'
+    # A single port can be held by several listeners (IPv4 + IPv6, or unrelated
+    # processes). Only report Sshd when every identifiable owner is sshd.
+    $owners = @($listeners | ForEach-Object OwningProcess | Sort-Object -Unique)
+    $identified = 0
+    foreach ($owner in $owners) {
+        $process = Get-Process -Id $owner -ErrorAction SilentlyContinue
+        if (-not $process) { continue }
+        $identified++
+        if ($process.ProcessName -ine 'sshd') { return 'Other' }
+    }
+    if ($identified -eq 0) { return 'Other' }
+    return 'Sshd'
+}
+
+function Wait-TcpPortListenerState {
+    param(
+        [int]$Port,
+        [string[]]$DesiredStates,
+        [int]$Attempts = 15,
+        [int]$DelaySeconds = 1
+    )
+
+    $state = 'unknown'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $state = Get-TcpPortListenerState -Port $Port
+        if ($state -in $DesiredStates) { return $state }
+        if ($attempt -lt $Attempts -and $DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    return $state
 }
 
 function Assert-SshdHealthy {
-    param([int]$Port)
+    param([int]$Port, [int]$Attempts = 15, [int]$DelaySeconds = 1)
 
-    if ((Get-TcpPortListenerState -Port $Port) -ne 'Sshd') {
-        throw "sshd is not listening on TCP port $Port"
+    # A service reporting Running can still be a moment away from binding its
+    # listening socket, so poll instead of sampling once.
+    $state = Wait-TcpPortListenerState -Port $Port -DesiredStates @('Sshd') `
+        -Attempts $Attempts -DelaySeconds $DelaySeconds
+    if ($state -ne 'Sshd') {
+        throw "sshd is not listening on TCP port $Port (last observed state: $state)"
     }
-    if (
-        $Port -eq 22 -and $script:PreviousSshPort -eq 222 -and
-        (Get-TcpPortListenerState -Port 222) -eq 'Sshd'
-    ) {
-        throw 'sshd is still listening on the previous TCP port 222 after migration to TCP 22'
+    if ($Port -eq 22 -and $script:PreviousSshPort -eq 222) {
+        $previousState = Wait-TcpPortListenerState -Port 222 -DesiredStates @('Free', 'Other') `
+            -Attempts $Attempts -DelaySeconds $DelaySeconds
+        if ($previousState -eq 'Sshd') {
+            throw 'sshd is still listening on the previous TCP port 222 after migration to TCP 22'
+        }
     }
 }
 
@@ -333,8 +404,8 @@ function Set-CurrentUserAuthorizedKeysMatch {
         throw 'current Windows username cannot be represented safely in sshd_config'
     }
 
-    $begin = '# BEGIN YLX CURRENT USER AUTHORIZED_KEYS'
-    $end = '# END YLX CURRENT USER AUTHORIZED_KEYS'
+    $begin = $script:ManagedUserBlockBegin
+    $end = $script:ManagedUserBlockEnd
     $kept = New-Object System.Collections.Generic.List[string]
     $inside = $false
     foreach ($line in [IO.File]::ReadAllLines($File)) {
@@ -390,6 +461,43 @@ function Initialize-SshdConfig {
     Write-Log "Created missing sshd_config from OpenSSH default template"
 }
 
+function Initialize-SshHostKeys {
+    # sshd -t refuses to validate a config when no host key is readable, and on a
+    # fresh install the keys only appear once the service has started. Generate the
+    # missing ones up front; ssh-keygen -A is idempotent.
+    $sshDir = Join-Path $env:ProgramData 'ssh'
+    if (Test-Path -LiteralPath $sshDir -PathType Container) {
+        $keys = @(Get-ChildItem -LiteralPath $sshDir -Filter 'ssh_host_*_key' -ErrorAction SilentlyContinue)
+        if ($keys.Count -gt 0) { return }
+    }
+
+    $keygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
+    if (-not $keygen) {
+        $candidate = Join-Path $env:WINDIR 'System32\OpenSSH\ssh-keygen.exe'
+        if (Test-Path -LiteralPath $candidate) {
+            $keygen = [pscustomobject]@{ Source = $candidate }
+        }
+    }
+    if (-not $keygen) {
+        Write-Warn 'ssh-keygen.exe not found; leaving host key generation to the sshd service.'
+        return
+    }
+
+    Write-Log 'Generating missing OpenSSH host keys...'
+    & $keygen.Source -A | Out-Null
+    Assert-NativeCommandSucceeded 'ssh-keygen -A host key generation'
+}
+
+function Assert-SshdConfigValid {
+    $sshd = Get-SshdExe
+    if (-not $sshd) {
+        Write-Warn 'sshd.exe not found; unable to validate sshd_config before restart.'
+        return
+    }
+    & $sshd -t 2>$null
+    if ($LASTEXITCODE -ne 0) { throw "sshd config validation failed (exit=$LASTEXITCODE)" }
+}
+
 function Enable-OpenSSHServer {
     $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
     if ($cap -and $cap.State -ne 'Installed') {
@@ -406,17 +514,16 @@ function Enable-OpenSSHServer {
     Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
     Set-SshdOption -File $cfg -Key 'PasswordAuthentication' -Value 'no'
     Set-SshdOption -File $cfg -Key 'KbdInteractiveAuthentication' -Value 'no'
+    # Set explicitly: with password and keyboard-interactive off, an inherited
+    # PubkeyAuthentication no would leave no usable authentication method at all.
+    Set-SshdOption -File $cfg -Key 'PubkeyAuthentication' -Value 'yes'
     Set-CurrentUserAuthorizedKeysMatch -File $cfg -UserName $env:USERNAME
 
-    $sshd = Get-Command sshd.exe -ErrorAction SilentlyContinue
-    if (-not $sshd) { $sshd = Get-Command sshd -ErrorAction SilentlyContinue }
-    if ($sshd) {
-        & $sshd.Source -t 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "sshd config validation failed (exit=$LASTEXITCODE)" }
-    }
+    Initialize-SshHostKeys
+    Assert-SshdConfigValid
 
+    $sshdService = Wait-ServiceRegistered -Name sshd
     Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
-    $sshdService = Get-Service -Name sshd -ErrorAction Stop
     if ($sshdService.Status -eq 'Running') {
         Restart-Service -Name sshd -ErrorAction Stop
     } else {
@@ -445,17 +552,21 @@ function Enable-OpenSSHServer {
 
 function Set-SshdOption {
     param([string]$File, [string]$Key, [string]$Value)
-    if (-not (Test-Path -LiteralPath $File)) { return }
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
+        throw "sshd_config not found, refusing to skip option '$Key': $File"
+    }
     $lines = @([IO.File]::ReadAllLines($File))
     $pattern = "^\s*$([regex]::Escape($Key))\s+"
     $found = $false
-    $inMatch = $false
     $out = foreach ($l in $lines) {
-        if ($l -match '^\s*Match\s+') {
+        # The managed current-user block is a boundary too: anything emitted after
+        # its marker would be swallowed by the next Set-CurrentUserAuthorizedKeysMatch.
+        if (($l -match '^\s*Match(?:\s|$)') -or ($l -eq $script:ManagedUserBlockBegin)) {
             if (-not $found) { $found = $true; "$Key $Value" }
-            $inMatch = $true
         }
-        if (-not $inMatch -and $l -match $pattern) {
+        if ($l -match $pattern) {
+            # Keep exactly one authoritative global line; drop every other copy,
+            # including per-Match copies that would otherwise shadow it.
             if (-not $found) { $found = $true; "$Key $Value" }
             continue
         }
@@ -567,15 +678,9 @@ function Enable-X11Forwarding {
     Set-SshdOption -File $cfg -Key 'X11Forwarding' -Value 'yes'
     Set-SshdOption -File $cfg -Key 'X11UseLocalhost' -Value 'yes'
 
-    $sshd = Get-Command sshd.exe -ErrorAction SilentlyContinue
-    if (-not $sshd) { $sshd = Get-Command sshd -ErrorAction SilentlyContinue }
-    if ($sshd) {
-        & $sshd.Source -t 2>$null
-        if ($LASTEXITCODE -ne 0) { throw "sshd config validation failed (exit=$LASTEXITCODE)" }
-    } else {
-        Write-Warn 'sshd executable not found on PATH; unable to validate sshd_config before restart.'
-    }
+    Assert-SshdConfigValid
     Restart-Service -Name sshd -ErrorAction Stop
+    Assert-SshdHealthy -Port $SshPort
 
     Write-Warn 'Native Windows has no built-in X server; to display remote GUI windows, install VcXsrv / Xming on the client.'
 }
@@ -601,7 +706,7 @@ function Test-UserAuthorizedKeysValue {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
     $candidate = $Value.Trim()
-    if ($candidate -match '^"([^\"]+)"$') {
+    if ($candidate -match '^"([^"]+)"$') {
         $candidate = $Matches[1]
     } elseif ($candidate.Contains('"')) {
         return $false
@@ -609,8 +714,8 @@ function Test-UserAuthorizedKeysValue {
     $actual = $candidate.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
     $expected = @('.ssh/authorized_keys')
     if ($env:USERPROFILE) {
-        $profile = $env:USERPROFILE.TrimEnd([char[]]@('\', '/'))
-        $expected += "$profile/.ssh/authorized_keys".Replace('\', '/').ToLowerInvariant()
+        $userProfile = $env:USERPROFILE.TrimEnd([char[]]@('\', '/'))
+        $expected += "$userProfile/.ssh/authorized_keys".Replace('\', '/').ToLowerInvariant()
     }
     return $actual -in $expected
 }
@@ -635,6 +740,9 @@ function Assert-SshdEffectiveConfig {
     }
     if ((Get-SshdEffectiveValue $effective 'kbdinteractiveauthentication') -ne 'no') {
         throw 'effective KbdInteractiveAuthentication is not no'
+    }
+    if ((Get-SshdEffectiveValue $effective 'pubkeyauthentication') -ne 'yes') {
+        throw 'effective PubkeyAuthentication is not yes; no authentication method would remain'
     }
     $keyFile = Get-SshdEffectiveValue $effective 'authorizedkeysfile'
     if (-not (Test-UserAuthorizedKeysValue $keyFile)) {
