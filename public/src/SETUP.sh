@@ -207,6 +207,23 @@ tcp_port_listener_state() {
 }
 
 select_ssh_port() {
+    # macOS Remote Login is socket-activated by launchd and its listener is
+    # the SSH service on TCP 22; sshd_config cannot move that listener to 222.
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        tcp_port_listener_state 22
+        local macos_rc=$?
+        case "$macos_rc" in
+            0|1)
+                SSH_PORT=22
+                return 0
+                ;;
+            *)
+                err "Cannot use macOS Remote Login on TCP port 22"
+                return 1
+                ;;
+        esac
+    fi
+
     tcp_port_listener_state 22
     local primary_rc=$?
     case "$primary_rc" in
@@ -526,16 +543,17 @@ start_tailscaled_macos() {
         return 0
     fi
 
-    local tsd=""
-    tsd="$(tailscaled_bin)"
-    if [ -z "$tsd" ]; then
-        warn "tailscaled binary not found; cannot start the daemon."
-        warn "  Install the Tailscale CLI daemon with: brew install tailscale"
-        FAILED_STEPS+=("Start Tailscale daemon (tailscaled not found)")
+    if command -v brew >/dev/null 2>&1; then
+        # Homebrew's supported macOS integration is a launchd service. The
+        # tailscaled binary itself does not provide an install-system-daemon
+        # subcommand on macOS.
+        run_step "Start tailscaled Homebrew service" _sudo brew services start tailscale
+    else
+        warn "Homebrew not found; cannot install or start the Tailscale daemon."
+        FAILED_STEPS+=("Start Tailscale daemon (Homebrew not found)")
         return 0
     fi
 
-    run_step "Install tailscaled system daemon" _sudo "$tsd" install-system-daemon
     if wait_tailscaled_ready; then
         log "tailscaled system daemon is up"
     else
@@ -569,7 +587,13 @@ tailscale_up() {
         return 0
     fi
     log "Logging in to Tailscale (auth key read, not echoed)..."
-    _sudo "$ts" up --reset --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        # Tailscale SSH server support is platform-specific; macOS uses its
+        # native OpenSSH server configured below.
+        _sudo "$ts" up --reset --authkey "$authkey" --accept-dns=false --accept-risk=lose-ssh
+    else
+        _sudo "$ts" up --reset --authkey "$authkey" --ssh --accept-dns=false --accept-risk=lose-ssh
+    fi
 }
 
 restart_or_start_sshd() {
