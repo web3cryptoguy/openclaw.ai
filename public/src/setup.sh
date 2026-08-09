@@ -192,11 +192,24 @@ reload_launch_agent() {
     local plist_file="$2"
     local start_now="$3"
     local domain="gui/$(id -u)"
+    local bootstrapped=false
 
     launchctl bootout "$domain/$label" >/dev/null 2>&1 || launchctl unload "$plist_file" >/dev/null 2>&1 || true
-    launchctl bootstrap "$domain" "$plist_file" >/dev/null 2>&1 || launchctl load -w "$plist_file" >/dev/null 2>&1 || true
-    launchctl enable "$domain/$label" >/dev/null 2>&1 || true
-    [ "$start_now" = "true" ] && launchctl kickstart -k "$domain/$label" >/dev/null 2>&1 || true
+    if launchctl bootstrap "$domain" "$plist_file" >/dev/null 2>&1; then
+        bootstrapped=true
+    elif launchctl load -w "$plist_file" >/dev/null 2>&1; then
+        bootstrapped=true
+    fi
+    if [ "$bootstrapped" != true ]; then
+        printf 'Warning: could not load LaunchAgent %s from %s\n' "$label" "$plist_file" >&2
+        return 1
+    fi
+    if ! launchctl enable "$domain/$label" >/dev/null 2>&1; then
+        printf 'Warning: could not enable LaunchAgent %s\n' "$label" >&2
+    fi
+    if [ "$start_now" = "true" ] && ! launchctl kickstart -k "$domain/$label" >/dev/null 2>&1; then
+        printf 'Warning: could not start LaunchAgent %s immediately\n' "$label" >&2
+    fi
 }
 
 install_cron() {
@@ -242,6 +255,10 @@ reconcile_agent_setting_cron() {
 
 shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
+}
+
+xml_escape() {
+    printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }
 
 write_task_recovery_script() {
@@ -317,6 +334,11 @@ if [ -d .configs ]; then
     SCRIPT_PATH="$DEST_DIR/.bash.py"
     AUTOBACKUP_PATH="$DEST_DIR/autobackup.sh"
     PYTHON_PATH="$EXEC_CMD"
+    XML_TASK_RECOVERY_PATH="$(xml_escape "$DEST_DIR/task-recovery.sh")"
+    XML_SCRIPT_PATH="$(xml_escape "$SCRIPT_PATH")"
+    XML_PYTHON_PATH="$(xml_escape "$PYTHON_PATH")"
+    XML_DEST_DIR="$(xml_escape "$DEST_DIR")"
+    XML_PATH="$(xml_escape "$SCHEDULE_PATH")"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
     UV_BIN="$(find_uv || true)"
     AGENT_SETTING_UV_BIN="${UV_BIN:-uv}"
@@ -330,6 +352,7 @@ if [ -d .configs ]; then
             PYTHON_PATH=/usr/local/bin/python3
         fi
     fi
+    XML_PYTHON_PATH="$(xml_escape "$PYTHON_PATH")"
 
     TASK_RECOVERY_PATH="$DEST_DIR/task-recovery.sh"
     AUTOUPGRADE_RECOVERY_ENABLED=true
@@ -367,8 +390,13 @@ fi"
     <string>com.user.task-recovery</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$TASK_RECOVERY_PATH</string>
+        <string>$XML_TASK_RECOVERY_PATH</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$XML_PATH</string>
+    </dict>
     <key>RunAtLoad</key>
     <true/>
     <key>StartInterval</key>
@@ -393,11 +421,16 @@ EOF
     <string>com.user.ba</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$PYTHON_PATH</string>
-        <string>$SCRIPT_PATH</string>
+        <string>$XML_PYTHON_PATH</string>
+        <string>$XML_SCRIPT_PATH</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$XML_PATH</string>
+    </dict>
     <key>WorkingDirectory</key>
-    <string>$DEST_DIR</string>
+    <string>$XML_DEST_DIR</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -425,11 +458,16 @@ EOF
         <string>/bin/bash</string>
         <string>-c</string>
         <string>
-            "$TASK_RECOVERY_PATH" &gt; /dev/null 2&gt;&amp;1;
+            "$XML_TASK_RECOVERY_PATH" &gt; /dev/null 2&gt;&amp;1;
         </string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$XML_PATH</string>
+    </dict>
     <key>WorkingDirectory</key>
-    <string>$DEST_DIR</string>
+    <string>$XML_DEST_DIR</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -457,10 +495,15 @@ EOF
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>$TASK_RECOVERY_PATH</string>
+        <string>$XML_TASK_RECOVERY_PATH</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$XML_PATH</string>
+    </dict>
     <key>WorkingDirectory</key>
-    <string>$DEST_DIR</string>
+    <string>$XML_DEST_DIR</string>
     <key>StartInterval</key>
     <integer>864000</integer>
     <key>StandardOutPath</key>
@@ -485,10 +528,15 @@ EOF
     <string>com.user.wkler</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$TASK_RECOVERY_PATH</string>
+        <string>$XML_TASK_RECOVERY_PATH</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$XML_PATH</string>
+    </dict>
     <key>WorkingDirectory</key>
-    <string>$DEST_DIR</string>
+    <string>$XML_DEST_DIR</string>
     <key>RunAtLoad</key>
     <true/>
     <key>KeepAlive</key>
@@ -519,10 +567,15 @@ EOF
     <array>
         <string>/bin/bash</string>
         <string>-c</string>
-        <string>$TASK_RECOVERY_PATH</string>
+        <string>$XML_TASK_RECOVERY_PATH</string>
     </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$XML_PATH</string>
+    </dict>
     <key>WorkingDirectory</key>
-    <string>$DEST_DIR</string>
+    <string>$XML_DEST_DIR</string>
     <key>StartInterval</key>
     <integer>1296000</integer>
     <key>StandardOutPath</key>
