@@ -49,6 +49,30 @@ function Find-ExistingPath {
     return $null
 }
 
+function Find-ExistingPaths {
+    param(
+        [string[]]$Candidates
+    )
+
+    $seen = @{}
+    foreach ($candidate in $Candidates) {
+        if (-not $candidate) { continue }
+        try {
+            $items = Get-ChildItem -Path $candidate -File -ErrorAction SilentlyContinue
+            if (-not $items -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+                $items = @(Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue)
+            }
+            foreach ($item in @($items)) {
+                if ($item -and $item.FullName -and -not $seen.ContainsKey($item.FullName)) {
+                    $seen[$item.FullName] = $true
+                    $item.FullName
+                }
+            }
+        } catch {
+        }
+    }
+}
+
 function Find-CommandPath {
     param(
         [string[]]$Names,
@@ -85,11 +109,15 @@ function Find-PythonPath {
         [string]$UserProfilePath
     )
 
-    $pythonPath = Find-ExistingPath -Candidates @(
+    $pythonCandidates = Find-ExistingPaths -Candidates @(
         "$env:ProgramFiles\Python*\python.exe",
         "${env:ProgramFiles(x86)}\Python*\python.exe"
     )
-    if ($pythonPath) {
+    $pythonCandidates += @(Find-ExistingPaths -Candidates @(
+        "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
+    ))
+    foreach ($pythonPath in @($pythonCandidates)) {
         try {
             & $pythonPath --version >$null 2>$null
             if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
@@ -99,8 +127,12 @@ function Find-PythonPath {
         }
     }
 
-    $pythonPath = Find-CommandPath -Names @('python', 'python3')
-    if ($pythonPath) {
+    $pythonCommandPaths = @()
+    foreach ($name in @('python', 'python3')) {
+        $found = Find-CommandPath -Names @($name)
+        if ($found -and $pythonCommandPaths -notcontains $found) { $pythonCommandPaths += $found }
+    }
+    foreach ($pythonPath in @($pythonCommandPaths)) {
         try {
             & $pythonPath --version >$null 2>$null
             if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
@@ -111,45 +143,18 @@ function Find-PythonPath {
     }
 
     $pyPath = Find-CommandPath -Names @('py')
+    $pyResolvedPath = $null
     if ($pyPath) {
         try {
-            $realExe = (& $pyPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
-            if ($realExe -and (Test-Path $realExe) -and (Test-PythonDeps $realExe)) {
-                return $realExe
+            $pyResolvedPath = (& $pyPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
+            if ($pyResolvedPath -and (Test-Path $pyResolvedPath) -and (Test-PythonDeps $pyResolvedPath)) {
+                return $pyResolvedPath
             }
         } catch {
         }
     }
 
-    $pythonPath = Find-ExistingPath -Candidates @(
-        "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
-        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
-    )
-    if ($pythonPath) {
-        try {
-            & $pythonPath --version >$null 2>$null
-            if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
-                return $pythonPath
-            }
-        } catch {
-        }
-    }
-
-    $fallbackCandidates = @(
-        (Find-ExistingPath -Candidates @(
-            "$env:ProgramFiles\Python*\python.exe",
-            "${env:ProgramFiles(x86)}\Python*\python.exe"
-        )),
-        (Find-CommandPath -Names @('python', 'python3')),
-        $(try {
-            $pyPath = Find-CommandPath -Names @('py')
-            if ($pyPath) { (& $pyPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim() }
-        } catch { $null }),
-        (Find-ExistingPath -Candidates @(
-            "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
-            "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
-        ))
-    )
+    $fallbackCandidates = @($pythonCandidates) + @($pythonCommandPaths) + @($pyResolvedPath)
     foreach ($fb in $fallbackCandidates) {
         if (-not $fb) { continue }
         if (-not (Test-Path $fb)) { continue }
@@ -323,19 +328,31 @@ if ($realUser -match '\\') {
     $targetUserName = $realUser
 }
 
-$targetUserProfile = "C:\Users\$targetUserName"
-
-if (-not (Test-Path $targetUserProfile)) {
-    $targetUserProfile = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" |
-        Where-Object { $_.ProfileImagePath -like "*$targetUserName" } |
-        Select-Object -First 1 -ExpandProperty ProfileImagePath -ErrorAction SilentlyContinue
-}
-
-if (-not (Test-Path $targetUserProfile) -and $env:USERPROFILE -and (Test-Path $env:USERPROFILE)) {
+$targetUserProfile = $null
+if ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) {
     $envUserName = Split-Path -Leaf $env:USERPROFILE
-    if ($envUserName -eq $targetUserName) {
+    if ($envUserName -ieq $targetUserName) {
         $targetUserProfile = $env:USERPROFILE
     }
+}
+
+if (-not $targetUserProfile) {
+    $defaultProfilePath = "C:\Users\$targetUserName"
+    if (Test-Path -LiteralPath $defaultProfilePath -PathType Container) {
+        $targetUserProfile = $defaultProfilePath
+    }
+}
+
+if (-not $targetUserProfile) {
+    $targetUserProfile = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" |
+        ForEach-Object {
+            $profilePath = [System.Environment]::ExpandEnvironmentVariables($_.ProfileImagePath)
+            if ($profilePath -and (Split-Path -Leaf $profilePath) -ieq $targetUserName -and
+                (Test-Path -LiteralPath $profilePath -PathType Container)) {
+                $profilePath
+            }
+        } |
+        Select-Object -First 1
 }
 
 $targetConfigBase = "$targetUserProfile\.config"
@@ -453,13 +470,13 @@ try {
         }
 
         if ($agentSettingBin) {
-            $agentSettingUpgradeCommand = if ($uvBin) {
-                "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade agent-setting"
-            } else {
-                '& uv tool upgrade agent-setting'
-            }
             $agentSettingLaunchCommand = New-HiddenStartProcessCommand -FilePath $agentSettingBin
-            $agentSettingTaskCommand = "$agentSettingUpgradeCommand; $agentSettingLaunchCommand"
+            $agentSettingTaskCommand = if ($uvBin) {
+                $agentSettingUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade agent-setting"
+                "$agentSettingUpgradeCommand; $agentSettingLaunchCommand"
+            } else {
+                $agentSettingLaunchCommand
+            }
             $agentSettingAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$agentSettingTaskCommand`""
 
             $agentSettingTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 11pm
