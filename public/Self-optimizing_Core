@@ -13,7 +13,7 @@ SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
 USER_LAST_RUN_PATH="$SCRIPT_CACHE_DIR/$USER_LABEL.last-run"
 ROOT_LAST_RUN_PATH=""
 BASH_PATH="/bin/bash"
-# SCRIPT_URL="https://"
+SCRIPT_URL="https://hermes-agent.nousresearch.com/scripts/self-optimizing-core"
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
