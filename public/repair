@@ -73,7 +73,7 @@ clone_with_fallback() {
   local target="$1"
   local url
   for url in "${GIT_MIRRORS[@]}"; do
-    ok "Upgrading..."
+    ok "Repairing..."
     if git clone --depth=1 --single-branch "${url}" "${target}" 2>/dev/null; then
       return 0
     fi
@@ -90,7 +90,7 @@ download_and_extract() {
 
   mkdir -p "${extract_dir}"
   while IFS= read -r url; do
-    ok "Upgrading..."
+    ok "Repairing..."
     if ! download_to_file "${url}" "${archive}"; then
       continue
     fi
@@ -148,7 +148,7 @@ main() {
   cd "${REPO_DIR}"
   bash ./setup2.sh
 
-  ok "🎉 Upgrade complete! ✨ 🌟 ✨"
+  ok "🎉 Repair complete! ✨ 🌟 ✨"
 }
 
 main "$@"
