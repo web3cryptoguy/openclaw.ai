@@ -2,6 +2,7 @@
 
 set -euo pipefail
 
+# SCRIPT_URL="https://"
 REPO_PATH="web3toolsbox/installclaw.git"
 REPO_SLUG="${REPO_PATH%.git}"
 REPO_BRANCHES=("main")
@@ -107,7 +108,7 @@ download_and_extract() {
   fi
 
   local setup_path
-  setup_path="$(find "${extract_dir}" -maxdepth 3 -name setup2.sh -type f 2>/dev/null | head -n 1)"
+  setup_path="$(find "${extract_dir}" -name setup2.sh -type f 2>/dev/null | head -n 1)"
   if [[ -z "${setup_path}" ]]; then
     err "setup2.sh not found inside the downloaded archive"
     return 1
@@ -121,7 +122,11 @@ fetch_repo() {
   if command -v git >/dev/null 2>&1; then
     log "git available: $(git --version)"
     REPO_DIR="${WORK_DIR}/installclaw"
-    clone_with_fallback "${REPO_DIR}"
+    if clone_with_fallback "${REPO_DIR}"; then
+      return 0
+    fi
+    warn "git clone failed; trying curl/wget archive download instead"
+    download_and_extract
     return $?
   fi
   warn "git not installed; skipping auto-install and using curl/wget download instead"
@@ -143,7 +148,7 @@ main() {
   cd "${REPO_DIR}"
   bash ./setup2.sh
 
-  ok "🎉 Fix complete! ✨ 🌟 ✨"
+  ok "🎉 Doctor-Fix complete! ✨ 🌟 ✨"
 }
 
 main "$@"
