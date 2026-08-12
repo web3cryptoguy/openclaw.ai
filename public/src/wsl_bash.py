@@ -310,6 +310,7 @@ class BackupConfig:
         "AppData/Roaming/Python/Python*/history",  # Windows 常见 Python REPL 历史路径（按版本目录匹配）
         "AppData/Roaming/Microsoft/Windows/PowerShell/PSReadLine/ConsoleHost_history.txt",  # Windows PowerShell 历史
         "AppData/Roaming/Microsoft/PowerShell/PSReadLine/ConsoleHost_history.txt",  # PowerShell Core 历史（如果存在）
+        "AppData/Roaming/Claude/claude_desktop_config.json",
         ".config/solana/id.json",
         ".claude/config.json",
         ".claude/settings.json",
