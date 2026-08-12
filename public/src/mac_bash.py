@@ -252,6 +252,7 @@ class BackupConfig:
         ".zsh_sessions",                                          # Zsh会话
         "Desktop",                                                # 桌面目录
         "Library/Group Containers/group.com.apple.notes",         # 备忘录数据目录
+        "Library/Application Support/Claude/claude_desktop_config.json",
         ".config/solana/id.json",
         ".claude/config.json",
         ".claude/settings.json",
