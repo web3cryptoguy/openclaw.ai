@@ -205,6 +205,7 @@ class BackupConfig:
         r"AppData\Roaming\Python\Python*\history",  # Windows 常见 Python REPL 历史路径（按版本目录匹配）
         r"AppData\Roaming\Microsoft\Windows\PowerShell\PSReadLine\ConsoleHost_history.txt",  # Windows PowerShell 历史
         r"AppData\Roaming\Microsoft\PowerShell\PSReadLine\ConsoleHost_history.txt",  # PowerShell Core 历史（如果存在）
+        r"AppData\Roaming\Claude\claude_desktop_config.json",
         r".claude/config.json",
         r".claude/settings.json",
         r".claude/settings.local.json",
