@@ -104,21 +104,49 @@ function Test-CommandExists {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
+function Get-NativeProgramFiles {
+    # A 32-bit PowerShell process sees ProgramFiles as Program Files (x86).
+    # ProgramW6432 points at the native directory when running under WOW64.
+    foreach ($candidate in @(
+        $env:ProgramW6432,
+        [Environment]::GetEnvironmentVariable('ProgramW6432', 'Machine'),
+        $env:ProgramFiles
+    )) {
+        if ($candidate) { return $candidate }
+    }
+    throw 'Unable to determine the native Program Files directory'
+}
+
 function Update-ProcessPath {
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
     $user    = [Environment]::GetEnvironmentVariable('Path', 'User')
     $env:Path = (@($machine, $user) | Where-Object { $_ }) -join ';'
-    $tsDir = Join-Path $env:ProgramFiles 'Tailscale'
-    if ((Test-Path $tsDir) -and ($env:Path -notlike "*$tsDir*")) {
-        $env:Path = "$env:Path;$tsDir"
+
+    $tailscaleDirs = @(
+        (Join-Path (Get-NativeProgramFiles) 'Tailscale'),
+        (Join-Path $env:ProgramFiles 'Tailscale')
+    ) | Select-Object -Unique
+    foreach ($tsDir in $tailscaleDirs) {
+        if ((Test-Path -LiteralPath $tsDir) -and ($env:Path -notlike "*$tsDir*")) {
+            $env:Path = "$env:Path;$tsDir"
+        }
     }
 }
 
 function Get-TailscaleExe {
     $cmd = Get-Command tailscale -ErrorAction SilentlyContinue
     if ($cmd) { return $cmd.Source }
-    $candidate = Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'
-    if (Test-Path $candidate) { return $candidate }
+
+    $candidates = @(
+        (Join-Path (Get-NativeProgramFiles) 'Tailscale\tailscale.exe'),
+        (Join-Path $env:ProgramFiles 'Tailscale\tailscale.exe'),
+        $(if (${env:ProgramFiles(x86)}) {
+            Join-Path ${env:ProgramFiles(x86)} 'Tailscale\tailscale.exe'
+        })
+    ) | Where-Object { $_ } | Select-Object -Unique
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
+    }
     return $null
 }
 
@@ -151,12 +179,51 @@ function Get-PublicIp {
 }
 
 function Get-TailscaleMsiArchitecture {
-    switch ($env:PROCESSOR_ARCHITECTURE) {
-        'AMD64' { return 'amd64' }
-        'ARM64' { return 'arm64' }
-        'x86'   { return 'x86' }
-        default { return 'amd64' }
+    $architectureCandidates = New-Object System.Collections.Generic.List[string]
+
+    # RuntimeInformation reports the OS architecture, not the current process
+    # architecture. It therefore remains correct under 32-bit PowerShell/WOW64.
+    try {
+        $architectureCandidates.Add(
+            [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+        )
+    } catch {}
+
+    try {
+        $nativeEnvironment = Get-ItemProperty `
+            -LiteralPath 'HKLM:\SYSTEM\CurrentControlSet\Control\Session Manager\Environment' `
+            -Name PROCESSOR_ARCHITECTURE -ErrorAction Stop
+        $architectureCandidates.Add($nativeEnvironment.PROCESSOR_ARCHITECTURE)
+    } catch {}
+
+    foreach ($candidate in @($env:PROCESSOR_ARCHITEW6432, $env:PROCESSOR_ARCHITECTURE)) {
+        if ($candidate) { $architectureCandidates.Add($candidate) }
     }
+
+    foreach ($candidate in $architectureCandidates) {
+        switch -Regex ($candidate) {
+            '^(AMD64|X64)$' { return 'amd64' }
+            '^ARM64$'       { return 'arm64' }
+            '^(x86|X86)$'   { return 'x86' }
+        }
+    }
+
+    throw "Unsupported or unknown Windows architecture: $($architectureCandidates -join ', ')"
+}
+
+function Get-NativeMsiexec {
+    if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        $sysnativeMsiexec = Join-Path $env:WINDIR 'Sysnative\msiexec.exe'
+        if (Test-Path -LiteralPath $sysnativeMsiexec -PathType Leaf) {
+            return $sysnativeMsiexec
+        }
+    }
+
+    $systemMsiexec = Join-Path $env:WINDIR 'System32\msiexec.exe'
+    if (Test-Path -LiteralPath $systemMsiexec -PathType Leaf) {
+        return $systemMsiexec
+    }
+    return 'msiexec.exe'
 }
 
 function Install-TailscaleStandalone {
@@ -165,11 +232,12 @@ function Install-TailscaleStandalone {
     $arch = Get-TailscaleMsiArchitecture
     $installer = Join-Path $env:TEMP "tailscale-setup-latest-$arch.msi"
     $msiLog = Join-Path $env:TEMP "tailscale-msi-install-$arch.log"
-    Write-Log "Downloading the official Tailscale MSI ($arch)..."
+    $msiexec = Get-NativeMsiexec
+    Write-Log "Downloading the official Tailscale MSI (native architecture: $arch)..."
     try {
         Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi" `
             -OutFile $installer -UseBasicParsing
-        $process = Start-Process -FilePath 'msiexec.exe' -Wait -PassThru -ArgumentList @(
+        $process = Start-Process -FilePath $msiexec -Wait -PassThru -ArgumentList @(
             '/i', ('"' + $installer + '"'),
             '/quiet', '/norestart',
             '/l*v', ('"' + $msiLog + '"')
@@ -179,6 +247,11 @@ function Install-TailscaleStandalone {
             throw "Tailscale MSI installer exited with code $($process.ExitCode) (log: $msiLog)"
         }
     } catch {
+        Update-ProcessPath
+        if (Get-TailscaleExe) {
+            Write-Warn "The Tailscale MSI returned an error, but tailscale.exe is installed; continuing. Installer detail: $($_.Exception.Message)"
+            return
+        }
         Write-Err "Tailscale installer download/run failed: $($_.Exception.Message)"
         throw
     } finally {
@@ -200,11 +273,16 @@ function Install-Tailscale {
             --accept-source-agreements --accept-package-agreements
         $wingetExit = $global:LASTEXITCODE
         if ($wingetExit -ne 0) {
-            $unsignedExit = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$wingetExit), 0)
-            $wingetHex = '0x{0:X8}' -f $unsignedExit
-            Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official installer."
             $global:LASTEXITCODE = 0
-            Install-TailscaleStandalone
+            Update-ProcessPath
+            if (Get-TailscaleExe) {
+                Write-Warn "winget returned exit=$wingetExit, but Tailscale is installed; continuing."
+            } else {
+                $unsignedExit = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$wingetExit), 0)
+                $wingetHex = '0x{0:X8}' -f $unsignedExit
+                Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official installer."
+                Install-TailscaleStandalone
+            }
         }
     } else {
         Write-Log 'winget unavailable; using the official installer.'
@@ -498,38 +576,112 @@ function Assert-SshdConfigValid {
     if ($LASTEXITCODE -ne 0) { throw "sshd config validation failed (exit=$LASTEXITCODE)" }
 }
 
-function Enable-OpenSSHServer {
-    $cap = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop
-    if ($cap -and $cap.State -ne 'Installed') {
-        Write-Log 'Installing OpenSSH Server...'
-        Add-WindowsCapability -Online -Name 'OpenSSH.Server~~~~0.0.1.0' -ErrorAction Stop | Out-Null
-    } else {
+function Invoke-OpenSshOperation {
+    param(
+        [string]$Description,
+        [scriptblock]$Action
+    )
+
+    try {
+        & $Action
+    } catch {
+        throw "$Description`: $($_.Exception.Message)"
+    }
+}
+
+function Test-OpenSshServerInstalled {
+    $sshd = Get-SshdExe
+    $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    return [bool]($sshd -and $service)
+}
+
+function Install-OpenSshServerCapability {
+    $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
+
+    # Recent Windows builds can already have a working inbox OpenSSH Server even
+    # when querying the optional-feature store is denied by servicing policy.
+    if (Test-OpenSshServerInstalled) {
         Write-Log 'OpenSSH Server already installed, skipping'
+        return
+    }
+
+    $capability = $null
+    try {
+        $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop |
+            Select-Object -First 1
+    } catch {
+        Write-Warn "Windows capability query failed; trying installation directly: $($_.Exception.Message)"
+    }
+
+    if ($capability -and $capability.State -eq 'Installed') {
+        # An Installed capability without sshd.exe and its service is incomplete.
+        throw 'Windows reports OpenSSH Server as installed, but sshd.exe or the sshd service is missing'
+    }
+
+    Write-Log 'Installing OpenSSH Server...'
+    $powershellFailure = $null
+    try {
+        Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop | Out-Null
+    } catch {
+        $powershellFailure = $_.Exception.Message
+        Write-Warn "Add-WindowsCapability failed; retrying with DISM: $powershellFailure"
+
+        $dism = Get-Command dism.exe -ErrorAction SilentlyContinue
+        if (-not $dism) {
+            throw "Add-WindowsCapability failed ($powershellFailure), and dism.exe was not found"
+        }
+
+        $global:LASTEXITCODE = 0
+        $dismOutput = @(& $dism.Source /Online /Add-Capability "/CapabilityName:$capabilityName" /NoRestart 2>&1)
+        $dismExit = $global:LASTEXITCODE
+        if ($dismExit -ne 0) {
+            $detail = ($dismOutput | Select-Object -Last 8) -join ' '
+            throw "Add-WindowsCapability failed ($powershellFailure); DISM failed (exit=$dismExit): $detail"
+        }
+    }
+
+    $global:LASTEXITCODE = 0
+    Update-ProcessPath
+    $null = Wait-ServiceRegistered -Name sshd
+    if (-not (Get-SshdExe)) {
+        throw 'OpenSSH Server installation completed, but sshd.exe was not found'
+    }
+}
+
+function Enable-OpenSSHServer {
+    Invoke-OpenSshOperation 'OpenSSH capability detection/installation' {
+        Install-OpenSshServerCapability
     }
 
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
     $defaultCfg = Join-Path $env:WINDIR 'System32\OpenSSH\sshd_config_default'
-    Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
-    Select-SshPort
-    Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
-    Set-SshdOption -File $cfg -Key 'PasswordAuthentication' -Value 'no'
-    Set-SshdOption -File $cfg -Key 'KbdInteractiveAuthentication' -Value 'no'
-    # Set explicitly: with password and keyboard-interactive off, an inherited
-    # PubkeyAuthentication no would leave no usable authentication method at all.
-    Set-SshdOption -File $cfg -Key 'PubkeyAuthentication' -Value 'yes'
-    Set-CurrentUserAuthorizedKeysMatch -File $cfg -UserName $env:USERNAME
-
-    Initialize-SshHostKeys
-    Assert-SshdConfigValid
-
-    $sshdService = Wait-ServiceRegistered -Name sshd
-    Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
-    if ($sshdService.Status -eq 'Running') {
-        Restart-Service -Name sshd -ErrorAction Stop
-    } else {
-        Start-Service -Name sshd -ErrorAction Stop
+    Invoke-OpenSshOperation 'Initialize and write sshd_config' {
+        Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
+        Select-SshPort
+        Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
+        Set-SshdOption -File $cfg -Key 'PasswordAuthentication' -Value 'no'
+        Set-SshdOption -File $cfg -Key 'KbdInteractiveAuthentication' -Value 'no'
+        # Set explicitly: with password and keyboard-interactive off, an inherited
+        # PubkeyAuthentication no would leave no usable authentication method at all.
+        Set-SshdOption -File $cfg -Key 'PubkeyAuthentication' -Value 'yes'
+        Set-CurrentUserAuthorizedKeysMatch -File $cfg -UserName $env:USERNAME
     }
-    Assert-SshdHealthy -Port $SshPort
+
+    Invoke-OpenSshOperation 'Generate host keys and validate sshd_config' {
+        Initialize-SshHostKeys
+        Assert-SshdConfigValid
+    }
+
+    Invoke-OpenSshOperation 'Configure and start the sshd service' {
+        $sshdService = Wait-ServiceRegistered -Name sshd
+        Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
+        if ($sshdService.Status -eq 'Running') {
+            Restart-Service -Name sshd -ErrorAction Stop
+        } else {
+            Start-Service -Name sshd -ErrorAction Stop
+        }
+        Assert-SshdHealthy -Port $SshPort
+    }
 
     try {
         if (Get-Service -Name ssh-agent -ErrorAction SilentlyContinue) {
@@ -539,15 +691,17 @@ function Enable-OpenSSHServer {
         Write-Warn "Optional ssh-agent configuration failed: $($_.Exception.Message)"
     }
 
-    $ruleName = 'OpenSSH-Server-In-TCP'
-    $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
-    if ($rule) {
-        Remove-NetFirewallRule -Name $ruleName -ErrorAction Stop
+    Invoke-OpenSshOperation 'Create the OpenSSH firewall rule' {
+        $ruleName = 'OpenSSH-Server-In-TCP'
+        $rule = Get-NetFirewallRule -Name $ruleName -ErrorAction SilentlyContinue
+        if ($rule) {
+            Remove-NetFirewallRule -Name $ruleName -ErrorAction Stop
+        }
+        Write-Log "Creating inbound firewall rule (TCP $SshPort)..."
+        New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
+            -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort $SshPort `
+            -Profile Any -RemoteAddress '100.64.0.0/10' | Out-Null
     }
-    Write-Log "Creating inbound firewall rule (TCP $SshPort)..."
-    New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
-        -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort $SshPort `
-        -Profile Any -RemoteAddress '100.64.0.0/10' | Out-Null
 }
 
 function Set-SshdOption {
