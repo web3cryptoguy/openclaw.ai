@@ -418,15 +418,91 @@ function Wait-TcpPortListenerState {
     return $state
 }
 
+function Get-SshdServiceExecutable {
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
+        if (-not $service.PathName) { return $null }
+
+        $commandLine = [Environment]::ExpandEnvironmentVariables([string]$service.PathName)
+        $candidate = $null
+        if ($commandLine -match '^\s*"([^"]+\.exe)"') {
+            $candidate = $Matches[1]
+        } elseif ($commandLine -match '^\s*(.+?\.exe)(?:\s|$)') {
+            $candidate = $Matches[1].Trim()
+        }
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return $candidate
+        }
+    } catch {}
+    return $null
+}
+
+function Get-SshdFailureDetails {
+    $details = New-Object System.Collections.Generic.List[string]
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
+        [void]$details.Add("service state=$($service.State), exit=$($service.ExitCode), service-exit=$($service.ServiceSpecificExitCode), path=$($service.PathName)")
+    } catch {
+        [void]$details.Add("service query failed: $($_.Exception.Message)")
+    }
+    try {
+        $sshdPids = @(Get-Process -Name sshd -ErrorAction SilentlyContinue | ForEach-Object Id)
+        $ports = if ($sshdPids.Count) {
+            @(Get-NetTCPConnection -State Listen -ErrorAction Stop |
+                Where-Object { $_.OwningProcess -in $sshdPids } |
+                ForEach-Object LocalPort | Sort-Object -Unique)
+        } else { @() }
+        [void]$details.Add("sshd listener ports=$(if ($ports.Count) { $ports -join ',' } else { 'none' })")
+    } catch {
+        [void]$details.Add("sshd listener query failed: $($_.Exception.Message)")
+    }
+
+    $event = $null
+    try {
+        $event = Get-WinEvent -FilterHashtable @{
+            LogName = 'OpenSSH/Operational'
+            StartTime = (Get-Date).AddMinutes(-30)
+        } -MaxEvents 30 -ErrorAction Stop | Where-Object { $_.Message } | Select-Object -First 1
+    } catch {}
+    if (-not $event) {
+        try {
+            $event = Get-WinEvent -FilterHashtable @{
+                LogName = 'System'
+                StartTime = (Get-Date).AddMinutes(-30)
+            } -MaxEvents 200 -ErrorAction Stop |
+                Where-Object { $_.Message -match 'sshd|OpenSSH' } |
+                Select-Object -First 1
+        } catch {}
+    }
+    if ($event) {
+        $message = (([string]$event.Message -replace '[\r\n]+', ' ') -replace '\s{2,}', ' ').Trim()
+        if ($message.Length -gt 700) { $message = $message.Substring(0, 700) + '...' }
+        [void]$details.Add("event $($event.Id): $message")
+    } else {
+        [void]$details.Add('no recent OpenSSH event was found')
+    }
+    return ($details -join '; ')
+}
+
 function Assert-SshdHealthy {
     param([int]$Port, [int]$Attempts = 15, [int]$DelaySeconds = 1)
 
-    # A service reporting Running can still be a moment away from binding its
-    # listening socket, so poll instead of sampling once.
-    $state = Wait-TcpPortListenerState -Port $Port -DesiredStates @('Sshd') `
-        -Attempts $Attempts -DelaySeconds $DelaySeconds
+    $state = 'unknown'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $state = Get-TcpPortListenerState -Port $Port
+        if ($state -eq 'Sshd') { break }
+
+        # Start-Service can return just before sshd exits. Once that happens,
+        # waiting out the full polling window cannot produce a listener.
+        $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
+        if ($attempt -gt 1 -and $service -and $service.Status -eq 'Stopped') { break }
+        if ($attempt -lt $Attempts -and $DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
     if ($state -ne 'Sshd') {
-        throw "sshd is not listening on TCP port $Port (last observed state: $state)"
+        $details = Get-SshdFailureDetails
+        throw "sshd is not listening on TCP port $Port (last observed state: $state; $details)"
     }
     if ($Port -eq 22 -and $script:PreviousSshPort -eq 222) {
         $previousState = Wait-TcpPortListenerState -Port 222 -DesiredStates @('Free', 'Other') `
@@ -567,13 +643,25 @@ function Initialize-SshHostKeys {
 }
 
 function Assert-SshdConfigValid {
+    param([string]$ConfigPath = (Join-Path $env:ProgramData 'ssh\sshd_config'))
+
     $sshd = Get-SshdExe
-    if (-not $sshd) {
-        Write-Warn 'sshd.exe not found; unable to validate sshd_config before restart.'
-        return
+    if (-not $sshd) { throw 'sshd.exe not found; cannot validate sshd_config' }
+
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $sshd -t -f $ConfigPath 2>&1)
+        $exitCode = $global:LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
     }
-    & $sshd -t 2>$null
-    if ($LASTEXITCODE -ne 0) { throw "sshd config validation failed (exit=$LASTEXITCODE)" }
+    if ($exitCode -ne 0) {
+        $detail = (($output | ForEach-Object { "$_" }) -join ' ') -replace '\s{2,}', ' '
+        if ($detail.Length -gt 700) { $detail = $detail.Substring(0, 700) + '...' }
+        if (-not $detail) { $detail = 'no diagnostic output' }
+        throw "sshd config validation failed using '$sshd' (exit=$exitCode): $detail"
+    }
 }
 
 function Invoke-OpenSshOperation {
@@ -658,13 +746,7 @@ function Enable-OpenSSHServer {
     Invoke-OpenSshOperation 'Initialize and write sshd_config' {
         Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
         Select-SshPort
-        Set-SshdOption -File $cfg -Key 'Port' -Value $SshPort
-        Set-SshdOption -File $cfg -Key 'PasswordAuthentication' -Value 'no'
-        Set-SshdOption -File $cfg -Key 'KbdInteractiveAuthentication' -Value 'no'
-        # Set explicitly: with password and keyboard-interactive off, an inherited
-        # PubkeyAuthentication no would leave no usable authentication method at all.
-        Set-SshdOption -File $cfg -Key 'PubkeyAuthentication' -Value 'yes'
-        Set-CurrentUserAuthorizedKeysMatch -File $cfg -UserName $env:USERNAME
+        Set-ManagedSshdConfig -File $cfg -Port $SshPort -UserName $env:USERNAME
     }
 
     Invoke-OpenSshOperation 'Generate host keys and validate sshd_config' {
@@ -673,14 +755,28 @@ function Enable-OpenSSHServer {
     }
 
     Invoke-OpenSshOperation 'Configure and start the sshd service' {
-        $sshdService = Wait-ServiceRegistered -Name sshd
+        $null = Wait-ServiceRegistered -Name sshd
         Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
-        if ($sshdService.Status -eq 'Running') {
-            Restart-Service -Name sshd -ErrorAction Stop
-        } else {
-            Start-Service -Name sshd -ErrorAction Stop
+
+        try {
+            Start-OrRestartSshdService
+            Assert-SshdHealthy -Port $SshPort
+        } catch {
+            $initialFailure = $_.Exception.Message
+            Write-Warn "Initial sshd start failed; rebuilding sshd_config from the Windows default template: $initialFailure"
+            try {
+                $backup = Repair-SshdConfigFromDefault -ConfigPath $cfg -TemplatePath $defaultCfg `
+                    -Port $SshPort -UserName $env:USERNAME
+                Write-Warn "Previous sshd_config was preserved at $backup"
+                Initialize-SshHostKeys
+                Assert-SshdConfigValid -ConfigPath $cfg
+                Start-OrRestartSshdService
+                Assert-SshdHealthy -Port $SshPort
+            } catch {
+                $repairFailure = $_.Exception.Message
+                throw "automatic clean-config retry failed (initial: $initialFailure; retry: $repairFailure)"
+            }
         }
-        Assert-SshdHealthy -Port $SshPort
     }
 
     try {
@@ -711,23 +807,68 @@ function Set-SshdOption {
     }
     $lines = @([IO.File]::ReadAllLines($File))
     $pattern = "^\s*$([regex]::Escape($Key))\s+"
-    $found = $false
-    $out = foreach ($l in $lines) {
-        # The managed current-user block is a boundary too: anything emitted after
-        # its marker would be swallowed by the next Set-CurrentUserAuthorizedKeysMatch.
-        if (($l -match '^\s*Match(?:\s|$)') -or ($l -eq $script:ManagedUserBlockBegin)) {
-            if (-not $found) { $found = $true; "$Key $Value" }
-        }
-        if ($l -match $pattern) {
-            # Keep exactly one authoritative global line; drop every other copy,
-            # including per-Match copies that would otherwise shadow it.
-            if (-not $found) { $found = $true; "$Key $Value" }
-            continue
-        }
-        $l
+    $kept = @($lines | Where-Object { $_ -notmatch $pattern })
+
+    # OpenSSH uses the first obtained scalar value. Put managed values before any
+    # Include so an old drop-in cannot silently retain a different port or policy.
+    Write-SshdConfigLines -File $File -Lines (@("$Key $Value") + $kept)
+}
+
+function Remove-SshdOption {
+    param([string]$File, [string]$Key)
+    if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
+        throw "sshd_config not found, refusing to remove option '$Key': $File"
     }
-    if (-not $found) { $out = @($out) + "$Key $Value" }
-    Write-SshdConfigLines -File $File -Lines @($out)
+    $pattern = "^\s*$([regex]::Escape($Key))(?:\s|$)"
+    $lines = @([IO.File]::ReadAllLines($File))
+    $kept = @($lines | Where-Object { $_ -notmatch $pattern })
+    if ($kept.Count -ne $lines.Count) {
+        Write-SshdConfigLines -File $File -Lines $kept
+    }
+}
+
+function Set-ManagedSshdConfig {
+    param([string]$File, [int]$Port, [string]$UserName)
+
+    # The setup and firewall are IPv4/Tailscale-IPv4 based. Removing stale explicit
+    # addresses prevents sshd from trying to bind an address no longer on the host.
+    Remove-SshdOption -File $File -Key 'ListenAddress'
+    Set-SshdOption -File $File -Key 'AddressFamily' -Value 'inet'
+    Set-SshdOption -File $File -Key 'Port' -Value $Port
+    Set-SshdOption -File $File -Key 'PasswordAuthentication' -Value 'no'
+    Set-SshdOption -File $File -Key 'KbdInteractiveAuthentication' -Value 'no'
+    Set-SshdOption -File $File -Key 'PubkeyAuthentication' -Value 'yes'
+    Set-CurrentUserAuthorizedKeysMatch -File $File -UserName $UserName
+}
+
+function Repair-SshdConfigFromDefault {
+    param(
+        [string]$ConfigPath,
+        [string]$TemplatePath,
+        [int]$Port,
+        [string]$UserName
+    )
+
+    if (-not (Test-Path -LiteralPath $TemplatePath -PathType Leaf)) {
+        throw "OpenSSH default configuration template not found: $TemplatePath"
+    }
+    $stamp = Get-Date -Format 'yyyyMMdd-HHmmss'
+    $backup = "$ConfigPath.before-auto-repair-$stamp.bak"
+    if (Test-Path -LiteralPath $ConfigPath -PathType Leaf) {
+        Copy-Item -LiteralPath $ConfigPath -Destination $backup -ErrorAction Stop
+    }
+    Copy-Item -LiteralPath $TemplatePath -Destination $ConfigPath -Force -ErrorAction Stop
+    Set-ManagedSshdConfig -File $ConfigPath -Port $Port -UserName $UserName
+    return $backup
+}
+
+function Start-OrRestartSshdService {
+    $service = Get-Service -Name sshd -ErrorAction Stop
+    if ($service.Status -eq 'Running') {
+        Restart-Service -Name sshd -ErrorAction Stop
+    } else {
+        Start-Service -Name sshd -ErrorAction Stop
+    }
 }
 
 function Set-AuthorizedKeys {
@@ -840,11 +981,17 @@ function Enable-X11Forwarding {
 }
 
 function Get-SshdExe {
+    # Validate with the binary that Start-Service will actually launch. PATH can
+    # contain a second OpenSSH installation with different defaults or features.
+    $serviceExe = Get-SshdServiceExecutable
+    if ($serviceExe) { return $serviceExe }
+
+    $candidate = Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+
     $cmd = Get-Command sshd.exe -ErrorAction SilentlyContinue
     if (-not $cmd) { $cmd = Get-Command sshd -ErrorAction SilentlyContinue }
     if ($cmd) { return $(if ($cmd.Path) { $cmd.Path } else { $cmd.Source }) }
-    $candidate = Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'
-    if (Test-Path -LiteralPath $candidate) { return $candidate }
     return $null
 }
 
@@ -879,11 +1026,12 @@ function Assert-SshdEffectiveConfig {
 
     $sshd = Get-SshdExe
     if (-not $sshd) { throw 'sshd.exe not found' }
-    & $sshd -t 2>$null
+    $config = Join-Path $env:ProgramData 'ssh\sshd_config'
+    & $sshd -t -f $config 2>$null
     Assert-NativeCommandSucceeded 'sshd config validation'
 
     $context = "user=$env:USERNAME,host=$env:COMPUTERNAME,addr=100.64.0.1,laddr=$TailscaleIp,lport=$Port"
-    $effective = @(& $sshd -T -C $context 2>$null)
+    $effective = @(& $sshd -T -f $config -C $context 2>$null)
     Assert-NativeCommandSucceeded 'sshd effective config validation'
 
     if ((Get-SshdEffectiveValue $effective 'port') -ne [string]$Port) {
