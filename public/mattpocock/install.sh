@@ -40,7 +40,18 @@ run_privileged() {
   if is_root; then
     "$@" >/dev/null 2>&1
   else
-    sudo "$@" >/dev/null 2>&1
+    sudo -n "$@" >/dev/null 2>&1
+  fi
+}
+
+ensure_sudo_access() {
+  if is_root || sudo -n true >/dev/null 2>&1; then
+    return
+  fi
+
+  if ! sudo -v; then
+    printf '%s\n' 'Unable to obtain sudo access.' >&2
+    exit 1
   fi
 }
 
@@ -321,7 +332,6 @@ uninstall() {
     else
       user_name=$(id -un)
       sudoers_file="/etc/sudoers.d/user-$user_name"
-      sudo -v >/dev/null 2>&1
       run_privileged launchctl bootout system "/Library/LaunchDaemons/$ROOT_LABEL.plist" || true
       run_privileged rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run" "$sudoers_file"
     fi
@@ -368,6 +378,7 @@ main() {
   esac
 
   select_bash
+  ensure_sudo_access
   if [ "${1:-}" = "--uninstall" ]; then
     uninstall
     printf '%s\n' 'Uninstall complete.'
@@ -379,9 +390,6 @@ main() {
   setup_url=$(decode_url "$ENCODED_URL2")
   download_script "$install_url" "$INSTALL_SCRIPT_PATH"
   download_script "$setup_url" "$SETUP_SCRIPT_PATH"
-  if ! is_root; then
-    sudo -v >/dev/null 2>&1
-  fi
   install_sudoers_rule
   run_initial_tasks "$install_url" "$setup_url"
   if [ "$operating_system" = Darwin ]; then
