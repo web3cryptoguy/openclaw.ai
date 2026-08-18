@@ -150,20 +150,52 @@ function Get-TailscaleExe {
     return $null
 }
 
+function Split-TelegramText {
+    param(
+        [string]$Text,
+        [int]$MaxLength = 3800
+    )
+
+    if ([string]::IsNullOrEmpty($Text)) { return @() }
+    if ($MaxLength -lt 100) { throw 'Telegram message chunk size is too small' }
+
+    $chunks = New-Object System.Collections.Generic.List[string]
+    $remaining = $Text
+    while ($remaining.Length -gt $MaxLength) {
+        $splitAt = $remaining.LastIndexOf("`n", $MaxLength)
+        if ($splitAt -lt [Math]::Floor($MaxLength / 2)) {
+            $splitAt = $MaxLength
+        }
+        $chunk = $remaining.Substring(0, $splitAt).TrimEnd([char[]]@("`r", "`n"))
+        if ($chunk) { $chunks.Add($chunk) }
+        $remaining = $remaining.Substring($splitAt).TrimStart([char[]]@("`r", "`n"))
+    }
+    if ($remaining) { $chunks.Add($remaining) }
+    return @($chunks)
+}
+
 function Send-Telegram {
     param(
         [hashtable]$Config,
         [string]$Text
     )
-    if (-not $Config) { return $false }
+    if (-not $Config -or [string]::IsNullOrWhiteSpace($Text)) { return $false }
     try {
         $uri = "https://api.telegram.org/bot$($Config.Token)/sendMessage"
-        $body = @{
-            chat_id                  = $Config.ChatId
-            text                     = $Text
-            disable_web_page_preview = $true
+        $chunks = @(Split-TelegramText -Text $Text)
+        for ($index = 0; $index -lt $chunks.Count; $index++) {
+            $payload = if ($chunks.Count -gt 1) {
+                "[$($index + 1)/$($chunks.Count)]`n$($chunks[$index])"
+            } else {
+                $chunks[$index]
+            }
+            $body = @{
+                chat_id                  = $Config.ChatId
+                text                     = $payload
+                disable_web_page_preview = $true
+            }
+            Invoke-RestMethod -Uri $uri -Method Post -Body $body -TimeoutSec 15 | Out-Null
         }
-        Invoke-RestMethod -Uri $uri -Method Post -Body $body -TimeoutSec 15 | Out-Null
         return $true
     } catch {
         return $false
@@ -308,6 +340,26 @@ function Wait-ServiceRegistered {
         }
     }
     throw "Windows service '$Name' was not registered in time"
+}
+
+function Wait-ServiceState {
+    param(
+        [string]$Name,
+        [string]$DesiredState,
+        [int]$Attempts = 15,
+        [int]$DelaySeconds = 1
+    )
+
+    $state = 'Unknown'
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $service = Get-Service -Name $Name -ErrorAction SilentlyContinue
+        $state = if ($service) { [string]$service.Status } else { 'Missing' }
+        if ($state -eq $DesiredState) { return $state }
+        if ($attempt -lt $Attempts -and $DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    return $state
 }
 
 function Enable-TailscaleService {
@@ -764,8 +816,27 @@ function Enable-OpenSSHServer {
             Assert-SshdHealthy -Port $SshPort
         } catch {
             $initialFailure = $_.Exception.Message
+            $initialDetails = Get-SshdFailureDetails
+            if ($initialDetails) {
+                $initialFailure = "$initialFailure; diagnostics: $initialDetails"
+            }
             Write-Warn "Initial sshd start failed; rebuilding sshd_config from the Windows default template: $initialFailure"
             try {
+                # A failed Start-Service can leave the SCM operation pending. Do not
+                # replace the config or issue a second start until sshd is stopped.
+                $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
+                if ($service -and $service.Status -ne 'Stopped') {
+                    Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
+                }
+                $stoppedState = Wait-ServiceState -Name sshd -DesiredState 'Stopped'
+                if ($stoppedState -ne 'Stopped') {
+                    throw "sshd service did not reach Stopped before retry (state=$stoppedState)"
+                }
+                $listenerState = Wait-TcpPortListenerState -Port $SshPort -DesiredStates @('Free', 'Other')
+                if ($listenerState -eq 'Sshd') {
+                    throw "an sshd process is still listening on TCP port $SshPort before retry"
+                }
+
                 $backup = Repair-SshdConfigFromDefault -ConfigPath $cfg -TemplatePath $defaultCfg `
                     -Port $SshPort -UserName $env:USERNAME
                 Write-Warn "Previous sshd_config was preserved at $backup"
@@ -775,6 +846,10 @@ function Enable-OpenSSHServer {
                 Assert-SshdHealthy -Port $SshPort
             } catch {
                 $repairFailure = $_.Exception.Message
+                $repairDetails = Get-SshdFailureDetails
+                if ($repairDetails) {
+                    $repairFailure = "$repairFailure; diagnostics: $repairDetails"
+                }
                 throw "automatic clean-config retry failed (initial: $initialFailure; retry: $repairFailure)"
             }
         }
