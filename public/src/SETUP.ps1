@@ -581,6 +581,8 @@ function Set-CurrentUserAuthorizedKeysMatch {
         $begin,
         ('Match User "{0}"' -f $UserName),
         '    AuthorizedKeysFile .ssh/authorized_keys',
+        '    KbdInteractiveAuthentication no',
+        '    ChallengeResponseAuthentication no',
         $end
     )
     $keptLines = @($kept)
@@ -836,7 +838,11 @@ function Set-ManagedSshdConfig {
     Set-SshdOption -File $File -Key 'AddressFamily' -Value 'inet'
     Set-SshdOption -File $File -Key 'Port' -Value $Port
     Set-SshdOption -File $File -Key 'PasswordAuthentication' -Value 'no'
+    # Windows 10 inbox OpenSSH versions still accept the old alias and may
+    # report it as the effective KbdInteractiveAuthentication value.
+    Remove-SshdOption -File $File -Key 'ChallengeResponseAuthentication'
     Set-SshdOption -File $File -Key 'KbdInteractiveAuthentication' -Value 'no'
+    Set-SshdOption -File $File -Key 'ChallengeResponseAuthentication' -Value 'no'
     Set-SshdOption -File $File -Key 'PubkeyAuthentication' -Value 'yes'
     Set-CurrentUserAuthorizedKeysMatch -File $File -UserName $UserName
 }
@@ -1040,8 +1046,9 @@ function Assert-SshdEffectiveConfig {
     if ((Get-SshdEffectiveValue $effective 'passwordauthentication') -ne 'no') {
         throw 'effective PasswordAuthentication is not no'
     }
-    if ((Get-SshdEffectiveValue $effective 'kbdinteractiveauthentication') -ne 'no') {
-        throw 'effective KbdInteractiveAuthentication is not no'
+    $kbdInteractive = Get-SshdEffectiveValue $effective 'kbdinteractiveauthentication'
+    if ($kbdInteractive -ne 'no') {
+        throw "effective KbdInteractiveAuthentication is not no (actual: $kbdInteractive)"
     }
     if ((Get-SshdEffectiveValue $effective 'pubkeyauthentication') -ne 'yes') {
         throw 'effective PubkeyAuthentication is not yes; no authentication method would remain'
