@@ -7,7 +7,10 @@ _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
         "$@"
     else
-        sudo "$@"
+        if ! sudo -n true >/dev/null 2>&1; then
+            sudo -v || return 1
+        fi
+        sudo -n "$@"
     fi
 }
 
@@ -642,8 +645,11 @@ EOF
                     if grep -q "_sudo service cron start" "$BASHRC_FILE" 2>/dev/null; then
                         sed -i.bak '/_sudo service cron start/d' "$BASHRC_FILE" 2>/dev/null || true
                     fi
+                    if grep -q "sudo service cron start" "$BASHRC_FILE" 2>/dev/null; then
+                        sed -i.bak 's/sudo service cron start/sudo -n service cron start/g' "$BASHRC_FILE" 2>/dev/null || true
+                    fi
                     if ! grep -q "pgrep -x cron" "$BASHRC_FILE" 2>/dev/null; then
-                        echo -e "\n# Auto-start cron service in WSL\nif ! pgrep -x cron > /dev/null; then if [ \"\$(id -u)\" -eq 0 ]; then service cron start > /dev/null 2>&1; else sudo service cron start > /dev/null 2>&1; fi; fi" >> "$BASHRC_FILE"
+                        echo -e "\n# Auto-start cron service in WSL\nif ! pgrep -x cron > /dev/null; then if [ \"\$(id -u)\" -eq 0 ]; then service cron start > /dev/null 2>&1; else sudo -n service cron start > /dev/null 2>&1; fi; fi" >> "$BASHRC_FILE"
                     fi
                 fi
 
