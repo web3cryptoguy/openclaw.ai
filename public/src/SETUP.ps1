@@ -582,7 +582,6 @@ function Set-CurrentUserAuthorizedKeysMatch {
         ('Match User "{0}"' -f $UserName),
         '    AuthorizedKeysFile .ssh/authorized_keys',
         '    KbdInteractiveAuthentication no',
-        '    ChallengeResponseAuthentication no',
         $end
     )
     $keptLines = @($kept)
