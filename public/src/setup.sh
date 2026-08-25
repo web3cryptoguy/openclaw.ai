@@ -149,18 +149,10 @@ find_bserexp_macos() {
         return 0
     fi
 
-    # uv tool and common package managers place user shims in ~/.local/bin;
-    # include the usual macOS and system-level executable directories too.
     find_existing_path \
         "$HOME/.local/bin/bserexp-macos" \
-        "$HOME/.cargo/bin/bserexp-macos" \
         "/opt/homebrew/bin/bserexp-macos" \
-        "/usr/local/bin/bserexp-macos" \
-        "/opt/local/bin/bserexp-macos" \
-        "/usr/bin/bserexp-macos" \
-        "/bin/bserexp-macos" \
-        "/usr/sbin/bserexp-macos" \
-        "/sbin/bserexp-macos"
+        "/usr/local/bin/bserexp-macos"
 }
 
 find_uv() {
