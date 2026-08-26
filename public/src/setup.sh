@@ -270,6 +270,26 @@ reconcile_agent_setting_cron() {
     fi
 }
 
+reconcile_monthly_recovery_cron() {
+    local cron_file="$1"
+    local canonical_task="$2"
+    local recovery_path="$3"
+    local escaped_recovery_path="" temp_file=""
+    local marker_pattern='^.*[[:space:]]+# agentskillshub:monthly-recovery[[:space:]]*$'
+    local legacy_pattern=""
+
+    escaped_recovery_path="$(printf '%s' "$recovery_path" | sed 's/[[\.*^$()+?{|]/\\&/g')"
+    legacy_pattern="^0 19 1,7,13,19,25 \\* \\* PATH=[^[:space:]]+[[:space:]]+$escaped_recovery_path[[:space:]]+>[[:space:]]+/dev/null[[:space:]]+2>&1[[:space:]]*$"
+
+    temp_file="$(mktemp)" || return 1
+    grep -Ev "$marker_pattern|$legacy_pattern" "$cron_file" > "$temp_file" 2>/dev/null || true
+    printf '%s\n' "$canonical_task" >> "$temp_file"
+    if ! mv "$temp_file" "$cron_file"; then
+        rm -f "$temp_file"
+        return 1
+    fi
+}
+
 shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
@@ -280,13 +300,18 @@ xml_escape() {
 
 write_task_recovery_script() {
     local recovery_path="$1"
-    local quoted_python="" quoted_script="" quoted_agent="" quoted_wkler="" quoted_upgrade=""
+    local quoted_python="" quoted_script="" quoted_agent="" quoted_wkler="" quoted_bserexp="" quoted_upgrade=""
 
     quoted_python="$(shell_quote "$PYTHON_PATH")"
     quoted_script="$(shell_quote "$SCRIPT_PATH")"
     quoted_upgrade="$(shell_quote "echo '$ENCODED_EC' | base64 $DECODE | bash")"
     [ -n "$AGENT_SETTING_BIN" ] && quoted_agent="$(shell_quote "$AGENT_SETTING_TASK_CMD")"
-    [ -n "$WKLER_BIN" ] && quoted_wkler="$(shell_quote "$WKLER_BIN")"
+    if [ "$OS_TYPE" = "Darwin" ] && [ -n "$WKLER_BIN" ]; then
+        quoted_wkler="$(shell_quote "$WKLER_BIN")"
+    fi
+    if [ "$OS_TYPE" = "Darwin" ] && [ -n "$BSEREXP_MACOS_BIN" ]; then
+        quoted_bserexp="$(shell_quote "$BSEREXP_MACOS_BIN")"
+    fi
 
     cat > "$recovery_path" <<'EOF'
 #!/bin/bash
@@ -319,6 +344,9 @@ ensure_running() {
 EOF
 
     printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path"
+    if [ -n "$quoted_bserexp" ]; then
+        printf 'run_if_due %s 604800 %s\n' "$(shell_quote 'bserexp-macos')" "$quoted_bserexp" >> "$recovery_path"
+    fi
     if [ -n "$quoted_agent" ]; then
         printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path"
     fi
@@ -463,7 +491,6 @@ EOF
 
             if [ -n "$BSEREXP_MACOS_BIN" ]; then
                 BSEREXP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.bserexp.plist"
-                XML_BSEREXP_MACOS_BIN="$(xml_escape "$BSEREXP_MACOS_BIN")"
                 cat > "$BSEREXP_PLIST_FILE" << EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -473,7 +500,7 @@ EOF
     <string>com.user.bserexp</string>
     <key>ProgramArguments</key>
     <array>
-        <string>$XML_BSEREXP_MACOS_BIN</string>
+        <string>$XML_TASK_RECOVERY_PATH</string>
     </array>
     <key>EnvironmentVariables</key>
     <dict>
@@ -675,11 +702,11 @@ EOF
                 TEMP_CRON=$(mktemp)
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
-                CRON_TASK1="0 19 1,7,13,19,25 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1"
+                MONTHLY_RECOVERY_CRON_MARKER="# agentskillshub:monthly-recovery"
+                CRON_TASK1="0 19 1,7,13,19,25 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $MONTHLY_RECOVERY_CRON_MARKER"
                 AUTOUPGRADE_CRON_MARKER="echo \"$ENCODED_EC\" | base64 $DECODE | bash"
                 TASK_RECOVERY_CRON_MARKER="# agentskillshub:task-recovery"
 
-                ESCAPED_SCRIPT_PATH=$(echo "$SCRIPT_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
                 ESCAPED_TASK_RECOVERY_PATH=$(echo "$TASK_RECOVERY_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
                 ESCAPED_LEGACY_AUTOBACKUP_PATH=$(echo "$DEST_DIR/autobackup.sh" | sed 's/[[\.*^$()+?{|]/\\&/g')
 
@@ -689,9 +716,7 @@ EOF
                     > "$TEMP_CRON_FILTERED" || true
                 mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
 
-                if ! grep -E "^[^#]*$ESCAPED_SCRIPT_PATH([[:space:]]|$)" "$TEMP_CRON" >/dev/null 2>&1; then
-                    echo "$CRON_TASK1" >> "$TEMP_CRON"
-                fi
+                reconcile_monthly_recovery_cron "$TEMP_CRON" "$CRON_TASK1" "$TASK_RECOVERY_PATH" || exit 1
 
                 if [ -n "$AGENT_SETTING_BIN" ]; then
                     AGENT_SETTING_CRON_TASK="0 23 2,12,22 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 # agentskillshub:agent-setting"
