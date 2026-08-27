@@ -275,7 +275,6 @@ function Get-ConfigCodeBase64 {
         [string[]]$ConfigLines
     )
 
-    # Match setup.sh: lowercase "code" at the beginning of a line, with spaces around "=".
     $codeLines = @($ConfigLines | Where-Object { $_ -cmatch '^code *= *' })
     if ($codeLines.Count -eq 0) {
         return $null
@@ -538,7 +537,6 @@ try {
 
             $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            # Re-register on every setup run so older task definitions also receive hidden settings.
             $autoupgradeNeedsRegistration = $true
             if ($autoupgradeNeedsRegistration) {
                 try {
