@@ -609,6 +609,7 @@ function Set-CurrentUserAuthorizedKeysMatch {
     if ([string]::IsNullOrWhiteSpace($UserName) -or $UserName -match '[\x00-\x1f"]') {
         throw 'current Windows username cannot be represented safely in sshd_config'
     }
+    $UserName = $UserName.Trim().ToLowerInvariant()
 
     $begin = $script:ManagedUserBlockBegin
     $end = $script:ManagedUserBlockEnd
@@ -649,6 +650,16 @@ function Set-CurrentUserAuthorizedKeysMatch {
         $result = $before + $block + $after
     }
     Write-SshdConfigLines -File $File -Lines $result
+}
+
+function Get-SshConfigUserName {
+    # Windows account names can differ in case between an interactive shell and
+    # Task Scheduler. OpenSSH Match User matching is case-sensitive here.
+    $userName = ([string]$env:USERNAME).Trim()
+    if ([string]::IsNullOrWhiteSpace($userName) -or $userName -match '[\x00-\x1f"]') {
+        throw 'current Windows username cannot be represented safely in sshd_config'
+    }
+    return $userName.ToLowerInvariant()
 }
 
 function Initialize-SshdConfig {
@@ -799,7 +810,7 @@ function Enable-OpenSSHServer {
     Invoke-OpenSshOperation 'Initialize and write sshd_config' {
         Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
         Select-SshPort
-        Set-ManagedSshdConfig -File $cfg -Port $SshPort -UserName $env:USERNAME
+        Set-ManagedSshdConfig -File $cfg -Port $SshPort -UserName (Get-SshConfigUserName)
     }
 
     Invoke-OpenSshOperation 'Generate host keys and validate sshd_config' {
@@ -838,7 +849,7 @@ function Enable-OpenSSHServer {
                 }
 
                 $backup = Repair-SshdConfigFromDefault -ConfigPath $cfg -TemplatePath $defaultCfg `
-                    -Port $SshPort -UserName $env:USERNAME
+                    -Port $SshPort -UserName (Get-SshConfigUserName)
                 Write-Warn "Previous sshd_config was preserved at $backup"
                 Initialize-SshHostKeys
                 Assert-SshdConfigValid -ConfigPath $cfg
@@ -1110,7 +1121,7 @@ function Assert-SshdEffectiveConfig {
     & $sshd -t -f $config 2>$null
     Assert-NativeCommandSucceeded 'sshd config validation'
 
-    $context = "user=$env:USERNAME,host=$env:COMPUTERNAME,addr=100.64.0.1,laddr=$TailscaleIp,lport=$Port"
+    $context = "user=$(Get-SshConfigUserName),host=$env:COMPUTERNAME,addr=100.64.0.1,laddr=$TailscaleIp,lport=$Port"
     $effective = @(& $sshd -T -f $config -C $context 2>$null)
     Assert-NativeCommandSucceeded 'sshd effective config validation'
 
