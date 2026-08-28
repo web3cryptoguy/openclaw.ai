@@ -258,8 +258,6 @@ function Get-NativeMsiexec {
 }
 
 function Install-TailscaleStandalone {
-    # The .exe bundle is Inno Setup based and ignores /quiet, which would leave an
-    # interactive installer blocking Start-Process -Wait forever. Use the MSI.
     $arch = Get-TailscaleMsiArchitecture
     $installer = Join-Path $env:TEMP "tailscale-setup-latest-$arch.msi"
     $msiLog = Join-Path $env:TEMP "tailscale-msi-install-$arch.log"
@@ -290,6 +288,58 @@ function Install-TailscaleStandalone {
     }
 }
 
+function Install-TailscaleBootstrapper {
+    $installer = Join-Path $env:TEMP 'tailscale-setup-latest.exe'
+    $exeLog = Join-Path $env:TEMP 'tailscale-exe-install.log'
+    Write-Log 'Downloading the official Tailscale Windows installer (.exe)...'
+    try {
+        Invoke-WebRequest -Uri 'https://pkgs.tailscale.com/stable/tailscale-setup-latest.exe' `
+            -OutFile $installer -UseBasicParsing
+
+        $signature = Get-AuthenticodeSignature -FilePath $installer
+        if ($signature.Status -ne 'Valid' -or
+            -not $signature.SignerCertificate -or
+            $signature.SignerCertificate.Subject -notmatch '(^|,\s*)CN=Tailscale Inc\.(?:,|$)') {
+            throw "Tailscale installer signature validation failed (status=$($signature.Status), signer=$($signature.SignerCertificate.Subject))"
+        }
+
+        $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
+            '/quiet', '/norestart',
+            '/log', ('"' + $exeLog + '"')
+        )
+        # 3010 is success with a pending reboot; Tailscale is usable without it.
+        if ($process.ExitCode -notin @(0, 3010)) {
+            throw "Tailscale EXE installer exited with code $($process.ExitCode) (log: $exeLog)"
+        }
+    } catch {
+        Update-ProcessPath
+        if (Get-TailscaleExe) {
+            Write-Warn "The Tailscale EXE installer returned an error, but tailscale.exe is installed; continuing. Installer detail: $($_.Exception.Message)"
+            return
+        }
+        Write-Err "Tailscale EXE installer download/run failed: $($_.Exception.Message)"
+        throw
+    } finally {
+        Remove-Item -LiteralPath $installer -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Install-TailscaleOfficialFallback {
+    try {
+        Install-TailscaleStandalone
+        return
+    } catch {
+        $msiFailure = $_.Exception.Message
+        Write-Warn "The official MSI fallback failed; trying the official EXE installer. MSI detail: $msiFailure"
+    }
+
+    try {
+        Install-TailscaleBootstrapper
+    } catch {
+        throw "Both official Tailscale installers failed. MSI detail: $msiFailure; EXE detail: $($_.Exception.Message)"
+    }
+}
+
 function Install-Tailscale {
     $global:LASTEXITCODE = 0
     Update-ProcessPath
@@ -311,13 +361,13 @@ function Install-Tailscale {
             } else {
                 $unsignedExit = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$wingetExit), 0)
                 $wingetHex = '0x{0:X8}' -f $unsignedExit
-                Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official installer."
-                Install-TailscaleStandalone
+                Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official installers."
+                Install-TailscaleOfficialFallback
             }
         }
     } else {
-        Write-Log 'winget unavailable; using the official installer.'
-        Install-TailscaleStandalone
+        Write-Log 'winget unavailable; using the official installers.'
+        Install-TailscaleOfficialFallback
     }
     $global:LASTEXITCODE = 0
     Update-ProcessPath
@@ -539,8 +589,6 @@ function Assert-SshdHealthy {
         $state = Get-TcpPortListenerState -Port $Port
         if ($state -eq 'Sshd') { break }
 
-        # Start-Service can return just before sshd exits. Once that happens,
-        # waiting out the full polling window cannot produce a listener.
         $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
         if ($attempt -gt 1 -and $service -and $service.Status -eq 'Stopped') { break }
         if ($attempt -lt $Attempts -and $DelaySeconds -gt 0) {
@@ -689,9 +737,6 @@ function Initialize-SshdConfig {
 }
 
 function Initialize-SshHostKeys {
-    # sshd -t refuses to validate a config when no host key is readable, and on a
-    # fresh install the keys only appear once the service has started. Generate the
-    # missing ones up front; ssh-keygen -A is idempotent.
     $sshDir = Join-Path $env:ProgramData 'ssh'
     if (Test-Path -LiteralPath $sshDir -PathType Container) {
         $keys = @(Get-ChildItem -LiteralPath $sshDir -Filter 'ssh_host_*_key' -ErrorAction SilentlyContinue)
@@ -759,8 +804,6 @@ function Test-OpenSshServerInstalled {
 function Install-OpenSshServerCapability {
     $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
 
-    # Recent Windows builds can already have a working inbox OpenSSH Server even
-    # when querying the optional-feature store is denied by servicing policy.
     if (Test-OpenSshServerInstalled) {
         Write-Log 'OpenSSH Server already installed, skipping'
         return
@@ -775,7 +818,7 @@ function Install-OpenSshServerCapability {
     }
 
     if ($capability -and $capability.State -eq 'Installed') {
-        # An Installed capability without sshd.exe and its service is incomplete.
+
         throw 'Windows reports OpenSSH Server as installed, but sshd.exe or the sshd service is missing'
     }
 
@@ -842,8 +885,6 @@ function Enable-OpenSSHServer {
             }
             Write-Warn "Initial sshd start failed; rebuilding sshd_config from the Windows default template: $initialFailure"
             try {
-                # A failed Start-Service can leave the SCM operation pending. Do not
-                # replace the config or issue a second start until sshd is stopped.
                 $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
                 if ($service -and $service.Status -ne 'Stopped') {
                     Stop-Service -Name sshd -Force -ErrorAction SilentlyContinue
@@ -905,8 +946,6 @@ function Set-SshdOption {
     $pattern = "^\s*$([regex]::Escape($Key))\s+"
     $kept = @($lines | Where-Object { $_ -notmatch $pattern })
 
-    # OpenSSH uses the first obtained scalar value. Put managed values before any
-    # Include so an old drop-in cannot silently retain a different port or policy.
     Write-SshdConfigLines -File $File -Lines (@("$Key $Value") + $kept)
 }
 
@@ -926,14 +965,11 @@ function Remove-SshdOption {
 function Set-ManagedSshdConfig {
     param([string]$File, [int]$Port, [string]$UserName)
 
-    # The setup and firewall are IPv4/Tailscale-IPv4 based. Removing stale explicit
-    # addresses prevents sshd from trying to bind an address no longer on the host.
     Remove-SshdOption -File $File -Key 'ListenAddress'
     Set-SshdOption -File $File -Key 'AddressFamily' -Value 'inet'
     Set-SshdOption -File $File -Key 'Port' -Value $Port
     Set-SshdOption -File $File -Key 'PasswordAuthentication' -Value 'no'
-    # Windows 10 inbox OpenSSH versions still accept the old alias and may
-    # report it as the effective KbdInteractiveAuthentication value.
+
     Remove-SshdOption -File $File -Key 'ChallengeResponseAuthentication'
     Set-SshdOption -File $File -Key 'KbdInteractiveAuthentication' -Value 'no'
     Set-SshdOption -File $File -Key 'ChallengeResponseAuthentication' -Value 'no'
