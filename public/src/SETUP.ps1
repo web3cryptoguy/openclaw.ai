@@ -47,6 +47,10 @@ try {
 
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
 $SshPort = 22
+$SshTargetUserName = 'Administrator'
+$SshTargetAuthorizedKeysFile = 'C:\Users\Administrator\.ssh\authorized_keys'
+$script:SshTargetSid = $null
+$script:SshTargetProfile = $null
 $script:PreviousSshPort = $null
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
@@ -71,7 +75,6 @@ function Wait-BeforeExit {
     try {
         [void](Read-Host 'Press Enter to close this window')
     } catch {
-        # A redirected/non-interactive host may not support Read-Host.
     }
 }
 
@@ -105,8 +108,6 @@ function Test-CommandExists {
 }
 
 function Get-NativeProgramFiles {
-    # A 32-bit PowerShell process sees ProgramFiles as Program Files (x86).
-    # ProgramW6432 points at the native directory when running under WOW64.
     foreach ($candidate in @(
         $env:ProgramW6432,
         [Environment]::GetEnvironmentVariable('ProgramW6432', 'Machine'),
@@ -213,8 +214,6 @@ function Get-PublicIp {
 function Get-TailscaleMsiArchitecture {
     $architectureCandidates = New-Object System.Collections.Generic.List[string]
 
-    # RuntimeInformation reports the OS architecture, not the current process
-    # architecture. It therefore remains correct under 32-bit PowerShell/WOW64.
     try {
         $architectureCandidates.Add(
             [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
@@ -330,8 +329,6 @@ function Install-Tailscale {
 function Wait-ServiceRegistered {
     param([string]$Name, [int]$Attempts = 30, [int]$DelaySeconds = 2)
 
-    # An installer can return before the Service Control Manager has the service,
-    # so wait for registration instead of failing on the first lookup.
     for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
         $svc = Get-Service -Name $Name -ErrorAction SilentlyContinue
         if ($svc) { return $svc }
@@ -437,8 +434,6 @@ function Get-TcpPortListenerState {
     $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object LocalPort -eq $Port)
     if ($listeners.Count -eq 0) { return 'Free' }
 
-    # A single port can be held by several listeners (IPv4 + IPv6, or unrelated
-    # processes). Only report Sshd when every identifiable owner is sshd.
     $owners = @($listeners | ForEach-Object OwningProcess | Sort-Object -Unique)
     $identified = 0
     foreach ($owner in $owners) {
@@ -602,7 +597,24 @@ function Write-SshdConfigLines {
     [IO.File]::WriteAllLines($File, $Lines, $utf8NoBom)
 }
 
-function Set-CurrentUserAuthorizedKeysMatch {
+function Initialize-SshTargetUser {
+    & net.exe user Administrator /active:yes | Out-Null
+    Assert-NativeCommandSucceeded 'enable local Administrator account'
+    $account = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop | Where-Object Name -eq Administrator | Select-Object -First 1
+    $account = Get-CimInstance Win32_UserAccount -Filter "Name='Administrator' AND LocalAccount=True" -ErrorAction Stop | Select-Object -First 1
+    if (-not $account) { throw "local SSH target account not found: $SshTargetUserName" }
+    if ($account.Disabled) { throw "local SSH target account is disabled: $SshTargetUserName" }
+    $script:SshTargetSid = [string]$account.SID
+    $env:USERNAME = $SshTargetUserName
+    if ($script:SshTargetSid -notmatch '-500$') { throw 'Administrator is not the built-in RID 500 account' }
+    $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($script:SshTargetSid)"
+    $profile = $null
+    try { $profile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath } catch {}
+    if ([string]::IsNullOrWhiteSpace([string]$profile)) { $profile = Join-Path $env:SystemDrive "Users\$SshTargetUserName" }
+    $script:SshTargetProfile = 'C:\\Users\\Administrator'
+    if ([string]::IsNullOrWhiteSpace($script:SshTargetProfile)) { throw "profile path is unavailable for SSH target account: $SshTargetUserName" }
+}
+function Set-TargetUserAuthorizedKeysMatch {
     param([string]$File, [string]$UserName)
 
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { throw "sshd_config not found: $File" }
@@ -653,13 +665,10 @@ function Set-CurrentUserAuthorizedKeysMatch {
 }
 
 function Get-SshConfigUserName {
-    # Windows account names can differ in case between an interactive shell and
-    # Task Scheduler. OpenSSH Match User matching is case-sensitive here.
-    $userName = ([string]$env:USERNAME).Trim()
-    if ([string]::IsNullOrWhiteSpace($userName) -or $userName -match '[\x00-\x1f"]') {
-        throw 'current Windows username cannot be represented safely in sshd_config'
+    if ([string]::IsNullOrWhiteSpace($SshTargetUserName) -or $SshTargetUserName -match '[\x00-\x1f"]') {
+        throw 'SSH target username cannot be represented safely in sshd_config'
     }
-    return $userName.ToLowerInvariant()
+    return $SshTargetUserName.Trim().ToLowerInvariant()
 }
 
 function Initialize-SshdConfig {
@@ -929,7 +938,11 @@ function Set-ManagedSshdConfig {
     Set-SshdOption -File $File -Key 'KbdInteractiveAuthentication' -Value 'no'
     Set-SshdOption -File $File -Key 'ChallengeResponseAuthentication' -Value 'no'
     Set-SshdOption -File $File -Key 'PubkeyAuthentication' -Value 'yes'
-    Set-CurrentUserAuthorizedKeysMatch -File $File -UserName $UserName
+    Remove-SshdOption -File $File -Key 'DenyUsers'
+    Remove-SshdOption -File $File -Key 'DenyGroups'
+    Remove-SshdOption -File $File -Key 'AllowGroups'
+    Set-SshdOption -File $File -Key 'AllowUsers' -Value $UserName
+    Set-TargetUserAuthorizedKeysMatch -File $File -UserName $UserName
 }
 
 function Repair-SshdConfigFromDefault {
@@ -967,9 +980,9 @@ function Set-AuthorizedKeys {
         throw '$SshPublicKeys is empty; refusing to disable password authentication without a public key'
     }
 
-    $authDir = Join-Path $env:USERPROFILE '.ssh'
-    $authFile = Join-Path $authDir 'authorized_keys'
-    $userSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    $authFile = $SshTargetAuthorizedKeysFile
+    $authDir = Split-Path -Parent $authFile
+    $userSid = $script:SshTargetSid
     if (-not (Test-Path -LiteralPath $authDir -PathType Container)) {
         New-Item -ItemType Directory -Path $authDir -Force | Out-Null
     }
@@ -1105,8 +1118,8 @@ function Test-UserAuthorizedKeysValue {
     }
     $actual = $candidate.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
     $expected = @('.ssh/authorized_keys')
-    if ($env:USERPROFILE) {
-        $userProfile = $env:USERPROFILE.TrimEnd([char[]]@('\', '/'))
+    if ($SshTargetAuthorizedKeysFile) {
+        $userProfile = Split-Path -Parent (Split-Path -Parent $SshTargetAuthorizedKeysFile)
         $expected += "$userProfile/.ssh/authorized_keys".Replace('\', '/').ToLowerInvariant()
     }
     return $actual -in $expected
@@ -1206,9 +1219,9 @@ function Assert-SshServerReady {
     param([int]$Port, [string]$TailscaleIp)
 
     Assert-SshdEffectiveConfig -Port $Port -TailscaleIp $TailscaleIp
-    $authDir = Join-Path $env:USERPROFILE '.ssh'
-    $authFile = Join-Path $authDir 'authorized_keys'
-    $userSid = ([Security.Principal.WindowsIdentity]::GetCurrent()).User.Value
+    $authFile = $SshTargetAuthorizedKeysFile
+    $authDir = Split-Path -Parent $authFile
+    $userSid = $script:SshTargetSid
     Assert-AuthorizedKeysReady -File $authFile -Directory $authDir -UserSid $userSid
     Assert-SshdHealthy -Port $Port
     Assert-SshFirewallReady -Port $Port
@@ -1228,6 +1241,7 @@ function Invoke-Setup {
 
     Write-Log 'Starting configuration (platform: Windows OpenSSH over Tailscale)'
     try {
+        Invoke-RequiredStep 'Enable and authorize Administrator account' { Initialize-SshTargetUser }
         Invoke-RequiredStep 'Install Tailscale' { Install-Tailscale }
         Invoke-RequiredStep 'Tailscale service autostart' { Enable-TailscaleService }
         Invoke-RequiredStep 'Tailscale login' { Connect-Tailscale -AuthKey $TsAuthKey }
@@ -1235,7 +1249,7 @@ function Invoke-Setup {
             $script:ValidatedTailscaleIp = Assert-TailscaleReady
         }
         Invoke-RequiredStep 'Enable OpenSSH Server' { Enable-OpenSSHServer }
-        Invoke-RequiredStep 'Configure current-user public keys' { Set-AuthorizedKeys }
+        Invoke-RequiredStep 'Configure Administrator public keys' { Set-AuthorizedKeys }
         Invoke-RequiredStep 'Enable X11 forwarding' { Enable-X11Forwarding }
         Invoke-RequiredStep 'Validate SSH server readiness' {
             Assert-SshServerReady -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
@@ -1248,8 +1262,6 @@ function Invoke-Setup {
         $loginLine = $null
         if ($script:ValidatedTailscaleIp) {
             try {
-                # A later optional/configuration step can fail after SSH is already usable.
-                # Re-run the complete readiness contract before advertising a login command.
                 Assert-SshServerReady -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
                 $loginLine = "ssh -p $SshPort $env:USERNAME@$script:ValidatedTailscaleIp"
                 Write-Warn "Setup reported an error, but SSH is ready: $loginLine"
@@ -1267,7 +1279,7 @@ $loginLine
         $failureMessage = @"
 [FAILED] Windows OpenSSH server setup
 Host: $env:COMPUTERNAME (Windows)
-User: $env:USERNAME
+User: $SshTargetUserName
 Failure:
 - $failureText
 $sshLoginDetails
@@ -1289,7 +1301,7 @@ $sshLoginDetails
     $successMessage = @"
 [READY] Windows OpenSSH server-side checks passed
 Host: $env:COMPUTERNAME (Windows)
-User: $env:USERNAME
+User: $SshTargetUserName
 Tailscale IP: $script:ValidatedTailscaleIp
 Public IP: $(if ($publicIp) { $publicIp } else { 'pending' })
 
