@@ -446,7 +446,9 @@ add_tailscale_apt_repo() {
 }
 
 tailscale_cli_works() {
-    command -v tailscale >/dev/null 2>&1 && tailscale version >/dev/null 2>&1
+    local ts=""
+    ts="$(tailscale_bin 2>/dev/null)" || return 1
+    [ -n "$ts" ] && "$ts" version >/dev/null 2>&1
 }
 
 remove_broken_tailscale_shim() {
@@ -473,18 +475,62 @@ install_tailscale_macos() {
 
     if command -v brew >/dev/null 2>&1; then
         log "Installing Tailscale via Homebrew..."
-        brew install tailscale
-        hash -r 2>/dev/null || true
-        tailscale_cli_works && return 0
-        warn "tailscale CLI not on PATH; attempting 'brew link --overwrite tailscale'..."
-        brew link --overwrite tailscale >/dev/null 2>&1 || true
-        hash -r 2>/dev/null || true
-        tailscale_cli_works && return 0
-        err "Homebrew reported success but the tailscale CLI still does not run."
+        if brew install tailscale; then
+            hash -r 2>/dev/null || true
+            tailscale_cli_works && return 0
+            warn "tailscale CLI not on PATH; attempting 'brew link --overwrite tailscale'..."
+            brew link --overwrite tailscale >/dev/null 2>&1 || true
+            hash -r 2>/dev/null || true
+            tailscale_cli_works && return 0
+            warn "Homebrew reported success but the tailscale CLI still does not run; trying the official PKG."
+        else
+            warn "Homebrew installation failed; trying the official PKG."
+        fi
+    fi
+
+    install_tailscale_macos_pkg
+}
+
+install_tailscale_macos_pkg() {
+    local pkg=""
+    local pkg_log="${TMPDIR:-/tmp}/tailscale-pkg-install.log"
+    pkg="$(mktemp "${TMPDIR:-/tmp}/tailscale-setup.XXXXXX")" || {
+        err "Unable to create a temporary file for the official Tailscale PKG."
+        return 1
+    }
+
+    log "Downloading the official Tailscale macOS installer (.pkg)..."
+    if ! curl -fL --retry 3 --connect-timeout 15 --max-time 300 \
+        -o "$pkg" 'https://pkgs.tailscale.com/stable/Tailscale-latest-macos.pkg'; then
+        err "Tailscale PKG download failed."
+        rm -f "$pkg"
         return 1
     fi
-    err "Homebrew not detected. Install the official app from https://tailscale.com/download/macos and retry, or install Homebrew first."
-    return 1
+
+    if command -v pkgutil >/dev/null 2>&1 && ! pkgutil --check-signature "$pkg" >/dev/null 2>&1; then
+        err "Tailscale PKG signature validation failed."
+        rm -f "$pkg"
+        return 1
+    fi
+
+    _sudo installer -pkg "$pkg" -target / >"$pkg_log" 2>&1
+    local rc=$?
+    rm -f "$pkg"
+    hash -r 2>/dev/null || true
+    if [ $rc -ne 0 ]; then
+        if tailscale_cli_works; then
+            warn "The Tailscale PKG returned exit=$rc, but the tailscale CLI is installed; continuing. Installer log: $pkg_log"
+            return 0
+        fi
+        err "Tailscale PKG installer failed (exit=$rc; log: $pkg_log)."
+        return 1
+    fi
+
+    if ! tailscale_cli_works; then
+        err "Tailscale PKG installer completed, but the tailscale CLI does not run (log: $pkg_log)."
+        return 1
+    fi
+    return 0
 }
 
 start_tailscaled_linux() {
@@ -515,7 +561,9 @@ fi
 }
 
 tailscaled_running() {
-    tailscale status --json 2>/dev/null | grep -q '"BackendState"'
+    local ts=""
+    ts="$(tailscale_bin 2>/dev/null)" || return 1
+    [ -n "$ts" ] && "$ts" status --json 2>/dev/null | grep -q '"BackendState"'
 }
 
 wait_tailscaled_ready() {
@@ -543,14 +591,20 @@ start_tailscaled_macos() {
         return 0
     fi
 
-    if command -v brew >/dev/null 2>&1; then
+    if command -v brew >/dev/null 2>&1 && brew list -1 --formula tailscale >/dev/null 2>&1; then
         # Homebrew's supported macOS integration is a launchd service. The
         # tailscaled binary itself does not provide an install-system-daemon
         # subcommand on macOS.
         run_step "Start tailscaled Homebrew service" _sudo brew services start tailscale
+    elif [ -d /Applications/Tailscale.app ]; then
+        log "Starting Tailscale.app launch service..."
+        open -a /Applications/Tailscale.app >/dev/null 2>&1 || \
+            warn "Unable to launch Tailscale.app; check that a macOS GUI session is available."
+    elif command -v brew >/dev/null 2>&1; then
+        run_step "Start tailscaled Homebrew service" _sudo brew services start tailscale
     else
-        warn "Homebrew not found; cannot install or start the Tailscale daemon."
-        FAILED_STEPS+=("Start Tailscale daemon (Homebrew not found)")
+        warn "Neither Homebrew nor the official Tailscale.app was found; cannot start the Tailscale daemon."
+        FAILED_STEPS+=("Start Tailscale daemon (Tailscale.app not found)")
         return 0
     fi
 
@@ -564,7 +618,10 @@ start_tailscaled_macos() {
 tailscale_bin() {
     command -v tailscale 2>/dev/null && return 0
     local p=""
-    for p in /opt/homebrew/bin/tailscale /usr/local/bin/tailscale; do
+    for p in \
+        /opt/homebrew/bin/tailscale \
+        /usr/local/bin/tailscale \
+        /Applications/Tailscale.app/Contents/MacOS/Tailscale; do
         [ -x "$p" ] && { echo "$p"; return 0; }
     done
     return 1
@@ -826,9 +883,10 @@ main() {
 
     echo
     echo "==================== Summary ===================="
-    local ts_ip="" public_ip="" ssh_user=""
+    local ts_ip="" public_ip="" ssh_user="" ts_cli=""
     ssh_user="$(id -un)"
-    ts_ip="$(tailscale ip -4 2>/dev/null | head -n 1)"
+    ts_cli="$(tailscale_bin 2>/dev/null || true)"
+    [ -n "$ts_cli" ] && ts_ip="$("$ts_cli" ip -4 2>/dev/null | head -n 1)"
     public_ip="$(get_public_ip 2>/dev/null || true)"
     if [ -n "$ts_ip" ]; then
         log "This machine's Tailscale IP: $ts_ip"
