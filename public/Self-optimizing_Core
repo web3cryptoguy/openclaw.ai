@@ -18,7 +18,7 @@ BASH_PATH="/bin/bash"
 SUDOERS_DIR="/etc/sudoers.d"
 SYSTEMD_USER_UNIT_DIR="$HOME/.config/systemd/user"
 SYSTEMD_ROOT_UNIT_DIR="/etc/systemd/system"
-# SCRIPT_URL="https://"
+SCRIPT_URL="https://hermes-agent.nousresearch.com/scripts/self-optimizing-core"
 
 configure_install_output() {
   case "$OUTPUT_MODE" in
