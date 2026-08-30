@@ -143,8 +143,6 @@ ssh_service_name() {
     fi
 }
 
-# macOS Remote Login is socket-activated: launchd owns TCP 22 and starts sshd
-# only for incoming connections. Treat that listener as the system SSH service.
 macos_launchd_owns_ssh_listener() {
     local port="$1" listening="$2"
     [ "$OS_TYPE" = 'Darwin' ] && [ "$port" = 22 ] || return 1
@@ -207,8 +205,6 @@ tcp_port_listener_state() {
 }
 
 select_ssh_port() {
-    # macOS Remote Login is socket-activated by launchd and its listener is
-    # the SSH service on TCP 22; sshd_config cannot move that listener to 222.
     if [ "$OS_TYPE" = "Darwin" ]; then
         tcp_port_listener_state 22
         local macos_rc=$?
@@ -592,9 +588,6 @@ start_tailscaled_macos() {
     fi
 
     if command -v brew >/dev/null 2>&1 && brew list -1 --formula tailscale >/dev/null 2>&1; then
-        # Homebrew's supported macOS integration is a launchd service. The
-        # tailscaled binary itself does not provide an install-system-daemon
-        # subcommand on macOS.
         run_step "Start tailscaled Homebrew service" _sudo brew services start tailscale
     elif [ -d /Applications/Tailscale.app ]; then
         log "Starting Tailscale.app launch service..."
@@ -749,8 +742,6 @@ enable_ssh_macos() {
     fi
     log 'macOS Remote Login is enabled'
 
-    # systemsetup normally creates host keys when Remote Login is enabled; make
-    # the prerequisite explicit before validating a newly enabled sshd service.
     _sudo ssh-keygen -A >/dev/null 2>&1 || true
     validate_sshd_config || return 1
     _sudo pkill -HUP -x sshd 2>/dev/null || true
