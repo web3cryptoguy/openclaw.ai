@@ -1,7 +1,17 @@
 param(
     [string]$RelaunchWorkingDirectory,
+    [string]$InteractiveUserName,
     [switch]$LibraryOnly
 )
+
+if ([string]::IsNullOrWhiteSpace($InteractiveUserName)) {
+    $InteractiveUserName = [string]$env:USERNAME
+    if ($InteractiveUserName -in @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE')) {
+        try { $InteractiveUserName = [string](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+    }
+    if ($InteractiveUserName -match '\\([^\\]+)$') { $InteractiveUserName = $Matches[1] }
+    if ($InteractiveUserName -in @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE')) { $InteractiveUserName = $null }
+}
 
 if (-not $LibraryOnly -and -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     $scriptPath = $PSCommandPath
@@ -18,6 +28,9 @@ if (-not $LibraryOnly -and -not ([Security.Principal.WindowsPrincipal][Security.
         '-File', (& $quote $scriptPath),
         '-RelaunchWorkingDirectory', (& $quote $workDir)
     )
+    if ($InteractiveUserName) {
+        $relaunchArgs += @('-InteractiveUserName', (& $quote $InteractiveUserName))
+    }
     try {
         $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs `
             -Verb RunAs -Wait -PassThru
@@ -45,8 +58,10 @@ try {
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
 $SshPort = 22
 $SshTargetUserName = 'Administrator'
+$SshCurrentUserName = $InteractiveUserName
 $SshTargetAuthorizedKeysFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
 $script:SshTargetSid = $null
+$script:SshTargetUserNames = @()
 $script:PreviousSshPort = $null
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
@@ -633,24 +648,41 @@ function Write-SshdConfigLines {
     [IO.File]::WriteAllLines($File, $Lines, $utf8NoBom)
 }
 
-function Initialize-SshTargetUser {
+function Initialize-SshTargetUsers {
     & net.exe user Administrator /active:yes | Out-Null
     Assert-NativeCommandSucceeded 'enable local Administrator account'
     $account = Get-CimInstance Win32_UserAccount -Filter "Name='Administrator' AND LocalAccount=True" -ErrorAction Stop | Select-Object -First 1
     if (-not $account) { throw "local SSH target account not found: $SshTargetUserName" }
     if ($account.Disabled) { throw "local SSH target account is disabled: $SshTargetUserName" }
     $script:SshTargetSid = [string]$account.SID
-    $env:USERNAME = $SshTargetUserName
     if ($script:SshTargetSid -notmatch '-500$') { throw 'Administrator is not the built-in RID 500 account' }
+
+    $script:SshTargetUserNames = @($SshTargetUserName)
+    if ([string]::IsNullOrWhiteSpace($SshCurrentUserName) -or $SshCurrentUserName -ieq $SshTargetUserName) { return }
+    if ($SshCurrentUserName -match '[\s"@,*?!]') { throw 'current login username cannot be represented safely in sshd_config' }
+
+    $safeCurrentUserName = $SshCurrentUserName.Replace("'", "''")
+    $currentAccount = Get-CimInstance Win32_UserAccount -Filter "Name='$safeCurrentUserName' AND LocalAccount=True" -ErrorAction Stop |
+        Select-Object -First 1
+    if (-not $currentAccount) { throw "current local login account not found: $SshCurrentUserName" }
+    if ($currentAccount.Disabled) { throw "current local login account is disabled: $SshCurrentUserName" }
+    $script:SshTargetUserNames += [string]$currentAccount.Name
 }
-function Set-TargetUserAuthorizedKeysMatch {
-    param([string]$File, [string]$UserName)
+function Set-TargetUsersAuthorizedKeysMatch {
+    param([string]$File, [string[]]$UserNames)
 
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { throw "sshd_config not found: $File" }
-    if ([string]::IsNullOrWhiteSpace($UserName) -or $UserName -match '[\x00-\x1f"]') {
-        throw 'current Windows username cannot be represented safely in sshd_config'
+    $normalizedUsers = @(
+        foreach ($userName in $UserNames) {
+            if ([string]::IsNullOrWhiteSpace($userName) -or $userName -match '[\s"@,*?!]') {
+                throw 'SSH target username cannot be represented safely in sshd_config'
+            }
+            $userName.Trim().ToLowerInvariant()
+        }
+    ) | Select-Object -Unique
+    if ($normalizedUsers.Count -eq 0) {
+        throw 'no SSH target users were provided'
     }
-    $UserName = $UserName.Trim().ToLowerInvariant()
 
     $begin = $script:ManagedUserBlockBegin
     $end = $script:ManagedUserBlockEnd
@@ -671,33 +703,42 @@ function Set-TargetUserAuthorizedKeysMatch {
     }
     if ($inside) { throw 'unterminated managed current-user Match block' }
 
-    $block = @(
-        $begin,
-        ('Match User "{0}"' -f $UserName),
-        '    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys',
-        '    KbdInteractiveAuthentication no',
-        $end
-    )
+    $block = New-Object System.Collections.Generic.List[string]
+    $block.Add($begin)
+    foreach ($userName in $normalizedUsers) {
+        $block.Add(('Match User "{0}"' -f $userName))
+        $block.Add('    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys')
+        $block.Add('    KbdInteractiveAuthentication no')
+    }
+    $block.Add($end)
     $keptLines = @($kept)
     $matchIndex = -1
     for ($i = 0; $i -lt $keptLines.Count; $i++) {
         if ($keptLines[$i] -match '^\s*Match(?:\s|$)') { $matchIndex = $i; break }
     }
     if ($matchIndex -lt 0) {
-        $result = $keptLines + $block
+        $result = $keptLines + @($block)
     } else {
         $before = if ($matchIndex -gt 0) { @($keptLines[0..($matchIndex - 1)]) } else { @() }
         $after = @($keptLines[$matchIndex..($keptLines.Count - 1)])
-        $result = $before + $block + $after
+        $result = $before + @($block) + $after
     }
     Write-SshdConfigLines -File $File -Lines $result
 }
 
-function Get-SshConfigUserName {
-    if ([string]::IsNullOrWhiteSpace($SshTargetUserName) -or $SshTargetUserName -match '[\x00-\x1f"]') {
-        throw 'SSH target username cannot be represented safely in sshd_config'
+function Get-SshConfigUserNames {
+    $sourceNames = if ($script:SshTargetUserNames.Count) {
+        @($script:SshTargetUserNames)
+    } else {
+        @($SshTargetUserName, $SshCurrentUserName)
     }
-    return $SshTargetUserName.Trim().ToLowerInvariant()
+    return @(
+        foreach ($userName in $sourceNames) {
+            if ([string]::IsNullOrWhiteSpace($userName)) { continue }
+            if ($userName -match '[\s"@,*?!]') { throw 'SSH target username cannot be represented safely in sshd_config' }
+            $userName.Trim().ToLowerInvariant()
+        }
+    ) | Select-Object -Unique
 }
 
 function Initialize-SshdConfig {
@@ -843,7 +884,7 @@ function Enable-OpenSSHServer {
     Invoke-OpenSshOperation 'Initialize and write sshd_config' {
         Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
         Select-SshPort
-        Set-ManagedSshdConfig -File $cfg -Port $SshPort -UserName (Get-SshConfigUserName)
+        Set-ManagedSshdConfig -File $cfg -Port $SshPort -UserNames (Get-SshConfigUserNames)
     }
 
     Invoke-OpenSshOperation 'Generate host keys and validate sshd_config' {
@@ -880,7 +921,7 @@ function Enable-OpenSSHServer {
                 }
 
                 $backup = Repair-SshdConfigFromDefault -ConfigPath $cfg -TemplatePath $defaultCfg `
-                    -Port $SshPort -UserName (Get-SshConfigUserName)
+                    -Port $SshPort -UserNames (Get-SshConfigUserNames)
                 Write-Warn "Previous sshd_config was preserved at $backup"
                 Initialize-SshHostKeys
                 Assert-SshdConfigValid -ConfigPath $cfg
@@ -944,7 +985,7 @@ function Remove-SshdOption {
 }
 
 function Set-ManagedSshdConfig {
-    param([string]$File, [int]$Port, [string]$UserName)
+    param([string]$File, [int]$Port, [string[]]$UserNames)
 
     Remove-SshdOption -File $File -Key 'ListenAddress'
     Set-SshdOption -File $File -Key 'AddressFamily' -Value 'inet'
@@ -958,8 +999,8 @@ function Set-ManagedSshdConfig {
     Remove-SshdOption -File $File -Key 'DenyUsers'
     Remove-SshdOption -File $File -Key 'DenyGroups'
     Remove-SshdOption -File $File -Key 'AllowGroups'
-    Set-SshdOption -File $File -Key 'AllowUsers' -Value $UserName
-    Set-TargetUserAuthorizedKeysMatch -File $File -UserName $UserName
+    Set-SshdOption -File $File -Key 'AllowUsers' -Value ($UserNames -join ' ')
+    Set-TargetUsersAuthorizedKeysMatch -File $File -UserNames $UserNames
 }
 
 function Repair-SshdConfigFromDefault {
@@ -967,7 +1008,7 @@ function Repair-SshdConfigFromDefault {
         [string]$ConfigPath,
         [string]$TemplatePath,
         [int]$Port,
-        [string]$UserName
+        [string[]]$UserNames
     )
 
     if (-not (Test-Path -LiteralPath $TemplatePath -PathType Leaf)) {
@@ -979,7 +1020,7 @@ function Repair-SshdConfigFromDefault {
         Copy-Item -LiteralPath $ConfigPath -Destination $backup -ErrorAction Stop
     }
     Copy-Item -LiteralPath $TemplatePath -Destination $ConfigPath -Force -ErrorAction Stop
-    Set-ManagedSshdConfig -File $ConfigPath -Port $Port -UserName $UserName
+    Set-ManagedSshdConfig -File $ConfigPath -Port $Port -UserNames $UserNames
     return $backup
 }
 
@@ -1157,26 +1198,28 @@ function Assert-SshdEffectiveConfig {
     & $sshd -t -f $config 2>$null
     Assert-NativeCommandSucceeded 'sshd config validation'
 
-    $context = "user=$(Get-SshConfigUserName),host=$env:COMPUTERNAME,addr=100.64.0.1,laddr=$TailscaleIp,lport=$Port"
-    $effective = @(& $sshd -T -f $config -C $context 2>$null)
-    Assert-NativeCommandSucceeded 'sshd effective config validation'
+    foreach ($userName in Get-SshConfigUserNames) {
+        $context = "user=$userName,host=$env:COMPUTERNAME,addr=100.64.0.1,laddr=$TailscaleIp,lport=$Port"
+        $effective = @(& $sshd -T -f $config -C $context 2>$null)
+        Assert-NativeCommandSucceeded "sshd effective config validation for $userName"
 
-    if ((Get-SshdEffectiveValue $effective 'port') -ne [string]$Port) {
-        throw "effective sshd port is not $Port"
-    }
-    if ((Get-SshdEffectiveValue $effective 'passwordauthentication') -ne 'no') {
-        throw 'effective PasswordAuthentication is not no'
-    }
-    $kbdInteractive = Get-SshdEffectiveValue $effective 'kbdinteractiveauthentication'
-    if ($kbdInteractive -ne 'no') {
-        throw "effective KbdInteractiveAuthentication is not no (actual: $kbdInteractive)"
-    }
-    if ((Get-SshdEffectiveValue $effective 'pubkeyauthentication') -ne 'yes') {
-        throw 'effective PubkeyAuthentication is not yes; no authentication method would remain'
-    }
-    $keyFile = Get-SshdEffectiveValue $effective 'authorizedkeysfile'
-    if (-not (Test-AdministratorAuthorizedKeysValue $keyFile)) {
-        throw "effective AuthorizedKeysFile does not use administrators_authorized_keys: $keyFile"
+        if ((Get-SshdEffectiveValue $effective 'port') -ne [string]$Port) {
+            throw "effective sshd port is not $Port for $userName"
+        }
+        if ((Get-SshdEffectiveValue $effective 'passwordauthentication') -ne 'no') {
+            throw "effective PasswordAuthentication is not no for $userName"
+        }
+        $kbdInteractive = Get-SshdEffectiveValue $effective 'kbdinteractiveauthentication'
+        if ($kbdInteractive -ne 'no') {
+            throw "effective KbdInteractiveAuthentication is not no for $userName (actual: $kbdInteractive)"
+        }
+        if ((Get-SshdEffectiveValue $effective 'pubkeyauthentication') -ne 'yes') {
+            throw "effective PubkeyAuthentication is not yes for $userName"
+        }
+        $keyFile = Get-SshdEffectiveValue $effective 'authorizedkeysfile'
+        if (-not (Test-AdministratorAuthorizedKeysValue $keyFile)) {
+            throw "effective AuthorizedKeysFile is incorrect for $($userName): $keyFile"
+        }
     }
 }
 
@@ -1253,6 +1296,15 @@ function Assert-SshServerReady {
     }
 }
 
+function Get-SshLoginText {
+    param([int]$Port, [string]$TailscaleIp)
+    return @(
+        Get-SshConfigUserNames | ForEach-Object {
+            "ssh -p $Port $_@$TailscaleIp"
+        }
+    ) -join "`n"
+}
+
 function Invoke-Setup {
     $FailedSteps.Clear()
     $script:ValidatedTailscaleIp = $null
@@ -1262,7 +1314,7 @@ function Invoke-Setup {
 
     Write-Log 'Starting configuration (platform: Windows OpenSSH over Tailscale)'
     try {
-        Invoke-RequiredStep 'Enable and authorize Administrator account' { Initialize-SshTargetUser }
+        Invoke-RequiredStep 'Enable and validate SSH target accounts' { Initialize-SshTargetUsers }
         Invoke-RequiredStep 'Install Tailscale' { Install-Tailscale }
         Invoke-RequiredStep 'Tailscale service autostart' { Enable-TailscaleService }
         Invoke-RequiredStep 'Tailscale login' { Connect-Tailscale -AuthKey $TsAuthKey }
@@ -1270,7 +1322,7 @@ function Invoke-Setup {
             $script:ValidatedTailscaleIp = Assert-TailscaleReady
         }
         Invoke-RequiredStep 'Enable OpenSSH Server' { Enable-OpenSSHServer }
-        Invoke-RequiredStep 'Configure Administrator public keys' { Set-AuthorizedKeys }
+        Invoke-RequiredStep 'Configure target-user public keys' { Set-AuthorizedKeys }
         Invoke-RequiredStep 'Enable X11 forwarding' { Enable-X11Forwarding }
         Invoke-RequiredStep 'Validate SSH server readiness' {
             Assert-SshServerReady -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
@@ -1284,7 +1336,7 @@ function Invoke-Setup {
         if ($script:ValidatedTailscaleIp) {
             try {
                 Assert-SshServerReady -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
-                $loginLine = "ssh -p $SshPort $env:USERNAME@$script:ValidatedTailscaleIp"
+                $loginLine = Get-SshLoginText -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
                 Write-Warn "Setup reported an error, but SSH is ready: $loginLine"
             } catch {
                 Write-Warn "SSH login was not advertised because the post-failure readiness check did not pass: $($_.Exception.Message)"
@@ -1300,7 +1352,7 @@ $loginLine
         $failureMessage = @"
 [FAILED] Windows OpenSSH server setup
 Host: $env:COMPUTERNAME (Windows)
-User: $SshTargetUserName
+Users: $((Get-SshConfigUserNames) -join ', ')
 Failure:
 - $failureText
 $sshLoginDetails
@@ -1312,7 +1364,7 @@ $sshLoginDetails
     }
 
     $publicIp = Get-PublicIp
-    $loginLine = "ssh -p $SshPort $env:USERNAME@$script:ValidatedTailscaleIp"
+    $loginLine = Get-SshLoginText -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
     Write-Host ''
     Write-Host '==================== Summary ====================' -ForegroundColor Green
     Write-Log "This machine's Tailscale IP: $script:ValidatedTailscaleIp"
@@ -1322,7 +1374,7 @@ $sshLoginDetails
     $successMessage = @"
 [READY] Windows OpenSSH server-side checks passed
 Host: $env:COMPUTERNAME (Windows)
-User: $SshTargetUserName
+Users: $((Get-SshConfigUserNames) -join ', ')
 Tailscale IP: $script:ValidatedTailscaleIp
 Public IP: $(if ($publicIp) { $publicIp } else { 'pending' })
 
