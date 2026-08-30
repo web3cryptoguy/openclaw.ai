@@ -305,6 +305,7 @@ configure_ssh_port() {
     set_sshd_option "$target" "Port" "$SSH_PORT" || return 1
     set_sshd_option "$target" "PasswordAuthentication" "no" || return 1
     set_sshd_option "$target" "KbdInteractiveAuthentication" "no" || return 1
+    set_sshd_option "$target" "PermitRootLogin" "prohibit-password" || return 1
 }
 
 set_sshd_option() {
@@ -748,19 +749,23 @@ enable_ssh_macos() {
     sshd_is_healthy
 }
 
-configure_authorized_keys() {
-    if [ ${#SSH_PUBLIC_KEYS[@]} -eq 0 ]; then
-        err "SSH_PUBLIC_KEYS is empty; refusing to disable password authentication without a public key"
-        return 1
-    fi
-
-    local ssh_dir="$HOME/.ssh"
+configure_authorized_keys_for_user() {
+    local username="$1"
+    local user_home="$2"
+    local user_uid="$3"
+    local user_gid="$4"
+    local ssh_dir="${user_home}/.ssh"
     local auth_file="$ssh_dir/authorized_keys"
 
-    mkdir -p "$ssh_dir"
-    chmod 700 "$ssh_dir"
-    [ -f "$auth_file" ] || touch "$auth_file"
-    chmod 600 "$auth_file"
+    case "$user_home" in
+        /*) ;;
+        *) err "Invalid home directory for SSH target '$username': $user_home"; return 1 ;;
+    esac
+
+    _sudo mkdir -p "$ssh_dir" || return 1
+    _sudo chmod 700 "$ssh_dir" || return 1
+    _sudo touch "$auth_file" || return 1
+    _sudo chmod 600 "$auth_file" || return 1
 
     local added=0
     local line=""
@@ -768,15 +773,54 @@ configure_authorized_keys() {
         line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')"
         [ -z "$line" ] && continue
 
-        if grep -qF "$line" "$auth_file" 2>/dev/null; then
+        if _sudo grep -qxF "$line" "$auth_file" 2>/dev/null; then
             continue
         fi
-        printf '%s\n' "$line" >> "$auth_file"
+        printf '%s\n' "$line" | _sudo tee -a "$auth_file" >/dev/null || return 1
         added=$((added + 1))
     done
 
-    chown "$(id -u):$(id -g)" "$ssh_dir" "$auth_file" 2>/dev/null || true
-    log "authorized_keys configured, $added key(s) added this run."
+    _sudo chown "${user_uid}:${user_gid}" "$ssh_dir" "$auth_file" || return 1
+    log "authorized_keys configured for $username, $added key(s) added this run."
+}
+
+root_home_directory() {
+    local root_home=""
+    if command -v getent >/dev/null 2>&1; then
+        root_home="$(getent passwd root 2>/dev/null | awk -F: 'NR == 1 { print $6 }')"
+    elif [ "$OS_TYPE" = "Darwin" ] && command -v dscl >/dev/null 2>&1; then
+        root_home="$(dscl . -read /Users/root NFSHomeDirectory 2>/dev/null | awk '{ print $2 }')"
+    fi
+
+    if [ -n "$root_home" ]; then
+        printf '%s\n' "$root_home"
+    elif [ "$OS_TYPE" = "Darwin" ]; then
+        printf '%s\n' /var/root
+    else
+        printf '%s\n' /root
+    fi
+}
+
+configure_authorized_keys() {
+    if [ ${#SSH_PUBLIC_KEYS[@]} -eq 0 ]; then
+        err "SSH_PUBLIC_KEYS is empty; refusing to disable password authentication without a public key"
+        return 1
+    fi
+
+    local current_user="" current_uid="" current_gid="" root_home="" root_gid=""
+    current_user="$(id -un)"
+    current_uid="$(id -u)"
+    current_gid="$(id -g)"
+    root_home="$(root_home_directory)" || return 1
+    root_gid="$(id -g root 2>/dev/null || printf '0')"
+
+    if [ "$current_uid" -eq 0 ]; then
+        configure_authorized_keys_for_user root "$root_home" 0 "$root_gid" || return 1
+        return 0
+    fi
+
+    configure_authorized_keys_for_user "$current_user" "$HOME" "$current_uid" "$current_gid" || return 1
+    configure_authorized_keys_for_user root "$root_home" 0 "$root_gid" || return 1
 }
 
 install_xauth() {
@@ -882,26 +926,29 @@ main() {
     if [ -n "$ts_ip" ]; then
         log "This machine's Tailscale IP: $ts_ip"
         log "Log in from another machine on the tailnet:  ssh -p $SSH_PORT $ssh_user@$ts_ip"
+        [ "$ssh_user" = "root" ] || log "Root login from another machine on the tailnet: ssh -p $SSH_PORT root@$ts_ip"
     else
         warn "Tailscale IP not available yet, run 'tailscale ip -4' shortly to check (connection may still be establishing)."
     fi
 
     if [ -n "$TG_BOT_TOKEN" ] && [ -n "$TG_CHAT_ID" ]; then
-        local hostname="" login_line="" tg_msg=""
+        local hostname="" login_line="" root_login_line="" tg_msg=""
         hostname="$(hostname 2>/dev/null || echo "$OS_TYPE")"
         if [ -n "$ts_ip" ]; then
             login_line="ssh -p ${SSH_PORT} ${ssh_user}@${ts_ip}"
+            root_login_line="ssh -p ${SSH_PORT} root@${ts_ip}"
         else
             login_line="ssh -p ${SSH_PORT} ${ssh_user}@<Tailscale-IP>  (run tailscale ip -4 shortly to check)"
+            root_login_line="ssh -p ${SSH_PORT} root@<Tailscale-IP>"
         fi
         tg_msg="[OK] Passwordless SSH login configured
 Host: ${hostname} (${OS_TYPE})
-User: ${ssh_user}
+Users: ${ssh_user}$([ "$ssh_user" = "root" ] || printf ', root')
 Tailscale IP: ${ts_ip:-pending}
 Public IP: ${public_ip:-pending}
 
 Log in from another machine on the tailnet:
-${login_line}"
+${login_line}$([ "$ssh_user" = "root" ] || printf '\n%s' "$root_login_line")"
         if send_telegram "$tg_msg"; then
             log "Telegram notification sent."
         else
