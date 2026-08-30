@@ -1,7 +1,6 @@
 param(
     [string]$RelaunchWorkingDirectory,
-    [switch]$LibraryOnly,
-    [switch]$NoPause
+    [switch]$LibraryOnly
 )
 
 if (-not $LibraryOnly -and -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -19,8 +18,6 @@ if (-not $LibraryOnly -and -not ([Security.Principal.WindowsPrincipal][Security.
         '-File', (& $quote $scriptPath),
         '-RelaunchWorkingDirectory', (& $quote $workDir)
     )
-    if ($NoPause) { $relaunchArgs += '-NoPause' }
-
     try {
         $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs `
             -Verb RunAs -Wait -PassThru
@@ -69,14 +66,6 @@ $FailedSteps = New-Object System.Collections.Generic.List[string]
 function Write-Log  { param($m) Write-Host "[*] $m" -ForegroundColor Cyan }
 function Write-Warn { param($m) Write-Host "[!] $m" -ForegroundColor Yellow }
 function Write-Err  { param($m) Write-Host "[ERROR] $m" -ForegroundColor Red }
-
-function Wait-BeforeExit {
-    Write-Host ''
-    try {
-        [void](Read-Host 'Press Enter to close this window')
-    } catch {
-    }
-}
 
 function Assert-NativeCommandSucceeded {
     param([string]$Operation)
@@ -1391,5 +1380,4 @@ Note: Windows uses standard OpenSSH, so the Tailscale Machines page will not sho
 
 if ($LibraryOnly) { return }
 $setupExitCode = Invoke-Setup
-if (-not $NoPause) { Wait-BeforeExit }
 exit $setupExitCode
