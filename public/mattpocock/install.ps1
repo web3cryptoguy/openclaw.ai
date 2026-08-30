@@ -164,7 +164,7 @@ function Register-TaskSetupTask {
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $INSTALL_SCRIPT_PATH
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
-    $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
+    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
 
     Register-ScheduledTask -TaskName $TASKSETUP_NAME -TaskPath '\' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 }
