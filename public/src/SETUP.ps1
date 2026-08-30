@@ -1011,6 +1011,48 @@ function Start-OrRestartSshdService {
     }
 }
 
+function Enable-AuthorizedKeysAclRepairAccess {
+    param(
+        [string]$Path,
+        [switch]$Container
+    )
+
+    # A previous run may have removed the launching administrator from the
+    # DACL before it could set the final owner.  Temporarily make the built-in
+    # Administrators group the owner so an elevated administrator or SYSTEM
+    # can repair and rerun the setup.
+    & takeown.exe /F $Path /A | Out-Null
+    Assert-NativeCommandSucceeded "take ownership for ACL repair: $Path"
+
+    $rights = if ($Container) { '(OI)(CI)(F)' } else { '(F)' }
+    & icacls.exe $Path /grant "*S-1-5-32-544:$rights" | Out-Null
+    Assert-NativeCommandSucceeded "grant Administrators ACL repair access: $Path"
+}
+
+function Set-RestrictedAuthorizedKeysAcl {
+    param(
+        [string]$Path,
+        [string]$UserSid,
+        [switch]$Container
+    )
+
+    $userRights = if ($Container) { "*$UserSid`:(OI)(CI)(F)" } else { "*$UserSid`:(F)" }
+    $systemRights = if ($Container) { '*S-1-5-18:(OI)(CI)(F)' } else { '*S-1-5-18:(F)' }
+    $adminRights = if ($Container) { '*S-1-5-32-544:(OI)(CI)(F)' } else { '*S-1-5-32-544:(F)' }
+
+    # /reset removes stale explicit ACEs.  Add the final explicit ACEs before
+    # removing inheritance, so the process performing the repair never locks
+    # itself out between icacls calls.
+    & icacls.exe $Path /reset | Out-Null
+    Assert-NativeCommandSucceeded "reset authorized-keys ACL: $Path"
+    & icacls.exe $Path /grant:r $userRights $systemRights $adminRights | Out-Null
+    Assert-NativeCommandSucceeded "grant restricted authorized-keys ACL: $Path"
+    & icacls.exe $Path '/inheritance:r' | Out-Null
+    Assert-NativeCommandSucceeded "disable authorized-keys ACL inheritance: $Path"
+    & icacls.exe $Path /setowner "*$UserSid" | Out-Null
+    Assert-NativeCommandSucceeded "set authorized-keys owner: $Path"
+}
+
 function Set-AuthorizedKeys {
     if (-not $SshPublicKeys -or $SshPublicKeys.Count -eq 0) {
         throw '$SshPublicKeys is empty; refusing to disable password authentication without a public key'
@@ -1022,8 +1064,10 @@ function Set-AuthorizedKeys {
     if (-not (Test-Path -LiteralPath $authDir -PathType Container)) {
         New-Item -ItemType Directory -Path $authDir -Force | Out-Null
     }
+    Enable-AuthorizedKeysAclRepairAccess -Path $authDir -Container
 
     if (-not (Test-Path $authFile)) { New-Item -ItemType File -Path $authFile -Force | Out-Null }
+    Enable-AuthorizedKeysAclRepairAccess -Path $authFile
 
     $existing = @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue)
     $added = 0
@@ -1036,23 +1080,10 @@ function Set-AuthorizedKeys {
     }
     Set-Content -LiteralPath $authFile -Value $existing -Encoding ASCII -ErrorAction Stop
 
-    & icacls.exe $authDir /reset | Out-Null
-    Assert-NativeCommandSucceeded 'icacls reset current-user .ssh directory'
-    & icacls.exe $authDir '/inheritance:r' | Out-Null
-    Assert-NativeCommandSucceeded 'icacls disable current-user .ssh inheritance'
-    & icacls.exe $authDir /grant:r "*$($userSid):(OI)(CI)(F)" '*S-1-5-18:(OI)(CI)(F)' | Out-Null
-    Assert-NativeCommandSucceeded 'icacls grant current user and SYSTEM on .ssh directory'
-    & icacls.exe $authDir /setowner "*$userSid" | Out-Null
-    Assert-NativeCommandSucceeded 'icacls set current-user .ssh owner'
-
-    & icacls.exe $authFile /reset | Out-Null
-    Assert-NativeCommandSucceeded 'icacls reset current-user authorized_keys'
-    & icacls.exe $authFile '/inheritance:r' | Out-Null
-    Assert-NativeCommandSucceeded 'icacls disable current-user authorized_keys inheritance'
-    & icacls.exe $authFile /grant:r "*$($userSid):(F)" '*S-1-5-18:(F)' | Out-Null
-    Assert-NativeCommandSucceeded 'icacls grant current user and SYSTEM on authorized_keys'
-    & icacls.exe $authFile /setowner "*$userSid" | Out-Null
-    Assert-NativeCommandSucceeded 'icacls set current-user authorized_keys owner'
+    # Finalize the file first.  The directory keeps the temporary repair ACE
+    # until the child no longer needs to be opened by this process.
+    Set-RestrictedAuthorizedKeysAcl -Path $authFile -UserSid $userSid
+    Set-RestrictedAuthorizedKeysAcl -Path $authDir -UserSid $userSid -Container
 
     Assert-AuthorizedKeysReady -File $authFile -Directory $authDir -UserSid $userSid
 
@@ -1067,9 +1098,9 @@ function Assert-RestrictedUserAcl {
     $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
     if ($ownerSid -ne $UserSid) { throw "ACL owner is $ownerSid instead of $UserSid`: $Path" }
 
-    $allowed = @($UserSid, 'S-1-5-18')
+    $allowed = @($UserSid, 'S-1-5-18', 'S-1-5-32-544')
     $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-    if ($rules.Count -ne 2) { throw "$Path has $($rules.Count) ACL entries; expected exactly 2" }
+    if ($rules.Count -ne 3) { throw "$Path has $($rules.Count) ACL entries; expected exactly 3" }
     foreach ($rule in $rules) {
         $sid = $rule.IdentityReference.Value
         if ($sid -notin $allowed) { throw "unexpected ACL principal on $Path`: $sid" }
