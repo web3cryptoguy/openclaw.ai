@@ -45,9 +45,8 @@ try {
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
 $SshPort = 22
 $SshTargetUserName = 'Administrator'
-$SshTargetAuthorizedKeysFile = 'C:\Users\Administrator\.ssh\authorized_keys'
+$SshTargetAuthorizedKeysFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
 $script:SshTargetSid = $null
-$script:SshTargetProfile = $null
 $script:PreviousSshPort = $null
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
@@ -637,19 +636,12 @@ function Write-SshdConfigLines {
 function Initialize-SshTargetUser {
     & net.exe user Administrator /active:yes | Out-Null
     Assert-NativeCommandSucceeded 'enable local Administrator account'
-    $account = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop | Where-Object Name -eq Administrator | Select-Object -First 1
     $account = Get-CimInstance Win32_UserAccount -Filter "Name='Administrator' AND LocalAccount=True" -ErrorAction Stop | Select-Object -First 1
     if (-not $account) { throw "local SSH target account not found: $SshTargetUserName" }
     if ($account.Disabled) { throw "local SSH target account is disabled: $SshTargetUserName" }
     $script:SshTargetSid = [string]$account.SID
     $env:USERNAME = $SshTargetUserName
     if ($script:SshTargetSid -notmatch '-500$') { throw 'Administrator is not the built-in RID 500 account' }
-    $profileKey = "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$($script:SshTargetSid)"
-    $profile = $null
-    try { $profile = (Get-ItemProperty -LiteralPath $profileKey -Name ProfileImagePath -ErrorAction Stop).ProfileImagePath } catch {}
-    if ([string]::IsNullOrWhiteSpace([string]$profile)) { $profile = Join-Path $env:SystemDrive "Users\$SshTargetUserName" }
-    $script:SshTargetProfile = 'C:\\Users\\Administrator'
-    if ([string]::IsNullOrWhiteSpace($script:SshTargetProfile)) { throw "profile path is unavailable for SSH target account: $SshTargetUserName" }
 }
 function Set-TargetUserAuthorizedKeysMatch {
     param([string]$File, [string]$UserName)
@@ -682,7 +674,7 @@ function Set-TargetUserAuthorizedKeysMatch {
     $block = @(
         $begin,
         ('Match User "{0}"' -f $UserName),
-        '    AuthorizedKeysFile .ssh/authorized_keys',
+        '    AuthorizedKeysFile __PROGRAMDATA__/ssh/administrators_authorized_keys',
         '    KbdInteractiveAuthentication no',
         $end
     )
@@ -1018,28 +1010,17 @@ function Enable-AuthorizedKeysAclRepairAccess {
     Assert-NativeCommandSucceeded "grant Administrators ACL repair access: $Path"
 }
 
-function Set-RestrictedAuthorizedKeysAcl {
-    param(
-        [string]$Path,
-        [string]$UserSid,
-        [switch]$Container
-    )
+function Set-RestrictedAdministratorsAuthorizedKeysAcl {
+    param([string]$Path)
 
-    $userRights = if ($Container) { "*$UserSid`:(OI)(CI)(F)" } else { "*$UserSid`:(F)" }
-    $systemRights = if ($Container) { '*S-1-5-18:(OI)(CI)(F)' } else { '*S-1-5-18:(F)' }
-    $adminRights = if ($Container) { '*S-1-5-32-544:(OI)(CI)(F)' } else { '*S-1-5-32-544:(F)' }
-
-    # /reset removes stale explicit ACEs.  Add the final explicit ACEs before
-    # removing inheritance, so the process performing the repair never locks
-    # itself out between icacls calls.
     & icacls.exe $Path /reset | Out-Null
-    Assert-NativeCommandSucceeded "reset authorized-keys ACL: $Path"
-    & icacls.exe $Path /grant:r $userRights $systemRights $adminRights | Out-Null
-    Assert-NativeCommandSucceeded "grant restricted authorized-keys ACL: $Path"
+    Assert-NativeCommandSucceeded 'reset administrators-authorized-keys ACL'
+    & icacls.exe $Path /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    Assert-NativeCommandSucceeded 'grant administrators-authorized-keys ACL'
     & icacls.exe $Path '/inheritance:r' | Out-Null
-    Assert-NativeCommandSucceeded "disable authorized-keys ACL inheritance: $Path"
-    & icacls.exe $Path /setowner "*$UserSid" | Out-Null
-    Assert-NativeCommandSucceeded "set authorized-keys owner: $Path"
+    Assert-NativeCommandSucceeded 'disable administrators-authorized-keys ACL inheritance'
+    & icacls.exe $Path /setowner '*S-1-5-32-544' | Out-Null
+    Assert-NativeCommandSucceeded 'set administrators-authorized-keys owner'
 }
 
 function Set-AuthorizedKeys {
@@ -1049,11 +1030,9 @@ function Set-AuthorizedKeys {
 
     $authFile = $SshTargetAuthorizedKeysFile
     $authDir = Split-Path -Parent $authFile
-    $userSid = $script:SshTargetSid
     if (-not (Test-Path -LiteralPath $authDir -PathType Container)) {
         New-Item -ItemType Directory -Path $authDir -Force | Out-Null
     }
-    Enable-AuthorizedKeysAclRepairAccess -Path $authDir -Container
 
     if (-not (Test-Path $authFile)) { New-Item -ItemType File -Path $authFile -Force | Out-Null }
     Enable-AuthorizedKeysAclRepairAccess -Path $authFile
@@ -1071,46 +1050,37 @@ function Set-AuthorizedKeys {
 
     # Finalize the file first.  The directory keeps the temporary repair ACE
     # until the child no longer needs to be opened by this process.
-    Set-RestrictedAuthorizedKeysAcl -Path $authFile -UserSid $userSid
-    Set-RestrictedAuthorizedKeysAcl -Path $authDir -UserSid $userSid -Container
-
-    Assert-AuthorizedKeysReady -File $authFile -Directory $authDir -UserSid $userSid
+    Set-RestrictedAdministratorsAuthorizedKeysAcl -Path $authFile
+    Assert-AuthorizedKeysReady -File $authFile
 
     Write-Log "authorized_keys configured ($authFile), $added key(s) added this run."
 }
 
-function Assert-RestrictedUserAcl {
-    param([string]$Path, [string]$UserSid)
+function Assert-RestrictedAdministratorsAuthorizedKeysAcl {
+    param([string]$Path)
 
     $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
-    if (-not $acl.AreAccessRulesProtected) { throw "ACL inheritance is still enabled: $Path" }
+    if (-not $acl.AreAccessRulesProtected) { throw 'administrators_authorized_keys ACL inheritance is enabled' }
     $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($ownerSid -ne $UserSid) { throw "ACL owner is $ownerSid instead of $UserSid`: $Path" }
+    if ($ownerSid -ne 'S-1-5-32-544') { throw 'administrators_authorized_keys owner is not Administrators' }
 
-    $allowed = @($UserSid, 'S-1-5-18', 'S-1-5-32-544')
+    $allowed = @('S-1-5-18', 'S-1-5-32-544')
     $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-    if ($rules.Count -ne 3) { throw "$Path has $($rules.Count) ACL entries; expected exactly 3" }
+    if ($rules.Count -ne 2) { throw 'administrators_authorized_keys must have exactly two ACL entries' }
     foreach ($rule in $rules) {
         $sid = $rule.IdentityReference.Value
-        if ($sid -notin $allowed) { throw "unexpected ACL principal on $Path`: $sid" }
-        if ($rule.IsInherited) { throw "inherited ACL entry on $Path`: $sid" }
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
-            throw "non-Allow ACL entry on $Path`: $sid"
-        }
+        if ($sid -notin $allowed -or $rule.IsInherited) { throw 'administrators_authorized_keys has an unexpected ACL entry' }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { throw 'administrators_authorized_keys has a non-Allow ACL entry' }
         $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
-        if (($rule.FileSystemRights -band $fullControl) -ne $fullControl) {
-            throw "ACL is not FullControl on $Path`: $sid"
-        }
+        if (($rule.FileSystemRights -band $fullControl) -ne $fullControl) { throw 'administrators_authorized_keys ACL is not FullControl' }
     }
     foreach ($sid in $allowed) {
-        if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq $sid })) {
-            throw "required ACL principal missing from $Path`: $sid"
-        }
+        if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq $sid })) { throw 'administrators_authorized_keys is missing a required ACL principal' }
     }
 }
 
 function Assert-AuthorizedKeysReady {
-    param([string]$File, [string]$Directory, [string]$UserSid)
+    param([string]$File)
 
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { throw "authorized_keys file not found: $File" }
     $existing = @(Get-Content -LiteralPath $File -ErrorAction Stop)
@@ -1118,9 +1088,7 @@ function Assert-AuthorizedKeysReady {
         if ($existing -notcontains $key.Trim()) { throw "configured public key is missing: $(($key -split '\s+')[-1])" }
     }
 
-    if (-not (Test-Path -LiteralPath $Directory -PathType Container)) { throw ".ssh directory not found: $Directory" }
-    Assert-RestrictedUserAcl -Path $Directory -UserSid $UserSid
-    Assert-RestrictedUserAcl -Path $File -UserSid $UserSid
+    Assert-RestrictedAdministratorsAuthorizedKeysAcl -Path $File
 }
 
 function Enable-X11Forwarding {
@@ -1163,7 +1131,7 @@ function Get-SshdEffectiveValue {
     return $null
 }
 
-function Test-UserAuthorizedKeysValue {
+function Test-AdministratorAuthorizedKeysValue {
     param([string]$Value)
     if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
     $candidate = $Value.Trim()
@@ -1173,10 +1141,9 @@ function Test-UserAuthorizedKeysValue {
         return $false
     }
     $actual = $candidate.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
-    $expected = @('.ssh/authorized_keys')
+    $expected = @('__programdata__/ssh/administrators_authorized_keys')
     if ($SshTargetAuthorizedKeysFile) {
-        $userProfile = Split-Path -Parent (Split-Path -Parent $SshTargetAuthorizedKeysFile)
-        $expected += "$userProfile/.ssh/authorized_keys".Replace('\', '/').ToLowerInvariant()
+        $expected += $SshTargetAuthorizedKeysFile.Replace('\', '/').ToLowerInvariant()
     }
     return $actual -in $expected
 }
@@ -1208,8 +1175,8 @@ function Assert-SshdEffectiveConfig {
         throw 'effective PubkeyAuthentication is not yes; no authentication method would remain'
     }
     $keyFile = Get-SshdEffectiveValue $effective 'authorizedkeysfile'
-    if (-not (Test-UserAuthorizedKeysValue $keyFile)) {
-        throw "effective AuthorizedKeysFile does not use the current user's .ssh/authorized_keys: $keyFile"
+    if (-not (Test-AdministratorAuthorizedKeysValue $keyFile)) {
+        throw "effective AuthorizedKeysFile does not use administrators_authorized_keys: $keyFile"
     }
 }
 
@@ -1276,9 +1243,7 @@ function Assert-SshServerReady {
 
     Assert-SshdEffectiveConfig -Port $Port -TailscaleIp $TailscaleIp
     $authFile = $SshTargetAuthorizedKeysFile
-    $authDir = Split-Path -Parent $authFile
-    $userSid = $script:SshTargetSid
-    Assert-AuthorizedKeysReady -File $authFile -Directory $authDir -UserSid $userSid
+    Assert-AuthorizedKeysReady -File $authFile
     Assert-SshdHealthy -Port $Port
     Assert-SshFirewallReady -Port $Port
     Assert-SshBanner -Address $TailscaleIp -Port $Port
