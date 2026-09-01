@@ -57,7 +57,7 @@ try {
 
 $TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
 $SshPort = 22
-$SshTargetUserName = 'Administrator'
+$SshTargetUserName = $null # Resolved from the built-in account's RID 500 below.
 $SshCurrentUserName = $InteractiveUserName
 $SshTargetAuthorizedKeysFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
 $script:SshTargetSid = $null
@@ -649,13 +649,36 @@ function Write-SshdConfigLines {
 }
 
 function Initialize-SshTargetUsers {
-    & net.exe user Administrator /active:yes | Out-Null
-    Assert-NativeCommandSucceeded 'enable local Administrator account'
-    $account = Get-CimInstance Win32_UserAccount -Filter "Name='Administrator' AND LocalAccount=True" -ErrorAction Stop | Select-Object -First 1
-    if (-not $account) { throw "local SSH target account not found: $SshTargetUserName" }
-    if ($account.Disabled) { throw "local SSH target account is disabled: $SshTargetUserName" }
+    # The built-in Administrator account is identified by RID 500.  Its name
+    # is localized and can also be renamed, so never assume "Administrator".
+    $account = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop |
+        Where-Object { [string]$_.SID -match '-500$' } |
+        Select-Object -First 1
+    if (-not $account) { throw 'local built-in Administrator account (RID 500) not found' }
+
+    $script:SshTargetUserName = [string]$account.Name
     $script:SshTargetSid = [string]$account.SID
-    if ($script:SshTargetSid -notmatch '-500$') { throw 'Administrator is not the built-in RID 500 account' }
+    if ([string]::IsNullOrWhiteSpace($script:SshTargetUserName)) {
+        throw 'local built-in Administrator account (RID 500) has no usable name'
+    }
+    if ($script:SshTargetUserName -match '[\s"@,*?!]') {
+        throw "built-in Administrator account name cannot be represented safely in sshd_config: $script:SshTargetUserName"
+    }
+
+    if ($account.Disabled) {
+        & net.exe user $script:SshTargetUserName /active:yes | Out-Null
+        $enableExitCode = $LASTEXITCODE
+        if ($enableExitCode -ne 0) {
+            throw "enable local built-in Administrator account '$script:SshTargetUserName' failed (exit=$enableExitCode)"
+        }
+
+        $account = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop |
+            Where-Object { [string]$_.SID -eq $script:SshTargetSid } |
+            Select-Object -First 1
+    }
+    if (-not $account -or $account.Disabled) {
+        throw "local built-in Administrator account remains disabled: $script:SshTargetUserName"
+    }
 
     $script:SshTargetUserNames = @($SshTargetUserName)
     if ([string]::IsNullOrWhiteSpace($SshCurrentUserName) -or $SshCurrentUserName -ieq $SshTargetUserName) { return }
