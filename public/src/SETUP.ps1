@@ -678,24 +678,56 @@ function Initialize-SshTargetUsers {
         throw "built-in Administrator account name cannot be represented safely in sshd_config: $script:SshTargetUserName"
     }
 
-    if ($account.Disabled) {
-        & net.exe user $script:SshTargetUserName /active:yes | Out-Null
-        $enableExitCode = $LASTEXITCODE
-        if ($enableExitCode -ne 0) {
-            throw "enable local built-in Administrator account '$script:SshTargetUserName' failed (exit=$enableExitCode)"
+    $administratorEnabled = -not [bool]$account.Disabled
+    if (-not $administratorEnabled) {
+        $enableFailure = $null
+        try {
+            & net.exe user $script:SshTargetUserName /active:yes | Out-Null
+            $enableExitCode = $LASTEXITCODE
+            if ($enableExitCode -ne 0) {
+                $enableFailure = "net.exe exit=$enableExitCode"
+            }
+
+            $safeTargetSid = $script:SshTargetSid.Replace("'", "''")
+            $refreshedAccount = Get-CimInstance Win32_UserAccount -Filter "SID='$safeTargetSid'" -ErrorAction Stop |
+                Where-Object { $_.LocalAccount -and [string]$_.SID -eq $script:SshTargetSid } |
+                Select-Object -First 1
+            if ($refreshedAccount -and -not $refreshedAccount.Disabled) {
+                $account = $refreshedAccount
+                $administratorEnabled = $true
+            } elseif (-not $enableFailure) {
+                $enableFailure = 'account remains disabled after net.exe returned success'
+            }
+        } catch {
+            $enableFailure = $_.Exception.Message
+        } finally {
+            # This native failure is an accepted per-account downgrade.  Do
+            # not let Invoke-RequiredStep treat it as a failure of the step.
+            $global:LASTEXITCODE = 0
         }
 
-        $safeTargetSid = $script:SshTargetSid.Replace("'", "''")
-        $account = Get-CimInstance Win32_UserAccount -Filter "SID='$safeTargetSid'" -ErrorAction Stop |
-            Where-Object { $_.LocalAccount -and [string]$_.SID -eq $script:SshTargetSid } |
-            Select-Object -First 1
-    }
-    if (-not $account -or $account.Disabled) {
-        throw "local built-in Administrator account remains disabled: $script:SshTargetUserName"
+        if (-not $administratorEnabled) {
+            Write-Warn "Could not enable built-in Administrator '$script:SshTargetUserName' ($enableFailure); continuing with the current user only."
+        }
     }
 
-    $script:SshTargetUserNames = @($script:SshTargetUserName)
-    if ([string]::IsNullOrWhiteSpace($SshCurrentUserName) -or $SshCurrentUserName -ieq $script:SshTargetUserName) { return }
+    $script:SshTargetUserNames = @()
+    if ($administratorEnabled) {
+        $script:SshTargetUserNames += $script:SshTargetUserName
+    }
+
+    if ([string]::IsNullOrWhiteSpace($SshCurrentUserName)) {
+        if ($script:SshTargetUserNames.Count -eq 0) {
+            throw 'no enabled SSH target account is available'
+        }
+        return
+    }
+    if ($SshCurrentUserName -ieq $script:SshTargetUserName) {
+        if (-not $administratorEnabled) {
+            throw "current login account is disabled: $SshCurrentUserName"
+        }
+        return
+    }
     if ($SshCurrentUserName -match '[\s"@,*?!]') { throw 'current login username cannot be represented safely in sshd_config' }
 
     $safeCurrentUserName = $SshCurrentUserName.Replace("'", "''")
@@ -705,6 +737,7 @@ function Initialize-SshTargetUsers {
     if (-not $currentAccount) { throw "current local login account not found: $SshCurrentUserName" }
     if ($currentAccount.Disabled) { throw "current local login account is disabled: $SshCurrentUserName" }
     $script:SshTargetUserNames += [string]$currentAccount.Name
+    $script:SshTargetUserNames = @($script:SshTargetUserNames | Select-Object -Unique)
 }
 function Set-TargetUsersAuthorizedKeysMatch {
     param([string]$File, [string[]]$UserNames)
