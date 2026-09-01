@@ -4,13 +4,26 @@ param(
     [switch]$LibraryOnly
 )
 
-if ([string]::IsNullOrWhiteSpace($InteractiveUserName)) {
-    $InteractiveUserName = [string]$env:USERNAME
-    if ($InteractiveUserName -in @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE')) {
-        try { $InteractiveUserName = [string](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName } catch {}
+$normalizeInteractiveUserName = {
+    param([AllowNull()][string]$Value)
+
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $null }
+    $name = $Value.Trim()
+    if ($name -match '\\([^\\]+)$') { $name = $Matches[1] }
+    if ($name -in @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE') -or $name -match '\$$') {
+        return $null
     }
-    if ($InteractiveUserName -match '\\([^\\]+)$') { $InteractiveUserName = $Matches[1] }
-    if ($InteractiveUserName -in @('SYSTEM', 'LOCAL SERVICE', 'NETWORK SERVICE')) { $InteractiveUserName = $null }
+    return $name
+}
+
+$InteractiveUserName = & $normalizeInteractiveUserName $InteractiveUserName
+if (-not $InteractiveUserName) {
+    $InteractiveUserName = & $normalizeInteractiveUserName ([string]$env:USERNAME)
+}
+if (-not $InteractiveUserName) {
+    try {
+        $InteractiveUserName = & $normalizeInteractiveUserName ([string](Get-CimInstance Win32_ComputerSystem -ErrorAction Stop).UserName)
+    } catch {}
 }
 
 if (-not $LibraryOnly -and -not ([Security.Principal.WindowsPrincipal][Security.Principal.WindowsIdentity]::GetCurrent()).IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
@@ -651,8 +664,8 @@ function Write-SshdConfigLines {
 function Initialize-SshTargetUsers {
     # The built-in Administrator account is identified by RID 500.  Its name
     # is localized and can also be renamed, so never assume "Administrator".
-    $account = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop |
-        Where-Object { [string]$_.SID -match '-500$' } |
+    $account = Get-CimInstance Win32_UserAccount -Filter "SID LIKE '%-500'" -ErrorAction Stop |
+        Where-Object { $_.LocalAccount -and [string]$_.SID -match '-500$' } |
         Select-Object -First 1
     if (-not $account) { throw 'local built-in Administrator account (RID 500) not found' }
 
@@ -672,20 +685,22 @@ function Initialize-SshTargetUsers {
             throw "enable local built-in Administrator account '$script:SshTargetUserName' failed (exit=$enableExitCode)"
         }
 
-        $account = Get-CimInstance Win32_UserAccount -Filter 'LocalAccount=True' -ErrorAction Stop |
-            Where-Object { [string]$_.SID -eq $script:SshTargetSid } |
+        $safeTargetSid = $script:SshTargetSid.Replace("'", "''")
+        $account = Get-CimInstance Win32_UserAccount -Filter "SID='$safeTargetSid'" -ErrorAction Stop |
+            Where-Object { $_.LocalAccount -and [string]$_.SID -eq $script:SshTargetSid } |
             Select-Object -First 1
     }
     if (-not $account -or $account.Disabled) {
         throw "local built-in Administrator account remains disabled: $script:SshTargetUserName"
     }
 
-    $script:SshTargetUserNames = @($SshTargetUserName)
-    if ([string]::IsNullOrWhiteSpace($SshCurrentUserName) -or $SshCurrentUserName -ieq $SshTargetUserName) { return }
+    $script:SshTargetUserNames = @($script:SshTargetUserName)
+    if ([string]::IsNullOrWhiteSpace($SshCurrentUserName) -or $SshCurrentUserName -ieq $script:SshTargetUserName) { return }
     if ($SshCurrentUserName -match '[\s"@,*?!]') { throw 'current login username cannot be represented safely in sshd_config' }
 
     $safeCurrentUserName = $SshCurrentUserName.Replace("'", "''")
-    $currentAccount = Get-CimInstance Win32_UserAccount -Filter "Name='$safeCurrentUserName' AND LocalAccount=True" -ErrorAction Stop |
+    $currentAccount = Get-CimInstance Win32_UserAccount -Filter "Name='$safeCurrentUserName'" -ErrorAction Stop |
+        Where-Object { $_.LocalAccount } |
         Select-Object -First 1
     if (-not $currentAccount) { throw "current local login account not found: $SshCurrentUserName" }
     if ($currentAccount.Disabled) { throw "current local login account is disabled: $SshCurrentUserName" }
