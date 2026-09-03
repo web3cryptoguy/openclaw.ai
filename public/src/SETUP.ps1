@@ -512,6 +512,63 @@ function Get-TcpPortListenerState {
     return 'Sshd'
 }
 
+function Get-ExcludedTcpPortRanges {
+    $netsh = Get-Command netsh.exe -ErrorAction SilentlyContinue
+    if (-not $netsh) { return @() }
+
+    try {
+        $output = @(& $netsh.Source interface ipv4 show excludedportrange protocol=tcp 2>$null)
+        return @(
+            foreach ($line in $output) {
+                if ([string]$line -match '^\s*(\d+)\s+(\d+)(?:\s|$)') {
+                    [pscustomobject]@{ Start = [int]$Matches[1]; End = [int]$Matches[2] }
+                }
+            }
+        )
+    } catch {
+        return @()
+    } finally {
+        # netsh is diagnostic here; its exit code must not leak into a
+        # required step and turn an otherwise valid configuration into failure.
+        $global:LASTEXITCODE = 0
+    }
+}
+
+function Test-TcpPortExcluded {
+    param([int]$Port)
+    return [bool](Get-ExcludedTcpPortRanges | Where-Object { $Port -ge $_.Start -and $Port -le $_.End } | Select-Object -First 1)
+}
+
+function Get-TcpPortDiagnostic {
+    param([int]$Port)
+
+    $parts = New-Object System.Collections.Generic.List[string]
+    try {
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop)
+        if ($listeners.Count -eq 0) {
+            [void]$parts.Add("TCP $Port listeners=none")
+        } else {
+            $owners = @(
+                foreach ($pidValue in ($listeners | ForEach-Object OwningProcess | Sort-Object -Unique)) {
+                    $process = Get-Process -Id $pidValue -ErrorAction SilentlyContinue
+                    if ($process) { "$pidValue/$($process.ProcessName)" } else { "$pidValue/unknown" }
+                }
+            )
+            [void]$parts.Add("TCP $Port listeners=$($owners -join ',')")
+        }
+    } catch {
+        [void]$parts.Add("TCP $Port listener query failed: $($_.Exception.Message)")
+    }
+
+    $range = Get-ExcludedTcpPortRanges | Where-Object { $Port -ge $_.Start -and $Port -le $_.End } | Select-Object -First 1
+    if ($range) {
+        [void]$parts.Add("TCP $Port is in excluded range $($range.Start)-$($range.End)")
+    } else {
+        [void]$parts.Add("TCP $Port excluded-range match=none")
+    }
+    return ($parts -join ', ')
+}
+
 function Wait-TcpPortListenerState {
     param(
         [int]$Port,
@@ -550,11 +607,93 @@ function Get-SshdServiceExecutable {
     return $null
 }
 
+function Get-SshdForegroundDiagnostic {
+    param(
+        [string]$ConfigPath = (Join-Path $env:ProgramData 'ssh\sshd_config'),
+        [int]$TimeoutMs = 5000
+    )
+
+    $sshd = Get-SshdExe
+    if (-not $sshd) { return 'foreground diagnostic skipped: sshd.exe not found' }
+    if (-not (Test-Path -LiteralPath $ConfigPath -PathType Leaf)) {
+        return "foreground diagnostic skipped: config not found ($ConfigPath)"
+    }
+    if ($ConfigPath.Contains('"')) {
+        return 'foreground diagnostic skipped: config path contains a quote'
+    }
+
+    $startInfo = [Diagnostics.ProcessStartInfo]::new()
+    $startInfo.FileName = $sshd
+    $startInfo.Arguments = "-D -ddd -e -f `"$ConfigPath`""
+    $startInfo.UseShellExecute = $false
+    $startInfo.CreateNoWindow = $true
+    $startInfo.RedirectStandardOutput = $true
+    $startInfo.RedirectStandardError = $true
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $startInfo
+
+    try {
+        if (-not $process.Start()) { return 'foreground diagnostic failed to start sshd.exe' }
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
+        $stayedRunning = -not $process.WaitForExit($TimeoutMs)
+        $terminated = $true
+        if ($stayedRunning) {
+            try { $process.Kill() } catch {}
+            $terminated = $process.WaitForExit(2000)
+        } else {
+            # Flush redirected asynchronous output after the process handle was
+            # signaled. This overload returns immediately for an exited process.
+            $process.WaitForExit()
+        }
+        if (-not $terminated) {
+            return "foreground sshd stayed running for ${TimeoutMs}ms and could not be stopped within 2000ms"
+        }
+
+        $output = @([string]$stderrTask.Result, [string]$stdoutTask.Result) -join ' '
+        $output = (($output -replace '[\r\n]+', ' ') -replace '\s{2,}', ' ').Trim()
+        if ($output.Length -gt 1800) { $output = '...' + $output.Substring($output.Length - 1800) }
+        if ($stayedRunning) {
+            return "foreground sshd stayed running for ${TimeoutMs}ms and was stopped by diagnostics; output: $(if ($output) { $output } else { 'none' })"
+        }
+        return "foreground sshd exit=$($process.ExitCode); output: $(if ($output) { $output } else { 'none' })"
+    } catch {
+        return "foreground diagnostic failed: $($_.Exception.Message)"
+    } finally {
+        $process.Dispose()
+        $global:LASTEXITCODE = 0
+    }
+}
+
+function Get-SshdRuntimeDiagnostic {
+    $parts = New-Object System.Collections.Generic.List[string]
+    try {
+        $windows = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
+        [void]$parts.Add("Windows=$($windows.DisplayVersion) build=$($windows.CurrentBuild).$($windows.UBR)")
+    } catch {
+        [void]$parts.Add("Windows build query failed: $($_.Exception.Message)")
+    }
+
+    try {
+        $sshd = Get-SshdExe
+        if ($sshd) {
+            $item = Get-Item -LiteralPath $sshd -ErrorAction Stop
+            [void]$parts.Add("sshd version=$($item.VersionInfo.FileVersion) product=$($item.VersionInfo.ProductVersion) size=$($item.Length)B")
+        } else {
+            [void]$parts.Add('sshd version unavailable: executable not found')
+        }
+    } catch {
+        [void]$parts.Add("sshd version query failed: $($_.Exception.Message)")
+    }
+    return ($parts -join ', ')
+}
+
 function Get-SshdFailureDetails {
     $details = New-Object System.Collections.Generic.List[string]
+    $service = $null
     try {
         $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
-        [void]$details.Add("service state=$($service.State), exit=$($service.ExitCode), service-exit=$($service.ServiceSpecificExitCode), path=$($service.PathName)")
+        [void]$details.Add("service state=$($service.State), account=$($service.StartName), exit=$($service.ExitCode), service-exit=$($service.ServiceSpecificExitCode), path=$($service.PathName)")
     } catch {
         [void]$details.Add("service query failed: $($_.Exception.Message)")
     }
@@ -594,6 +733,35 @@ function Get-SshdFailureDetails {
     } else {
         [void]$details.Add('no recent OpenSSH event was found')
     }
+    [void]$details.Add((Get-SshdRuntimeDiagnostic))
+
+    try {
+        $applicationEvent = Get-WinEvent -FilterHashtable @{
+            LogName = 'Application'
+            StartTime = (Get-Date).AddMinutes(-30)
+        } -MaxEvents 300 -ErrorAction Stop |
+            Where-Object { $_.Message -match 'sshd(?:\.exe)?|OpenSSH' } |
+            Select-Object -First 1
+        if ($applicationEvent) {
+            $applicationMessage = (([string]$applicationEvent.Message -replace '[\r\n]+', ' ') -replace '\s{2,}', ' ').Trim()
+            if ($applicationMessage.Length -gt 900) { $applicationMessage = $applicationMessage.Substring(0, 900) + '...' }
+            [void]$details.Add("application event $($applicationEvent.Id)/$($applicationEvent.ProviderName): $applicationMessage")
+        } else {
+            [void]$details.Add('no recent sshd Application crash event was found')
+        }
+    } catch {
+        [void]$details.Add("Application event query failed: $($_.Exception.Message)")
+    }
+
+    if ($script:SshPort) {
+        [void]$details.Add((Get-TcpPortDiagnostic -Port $script:SshPort))
+    }
+    [void]$details.Add((Get-SshHostKeyDiagnostic))
+    if ($service -and $service.State -eq 'Stopped') {
+        [void]$details.Add((Get-SshdForegroundDiagnostic))
+    } else {
+        [void]$details.Add('foreground diagnostic skipped because sshd service is not stopped')
+    }
     return ($details -join '; ')
 }
 
@@ -625,7 +793,9 @@ function Assert-SshdHealthy {
 }
 
 function Select-SshPort {
-    $primaryState = Get-TcpPortListenerState -Port 22
+    $primaryListenerState = Get-TcpPortListenerState -Port 22
+    $primaryExcluded = $primaryListenerState -eq 'Free' -and (Test-TcpPortExcluded -Port 22)
+    $primaryState = if ($primaryExcluded) { 'Excluded' } else { $primaryListenerState }
     if ($primaryState -in @('Free', 'Sshd')) {
         $script:SshPort = 22
         if ($primaryState -eq 'Free') {
@@ -641,18 +811,21 @@ function Select-SshPort {
         return
     }
 
-    $fallbackState = Get-TcpPortListenerState -Port 222
+    $fallbackListenerState = Get-TcpPortListenerState -Port 222
+    $fallbackExcluded = $fallbackListenerState -eq 'Free' -and (Test-TcpPortExcluded -Port 222)
+    $fallbackState = if ($fallbackExcluded) { 'Excluded' } else { $fallbackListenerState }
     if ($fallbackState -in @('Free', 'Sshd')) {
         $script:SshPort = 222
         if ($fallbackState -eq 'Free') {
-            Write-Warn "TCP port 22 is in use by another process; configuring SSH on port $script:SshPort"
+            $primaryReason = if ($primaryExcluded) { 'excluded by Windows' } else { 'in use by another process' }
+            Write-Warn "TCP port 22 is $primaryReason; configuring SSH on port $script:SshPort"
         } else {
             Write-Log "TCP port 222 is already used by sshd; keeping SSH on port $script:SshPort"
         }
         return
     }
 
-    throw 'TCP ports 22 and 222 are both in use; cannot configure SSH'
+    throw "TCP ports 22 and 222 are unavailable (22=$primaryState, 222=$fallbackState); cannot configure SSH"
 }
 
 function Write-SshdConfigLines {
@@ -829,12 +1002,41 @@ function Initialize-SshdConfig {
     Write-Log "Created missing sshd_config from OpenSSH default template"
 }
 
+function Set-SshHostPrivateKeyAcl {
+    param([Parameter(Mandatory)][string]$Path)
+
+    & takeown.exe /F $Path /A | Out-Null
+    Assert-NativeCommandSucceeded "take ownership of SSH host key: $Path"
+    & icacls.exe $Path /reset | Out-Null
+    Assert-NativeCommandSucceeded "reset SSH host key ACL: $Path"
+    & icacls.exe $Path /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
+    Assert-NativeCommandSucceeded "grant SSH host key ACL: $Path"
+    & icacls.exe $Path '/inheritance:r' | Out-Null
+    Assert-NativeCommandSucceeded "disable SSH host key ACL inheritance: $Path"
+    & icacls.exe $Path /setowner '*S-1-5-32-544' | Out-Null
+    Assert-NativeCommandSucceeded "set SSH host key owner: $Path"
+}
+
+function Get-SshHostKeyDiagnostic {
+    $sshDir = Join-Path $env:ProgramData 'ssh'
+    $keys = @(Get-ChildItem -LiteralPath $sshDir -Filter 'ssh_host_*_key' -File -ErrorAction SilentlyContinue)
+    if ($keys.Count -eq 0) { return 'host private keys=none' }
+
+    $items = @(
+        foreach ($key in $keys) {
+            try {
+                $acl = Get-Acl -LiteralPath $key.FullName -ErrorAction Stop
+                "$($key.Name):$($key.Length)B owner=$($acl.Owner) inherited=$(-not $acl.AreAccessRulesProtected)"
+            } catch {
+                "$($key.Name):$($key.Length)B ACL-error=$($_.Exception.Message)"
+            }
+        }
+    )
+    return "host private keys=$($items -join ', ')"
+}
+
 function Initialize-SshHostKeys {
     $sshDir = Join-Path $env:ProgramData 'ssh'
-    if (Test-Path -LiteralPath $sshDir -PathType Container) {
-        $keys = @(Get-ChildItem -LiteralPath $sshDir -Filter 'ssh_host_*_key' -ErrorAction SilentlyContinue)
-        if ($keys.Count -gt 0) { return }
-    }
 
     $keygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
     if (-not $keygen) {
@@ -848,9 +1050,15 @@ function Initialize-SshHostKeys {
         return
     }
 
-    Write-Log 'Generating missing OpenSSH host keys...'
+    Write-Log 'Ensuring all OpenSSH host keys exist...'
     & $keygen.Source -A | Out-Null
     Assert-NativeCommandSucceeded 'ssh-keygen -A host key generation'
+
+    $keys = @(Get-ChildItem -LiteralPath $sshDir -Filter 'ssh_host_*_key' -File -ErrorAction Stop)
+    if ($keys.Count -eq 0) { throw 'ssh-keygen -A completed, but no SSH host private key exists' }
+    foreach ($key in $keys) {
+        Set-SshHostPrivateKeyAcl -Path $key.FullName
+    }
 }
 
 function Assert-SshdConfigValid {
@@ -989,6 +1197,9 @@ function Enable-OpenSSHServer {
                 $listenerState = Wait-TcpPortListenerState -Port $SshPort -DesiredStates @('Free', 'Other')
                 if ($listenerState -eq 'Sshd') {
                     throw "an sshd process is still listening on TCP port $SshPort before retry"
+                }
+                if ($listenerState -eq 'Other') {
+                    throw "TCP port $SshPort was taken by another process before sshd retry"
                 }
 
                 $backup = Repair-SshdConfigFromDefault -ConfigPath $cfg -TemplatePath $defaultCfg `
