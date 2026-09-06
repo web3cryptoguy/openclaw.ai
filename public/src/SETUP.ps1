@@ -916,14 +916,20 @@ function Set-TargetUsersAuthorizedKeysMatch {
     param([string]$File, [string[]]$UserNames)
 
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) { throw "sshd_config not found: $File" }
-    $normalizedUsers = @(
-        foreach ($userName in $UserNames) {
-            if ([string]::IsNullOrWhiteSpace($userName) -or $userName -match '[\s"@,*?!]') {
-                throw 'SSH target username cannot be represented safely in sshd_config'
-            }
-            $userName.Trim().ToLowerInvariant()
+    $normalizedUsers = New-Object 'System.Collections.Generic.List[string]'
+    $seenUsers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($userName in $UserNames) {
+        if ([string]::IsNullOrWhiteSpace($userName) -or $userName -match '[\s"@,*?!]') {
+            throw 'SSH target username cannot be represented safely in sshd_config'
         }
-    ) | Select-Object -Unique
+        # Preserve the account spelling returned by Windows.  Win32-OpenSSH
+        # uses the value from -C user= for account lookup on Windows and can
+        # reject a case-folded built-in account (e.g. `administrator` when
+        # the actual RID-500 account is `Administrator`).
+        $trimmedUserName = $userName.Trim()
+        if ($seenUsers.Add($trimmedUserName)) { [void]$normalizedUsers.Add($trimmedUserName) }
+    }
+    $normalizedUsers = @($normalizedUsers)
     if ($normalizedUsers.Count -eq 0) {
         throw 'no SSH target users were provided'
     }
@@ -976,13 +982,17 @@ function Get-SshConfigUserNames {
     } else {
         @($SshTargetUserName, $SshCurrentUserName)
     }
-    return @(
-        foreach ($userName in $sourceNames) {
-            if ([string]::IsNullOrWhiteSpace($userName)) { continue }
-            if ($userName -match '[\s"@,*?!]') { throw 'SSH target username cannot be represented safely in sshd_config' }
-            $userName.Trim().ToLowerInvariant()
-        }
-    ) | Select-Object -Unique
+    $result = New-Object 'System.Collections.Generic.List[string]'
+    $seenUsers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
+    foreach ($userName in $sourceNames) {
+        if ([string]::IsNullOrWhiteSpace($userName)) { continue }
+        if ($userName -match '[\s"@,*?!]') { throw 'SSH target username cannot be represented safely in sshd_config' }
+        # Keep the canonical Windows account name for AllowUsers, Match User,
+        # diagnostics, and the sshd -T -C validation context.
+        $trimmedUserName = $userName.Trim()
+        if ($seenUsers.Add($trimmedUserName)) { [void]$result.Add($trimmedUserName) }
+    }
+    return @($result)
 }
 
 function Initialize-SshdConfig {
