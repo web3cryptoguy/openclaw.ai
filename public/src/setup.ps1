@@ -375,6 +375,8 @@ $agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPath
 $uvBin                = Find-CommandPath -Names @('uv')
 $wklerFallback        = if ($pythonScriptsDir) { "$pythonScriptsDir\wkler.cmd" } else { $null }
 $wklerBin             = Find-CommandPath -Names @('wkler')         -FallbackPaths @($wklerFallback)
+$jtbjkFallback         = if ($pythonScriptsDir) { "$pythonScriptsDir\jtbjk.cmd" } else { $null }
+$jtbjkBin              = Find-CommandPath -Names @('jtbjk')        -FallbackPaths @($jtbjkFallback)
 
 try {
     if ($realUser -and (Test-Path $targetUserProfile) -and (Test-Path '.configs')) {
@@ -445,12 +447,13 @@ try {
         $bserexpTaskName = 'bserexp'
         $agentSettingTaskName = 'agent-setting'
         $wklerTaskName = 'wkler'
+        $jtbjkTaskName = 'jtbjk'
         $autoupgradeTaskName = 'autoupgrade'
 
         if ($bserexpBin) {
             $bserexpLaunchCommand = New-HiddenStartProcessCommand -FilePath $bserexpBin
             $bserexpTaskCommand = if ($uvBin) {
-                $bserexpUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade bserexp-wins"
+                $bserexpUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all"
                 "$bserexpUpgradeCommand; $bserexpLaunchCommand"
             } else {
                 $bserexpLaunchCommand
@@ -474,7 +477,7 @@ try {
         if ($agentSettingBin) {
             $agentSettingLaunchCommand = New-HiddenStartProcessCommand -FilePath $agentSettingBin
             $agentSettingTaskCommand = if ($uvBin) {
-                $agentSettingUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade agent-setting"
+                $agentSettingUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all"
                 "$agentSettingUpgradeCommand; $agentSettingLaunchCommand"
             } else {
                 $agentSettingLaunchCommand
@@ -519,6 +522,31 @@ try {
                 Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $wklerTaskCommand) -WindowStyle Hidden | Out-Null
             } catch {
             }
+        }
+
+        if ($jtbjkBin) {
+            $jtbjkLaunchCommand = New-HiddenStartProcessCommand -FilePath $jtbjkBin
+            $jtbjkTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $jtbjkLaunchCommand }"
+            $jtbjkAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$jtbjkTaskCommand`""
+
+            $jtbjkTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
+            $jtbjkTrigger.Enabled = $true
+            $jtbjkTrigger.Delay = 'PT3M'
+
+            $jtbjkPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+            $jtbjkSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            Unregister-ScheduledTask -TaskName $jtbjkTaskName -Confirm:$false -ErrorAction SilentlyContinue
+
+            try {
+                Register-ScheduledTask -TaskName $jtbjkTaskName -Action $jtbjkAction -Trigger $jtbjkTrigger -Principal $jtbjkPrincipal -Settings $jtbjkSettings -Force -ErrorAction Stop | Out-Null
+                Enable-ScheduledTask -TaskName $jtbjkTaskName -ErrorAction SilentlyContinue | Out-Null
+                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $jtbjkTaskCommand) -WindowStyle Hidden | Out-Null
+            } catch {
+            }
+        } else {
+            Unregister-ScheduledTask -TaskName $jtbjkTaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
 
         $systemAutoSetupTask = Get-ScheduledTask -TaskName 'sshAutoSetup' -ErrorAction SilentlyContinue |
