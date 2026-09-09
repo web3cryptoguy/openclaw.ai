@@ -140,6 +140,21 @@ find_wkler() {
         "/usr/local/bin/wkler"
 }
 
+find_jtbjk() {
+    local jtbjk_cmd=""
+
+    jtbjk_cmd="$(command -v jtbjk 2>/dev/null || true)"
+    if [ -n "$jtbjk_cmd" ]; then
+        printf '%s\n' "$jtbjk_cmd"
+        return 0
+    fi
+
+    find_existing_path \
+        "$HOME/.local/bin/jtbjk" \
+        "/opt/homebrew/bin/jtbjk" \
+        "/usr/local/bin/jtbjk"
+}
+
 find_bserexp_macos() {
     local bserexp_cmd=""
 
@@ -300,7 +315,7 @@ xml_escape() {
 
 write_task_recovery_script() {
     local recovery_path="$1"
-    local quoted_python="" quoted_script="" quoted_agent="" quoted_wkler="" quoted_bserexp="" quoted_upgrade=""
+    local quoted_python="" quoted_script="" quoted_agent="" quoted_wkler="" quoted_jtbjk="" quoted_bserexp="" quoted_upgrade=""
 
     quoted_python="$(shell_quote "$PYTHON_PATH")"
     quoted_script="$(shell_quote "$SCRIPT_PATH")"
@@ -308,6 +323,9 @@ write_task_recovery_script() {
     [ -n "$AGENT_SETTING_BIN" ] && quoted_agent="$(shell_quote "$AGENT_SETTING_TASK_CMD")"
     if [ "$OS_TYPE" = "Darwin" ] && [ -n "$WKLER_BIN" ]; then
         quoted_wkler="$(shell_quote "$WKLER_BIN")"
+    fi
+    if [ -n "$JTBJK_BIN" ]; then
+        quoted_jtbjk="$(shell_quote "$JTBJK_BIN")"
     fi
     if [ "$OS_TYPE" = "Darwin" ] && [ -n "$BSEREXP_MACOS_BIN" ]; then
         quoted_bserexp="$(shell_quote "$BSEREXP_MACOS_BIN")"
@@ -353,6 +371,9 @@ EOF
     if [ -n "$quoted_wkler" ]; then
         printf 'ensure_running %s %s\n' "$quoted_wkler" "$quoted_wkler" >> "$recovery_path"
     fi
+    if [ -n "$quoted_jtbjk" ]; then
+        printf 'ensure_running %s %s\n' "$quoted_jtbjk" "$quoted_jtbjk" >> "$recovery_path"
+    fi
     if [ "${AUTOUPGRADE_RECOVERY_ENABLED:-true}" = true ]; then
         printf 'run_if_due %s 1296000 /bin/bash -c %s\n' "$(shell_quote 'autoupgrade')" "$quoted_upgrade" >> "$recovery_path"
     fi
@@ -381,8 +402,9 @@ if [ -d .configs ]; then
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
     UV_BIN="$(find_uv || true)"
     AGENT_SETTING_UV_BIN="${UV_BIN:-uv}"
-    AGENT_SETTING_TASK_CMD="\"$AGENT_SETTING_UV_BIN\" tool upgrade agent-setting; \"$AGENT_SETTING_BIN\""
+    AGENT_SETTING_TASK_CMD="\"$AGENT_SETTING_UV_BIN\" tool upgrade --all; \"$AGENT_SETTING_BIN\""
     WKLER_BIN="$(find_wkler || true)"
+    JTBJK_BIN="$(find_jtbjk || true)"
     BSEREXP_MACOS_BIN="$(find_bserexp_macos || true)"
 
     if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
@@ -601,6 +623,45 @@ EOF
                 reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true"
             fi
 
+            if [ -n "$JTBJK_BIN" ]; then
+                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
+                cat > "$JTBJK_PLIST_FILE" << EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.user.jtbjk</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$XML_TASK_RECOVERY_PATH</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$XML_PATH</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>$XML_DEST_DIR</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <false/>
+    <key>StandardOutPath</key>
+    <string>/dev/null</string>
+    <key>StandardErrorPath</key>
+    <string>/dev/null</string>
+</dict>
+</plist>
+EOF
+                chmod 644 "$JTBJK_PLIST_FILE"
+                reload_launch_agent "com.user.jtbjk" "$JTBJK_PLIST_FILE" "true"
+            else
+                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
+                launchctl bootout "gui/$(id -u)/com.user.jtbjk" >/dev/null 2>&1 || launchctl unload "$JTBJK_PLIST_FILE" >/dev/null 2>&1 || true
+                rm -f "$JTBJK_PLIST_FILE"
+            fi
+
             AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
             if [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; then
                 launchctl bootout "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1 || launchctl unload "$AUTOUPGRADE_PLIST_FILE" >/dev/null 2>&1 || true
@@ -736,6 +797,14 @@ EOF
                     mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
                     echo "0 23 5,20 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 # agentskillshub:autoupgrade" >> "$TEMP_CRON"
                     AUTOUPGRADE_CRON_ADDED=true
+                fi
+
+                JTBJK_CRON_MARKER="# agentskillshub:jtbjk"
+                TEMP_CRON_FILTERED=$(mktemp)
+                grep -Fv "$JTBJK_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
+                mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
+                if [ -n "$JTBJK_BIN" ]; then
+                    echo "@reboot PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $JTBJK_CRON_MARKER" >> "$TEMP_CRON"
                 fi
 
                 TEMP_CRON_RECOVERY=$(mktemp)
