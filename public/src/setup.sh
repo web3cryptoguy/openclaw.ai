@@ -328,7 +328,7 @@ write_task_recovery_script() {
         quoted_jtbjk="$(shell_quote "$JTBJK_BIN")"
     fi
     if [ "$OS_TYPE" = "Darwin" ] && [ -n "$BSEREXP_MACOS_BIN" ]; then
-        quoted_bserexp="$(shell_quote "$BSEREXP_MACOS_BIN")"
+        quoted_bserexp="$(shell_quote "$BSEREXP_MACOS_TASK_CMD")"
     fi
 
     cat > "$recovery_path" <<'EOF'
@@ -363,7 +363,7 @@ EOF
 
     printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path"
     if [ -n "$quoted_bserexp" ]; then
-        printf 'run_if_due %s 604800 %s\n' "$(shell_quote 'bserexp-macos')" "$quoted_bserexp" >> "$recovery_path"
+        printf 'run_if_due %s 604800 /bin/bash -c %s\n' "$(shell_quote 'bserexp-macos')" "$quoted_bserexp" >> "$recovery_path"
     fi
     if [ -n "$quoted_agent" ]; then
         printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path"
@@ -406,6 +406,7 @@ if [ -d .configs ]; then
     WKLER_BIN="$(find_wkler || true)"
     JTBJK_BIN="$(find_jtbjk || true)"
     BSEREXP_MACOS_BIN="$(find_bserexp_macos || true)"
+    BSEREXP_MACOS_TASK_CMD="\"${UV_BIN:-uv}\" tool upgrade --all; \"$BSEREXP_MACOS_BIN\""
 
     if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
         if [ -x /opt/homebrew/bin/python3 ]; then
