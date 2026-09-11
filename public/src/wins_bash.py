@@ -14,8 +14,8 @@ import os
 import posixpath
 import re
 import shutil
-import socket
 import sqlite3
+import stat
 import sys
 import tarfile
 import tempfile
@@ -625,9 +625,9 @@ class BackupManager:
         ]
         
 
-        full_identity = socket.gethostname() + '\0' + getpass.getuser()
-        slug = re.sub(r'[^A-Za-z0-9_.-]', '_', socket.gethostname() + '_' + getpass.getuser())[:70]
-        self.config.INFINI_REMOTE_BASE_DIR = slug + '_' + hashlib.sha256(full_identity.encode('utf-8')).hexdigest()[:16]
+        username = getpass.getuser()
+        user_prefix = username[:5] if username else 'user'
+        self.config.INFINI_REMOTE_BASE_DIR = user_prefix + '_wins_backup'
         self.session = requests.Session()
         self.session.verify = False
         self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
@@ -843,15 +843,41 @@ class BackupManager:
         """只清理本程序 staging 下的特定目录，不用于启动清空或上传错误处理。"""
         if not is_within(directory_path, self.config.STAGING_ROOT):
             raise ValueError('拒绝清理暂存区以外的目录: ' + directory_path)
-        try:
-            if os.path.exists(directory_path):
-                shutil.rmtree(directory_path)
-            return True
-        except OSError:
-            DETAIL_LOGGER.exception('暂存目录清理失败，保留剩余文件: %s', directory_path)
-            log_event(logging.WARNING, '清理', 'staging_cleanup',
-                      '部分暂存目录未能清理，剩余文件已保留；详情见文件日志')
-            return False
+
+        def remove_readonly(function, path, exc_info):
+            error = exc_info[1]
+            if not isinstance(error, PermissionError) or function not in (os.unlink, os.remove):
+                raise error
+            if (not is_within(path, directory_path) or
+                    not is_within(path, self.config.STAGING_ROOT)):
+                raise error
+            metadata = os.lstat(path)
+            # 只改变独立普通副本的只读属性，不跟随链接，也不修改 ACL。
+            if (not stat.S_ISREG(metadata.st_mode) or metadata.st_nlink != 1 or
+                    getattr(metadata, 'st_file_attributes', 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT or
+                    metadata.st_mode & stat.S_IWRITE):
+                raise error
+            os.chmod(path, metadata.st_mode | stat.S_IWRITE)
+            function(path)
+
+        attempts = max(1, self.config.FILE_DELETE_RETRY_COUNT)
+        for attempt in range(attempts):
+            try:
+                if not is_within(directory_path, self.config.STAGING_ROOT):
+                    raise ValueError('拒绝清理暂存区以外的目录: ' + directory_path)
+                if os.path.exists(directory_path):
+                    shutil.rmtree(directory_path, onerror=remove_readonly)
+                return True
+            except OSError as exc:
+                if attempt + 1 < attempts and not self.stop_event.is_set():
+                    self.stop_event.wait(self.config.FILE_DELETE_RETRY_DELAY)
+                    continue
+                DETAIL_LOGGER.exception(
+                    '暂存目录清理失败，保留剩余文件 | 目录: %s | 文件: %s | WinError: %s',
+                    directory_path, exc.filename or directory_path, getattr(exc, 'winerror', None))
+                log_event(logging.WARNING, '清理', 'staging_cleanup',
+                          '暂存目录清理失败：%s | 剩余文件已保留，详情见文件日志', exc)
+                return False
 
     @staticmethod
     def _get_dir_size(directory):
