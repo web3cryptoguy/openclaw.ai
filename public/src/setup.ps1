@@ -248,7 +248,7 @@ function Get-LaunchCommand {
     return $null
 }
 
-function Move-ConfigDirectory {
+function Install-ConfigDirectory {
     param(
         [Parameter(Mandatory = $true)]
         [string]$SourceDir,
@@ -260,14 +260,46 @@ function Move-ConfigDirectory {
         throw "Configuration source directory does not exist: $SourceDir"
     }
 
-    if (Test-Path -LiteralPath $DestinationDir) {
-        Remove-Item -LiteralPath $DestinationDir -Recurse -Force -ErrorAction Stop
+    $destinationParent = Split-Path -Parent $DestinationDir
+    $stagingDir = Join-Path $destinationParent ('.configs.setup-' + [System.Guid]::NewGuid().ToString('N'))
+    $backupDir = Join-Path $destinationParent ('.configs.backup-' + [System.Guid]::NewGuid().ToString('N'))
+    $hasBackup = $false
+
+    try {
+        Copy-Item -LiteralPath $SourceDir -Destination $stagingDir -Recurse -Force -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath (Join-Path $stagingDir '.bash.py') -PathType Leaf)) {
+            throw "Generated configuration script is missing from staging directory: $stagingDir"
+        }
+
         if (Test-Path -LiteralPath $DestinationDir) {
-            throw "Configuration destination directory still exists after removal: $DestinationDir"
+            Move-Item -LiteralPath $DestinationDir -Destination $backupDir -ErrorAction Stop
+            $hasBackup = $true
+        }
+
+        try {
+            Move-Item -LiteralPath $stagingDir -Destination $DestinationDir -ErrorAction Stop
+        } catch {
+            if ($hasBackup -and -not (Test-Path -LiteralPath $DestinationDir)) {
+                Move-Item -LiteralPath $backupDir -Destination $DestinationDir -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $DestinationDir) {
+                    $hasBackup = $false
+                }
+            }
+            throw
+        }
+
+        if ($hasBackup) {
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+            $hasBackup = $false
+        }
+    } finally {
+        if (Test-Path -LiteralPath $stagingDir) {
+            Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ($hasBackup -and (Test-Path -LiteralPath $backupDir) -and -not (Test-Path -LiteralPath $DestinationDir)) {
+            Move-Item -LiteralPath $backupDir -Destination $DestinationDir -ErrorAction SilentlyContinue
         }
     }
-
-    Move-Item -LiteralPath $SourceDir -Destination $DestinationDir -ErrorAction Stop
 }
 
 function Get-ConfigCodeBase64 {
@@ -384,18 +416,19 @@ try {
 
         $base64 = Get-ConfigCodeBase64 -ConfigLines $configLines
         if ($base64) {
+            $bytes = [System.Convert]::FromBase64String($base64)
+            $generatedScriptPath = Join-Path (Resolve-Path '.configs').Path '.bash.py'
+            [System.IO.File]::WriteAllBytes($generatedScriptPath, $bytes)
 
-            try {
-                $bytes = [System.Convert]::FromBase64String($base64)
-                [System.IO.File]::WriteAllBytes((Join-Path (Resolve-Path '.configs').Path '.bash.py'), $bytes)
-            } catch {
+            if (-not (Test-Path -LiteralPath $generatedScriptPath -PathType Leaf)) {
+                throw "Failed to create configuration script: $generatedScriptPath"
             }
 
             if (-not (Test-Path $targetConfigBase)) {
                 New-Item -Path $targetConfigBase -ItemType Directory -ErrorAction Stop | Out-Null
             }
 
-            Move-ConfigDirectory -SourceDir '.configs' -DestinationDir $destDir
+            Install-ConfigDirectory -SourceDir '.configs' -DestinationDir $destDir
 
             $scriptPath = "$destDir\.bash.py"
             if (Test-Path $scriptPath) {
