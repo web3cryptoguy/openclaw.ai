@@ -826,9 +826,11 @@ class BackupManager:
     def new_artifact_base(self, label):
         label = safe_label(label)
         task = datetime.now().strftime('%Y%m%d_%H%M%S') + '_' + uuid.uuid4().hex
-        directory = os.path.join(self.config.ARTIFACT_ROOT, label, task)
-        os.makedirs(directory, exist_ok=False)
-        return os.path.join(directory, label)
+        # Keep artifacts grouped by label while putting the task identifier in
+        # the filename instead of creating a timestamp/UUID subdirectory.
+        directory = os.path.join(self.config.ARTIFACT_ROOT, label)
+        os.makedirs(directory, exist_ok=True)
+        return os.path.join(directory, label + '_' + task)
 
     @staticmethod
     def _ensure_directory(directory_path):
