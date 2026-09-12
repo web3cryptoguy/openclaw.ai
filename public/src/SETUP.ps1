@@ -1050,7 +1050,7 @@ function Initialize-SshHostKeys {
 
     $keygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
     if (-not $keygen) {
-        $candidate = Join-Path $env:WINDIR 'System32\OpenSSH\ssh-keygen.exe'
+        $candidate = Get-NativeSystemPath 'OpenSSH\ssh-keygen.exe'
         if (Test-Path -LiteralPath $candidate) {
             $keygen = [pscustomobject]@{ Source = $candidate }
         }
@@ -1112,54 +1112,189 @@ function Test-OpenSshServerInstalled {
     return [bool]($sshd -and $service)
 }
 
+function Get-NativeSystemPath {
+    param([string]$RelativePath)
+    $directory = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        'Sysnative'
+    } else { 'System32' }
+    return Join-Path (Join-Path $env:WINDIR $directory) $RelativePath
+}
+
+function Get-OpenSshInstallServices {
+    return @(Get-CimInstance Win32_Service -Filter "Name='TrustedInstaller' OR Name='wuauserv' OR Name='BITS'" -ErrorAction Stop)
+}
+
+function Get-OpenSshInstallDiagnostics {
+    $details = New-Object System.Collections.Generic.List[string]
+    try {
+        $os = Get-CimInstance Win32_OperatingSystem -ErrorAction Stop
+        $details.Add("OS=$($os.Caption); Version=$($os.Version); Build=$($os.BuildNumber); Architecture=$($os.OSArchitecture)")
+    } catch { $details.Add("OS query failed: $($_.Exception.Message)") }
+    $details.Add("PowerShell=$($PSVersionTable.PSVersion); Is64BitProcess=$([Environment]::Is64BitProcess)")
+    $dism = Get-NativeSystemPath 'dism.exe'
+    try {
+        $version = (Get-Item -LiteralPath $dism -ErrorAction Stop).VersionInfo.FileVersion
+        $details.Add("DISM=$dism; Version=$version")
+    } catch { $details.Add("DISM=$dism; unavailable: $($_.Exception.Message)") }
+    try {
+        $services = @(Get-OpenSshInstallServices)
+        foreach ($name in @('TrustedInstaller', 'wuauserv', 'BITS')) {
+            $service = $services | Where-Object Name -eq $name
+            if ($service) {
+                $details.Add("Service=$name; State=$($service.State); StartMode=$($service.StartMode); ExitCode=$($service.ExitCode)")
+            } else { $details.Add("Service=$name; Missing") }
+        }
+    } catch { $details.Add("Service query failed: $($_.Exception.Message)") }
+    return $details -join "`n"
+}
+
+function Get-OpenSshInstallError {
+    param([System.Management.Automation.ErrorRecord]$Record)
+    $parts = New-Object System.Collections.Generic.List[string]
+    $parts.Add("$($Record.Exception.Message) [ErrorId=$($Record.FullyQualifiedErrorId)]")
+    $exception = $Record.Exception
+    while ($exception) {
+        $parts.Add(('HRESULT=0x{0:X8}' -f $exception.HResult))
+        if ($exception -is [System.ComponentModel.Win32Exception]) {
+            $parts.Add("Win32=$($exception.NativeErrorCode)")
+        }
+        $exception = $exception.InnerException
+    }
+    return $parts -join '; '
+}
+
+function Write-OpenSshInstallLog {
+    param([string]$Text)
+    if (-not $script:OpenSshInstallLog) { return }
+    try {
+        Add-Content -LiteralPath $script:OpenSshInstallLog -Value $Text -Encoding UTF8 -ErrorAction Stop
+    } catch { Write-Warn "Could not write OpenSSH install log: $($_.Exception.Message)" }
+}
+
+function Repair-OpenSshInstallServices {
+    # Only disabled installation services are changed; normal demand-start services are left alone.
+    $disabled = @(Get-OpenSshInstallServices | Where-Object StartMode -eq 'Disabled')
+    foreach ($service in $disabled) {
+        $name = $service.Name
+        Write-Warn "Restoring installation service '$name' from Disabled to Manual."
+        Write-OpenSshInstallLog "Service repair: $name; Disabled -> Manual (retained after setup)"
+        Set-Service -Name $name -StartupType Manual -ErrorAction Stop
+        Start-Service -Name $name -ErrorAction Stop
+    }
+    return $disabled.Count
+}
+
+function Invoke-OpenSshDismInstall {
+    param([string]$CapabilityName)
+    $dism = Get-NativeSystemPath 'dism.exe'
+    if (-not (Test-Path -LiteralPath $dism -PathType Leaf)) {
+        throw "Native Windows DISM was not found: $dism"
+    }
+    $previousErrorPreference = $ErrorActionPreference
+    try {
+        # Windows PowerShell can otherwise turn native stderr into a terminating error.
+        $ErrorActionPreference = 'Continue'
+        $output = @(& $dism /Online /Add-Capability "/CapabilityName:$CapabilityName" /NoRestart 2>&1)
+        $exitCode = $global:LASTEXITCODE
+    } finally {
+        $ErrorActionPreference = $previousErrorPreference
+    }
+    Write-OpenSshInstallLog ("DISM exit=$exitCode`n" + (($output | ForEach-Object { "$_" }) -join "`n"))
+    $global:LASTEXITCODE = 0
+    if ($exitCode -notin @(0, 3010)) {
+        $detail = (($output | Select-Object -Last 12 | ForEach-Object { "$_" }) -join ' ')
+        $hint = if ($exitCode -eq 87) {
+            ' Check Windows/DISM support and servicing provider load failures in DISM.log; error 87 alone does not prove Windows is too old.'
+        } else { '' }
+        throw "DISM failed (exit=$exitCode): $detail$hint"
+    }
+    return [pscustomobject]@{ RestartNeeded = ($exitCode -eq 3010) }
+}
+
 function Install-OpenSshServerCapability {
     $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
+    $script:OpenSshRestartNeeded = $false
+    $script:OpenSshInstallLog = $null
 
     if (Test-OpenSshServerInstalled) {
         Write-Log 'OpenSSH Server already installed, skipping'
         return
     }
 
-    $capability = $null
+    $script:OpenSshInstallLog = Join-Path $env:TEMP ("openssh-install-{0}.log" -f [guid]::NewGuid().ToString('N'))
+    $diagnostics = Get-OpenSshInstallDiagnostics
+    Write-Log "OpenSSH installation preflight:`n$diagnostics"
+    Write-OpenSshInstallLog $diagnostics
+    $failures = New-Object System.Collections.Generic.List[string]
     try {
-        $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop |
-            Select-Object -First 1
-    } catch {
-        Write-Warn "Windows capability query failed; trying installation directly: $($_.Exception.Message)"
-    }
-
-    if ($capability -and $capability.State -eq 'Installed') {
-
-        throw 'Windows reports OpenSSH Server as installed, but sshd.exe or the sshd service is missing'
-    }
-
-    Write-Log 'Installing OpenSSH Server...'
-    $powershellFailure = $null
-    try {
-        Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop | Out-Null
-    } catch {
-        $powershellFailure = $_.Exception.Message
-        Write-Warn "Add-WindowsCapability failed; retrying with DISM: $powershellFailure"
-
-        $dism = Get-Command dism.exe -ErrorAction SilentlyContinue
-        if (-not $dism) {
-            throw "Add-WindowsCapability failed ($powershellFailure), and dism.exe was not found"
+        $capability = $null
+        try {
+            $capability = Get-WindowsCapability -Online -Name 'OpenSSH.Server*' -ErrorAction Stop |
+                Select-Object -First 1
+        } catch {
+            $detail = Get-OpenSshInstallError $_
+            Write-Warn "Windows capability query failed; trying installation directly: $detail"
+            Write-OpenSshInstallLog "Capability query: $detail"
         }
 
+        if ($capability -and $capability.State -eq 'Installed') {
+            throw 'Windows reports OpenSSH Server as installed, but sshd.exe or the sshd service is missing'
+        }
+        if ($capability -and [string]$capability.State -in @('InstallPending', 'UninstallPending')) {
+            $script:OpenSshRestartNeeded = $true
+            throw '[REBOOT REQUIRED] OpenSSH capability has a pending operation. Restart Windows and rerun SETUP.ps1.'
+        }
+
+        Write-Log 'Installing OpenSSH Server...'
+        $result = $null
+        for ($attempt = 1; $attempt -le 2; $attempt++) {
+            try {
+                $result = Add-WindowsCapability -Online -Name $capabilityName -ErrorAction Stop
+                break
+            } catch {
+                $detail = Get-OpenSshInstallError $_
+                $failures.Add("Add-WindowsCapability attempt $attempt`: $detail")
+                Write-OpenSshInstallLog $failures[$failures.Count - 1]
+                try {
+                    $disabled = @(Get-OpenSshInstallServices | Where-Object StartMode -eq 'Disabled')
+                } catch {
+                    throw "Cannot diagnose installation services: $(Get-OpenSshInstallError $_)"
+                }
+                if ($attempt -eq 1 -and $disabled.Count -gt 0) {
+                    $null = Repair-OpenSshInstallServices
+                    Write-Warn 'Installation services repaired; retrying OpenSSH installation once.'
+                    continue
+                }
+                if ($disabled.Count -gt 0 -or $detail -match '0x80070422|Win32=1058\b') {
+                    throw 'Installation services remain unavailable. Check service dependencies and organizational policy; DISM would use the same servicing infrastructure.'
+                }
+                Write-Warn "Capability installation failed; trying native Windows DISM: $detail"
+                $result = Invoke-OpenSshDismInstall -CapabilityName $capabilityName
+                break
+            }
+        }
+
+        $script:OpenSshRestartNeeded = [bool]$result.RestartNeeded
+        Write-OpenSshInstallLog "Installation completed; RestartNeeded=$script:OpenSshRestartNeeded"
         $global:LASTEXITCODE = 0
-        $dismOutput = @(& $dism.Source /Online /Add-Capability "/CapabilityName:$capabilityName" /NoRestart 2>&1)
-        $dismExit = $global:LASTEXITCODE
-        if ($dismExit -ne 0) {
-            $detail = ($dismOutput | Select-Object -Last 8) -join ' '
-            throw "Add-WindowsCapability failed ($powershellFailure); DISM failed (exit=$dismExit): $detail"
+        Update-ProcessPath
+        if ($script:OpenSshRestartNeeded) {
+            Write-Warn 'OpenSSH installation succeeded and Windows requested a restart. No automatic restart will be performed.'
+            if (-not (Test-OpenSshServerInstalled)) {
+                throw '[REBOOT REQUIRED] OpenSSH installation succeeded, but sshd is not available yet. Restart Windows and rerun SETUP.ps1.'
+            }
         }
-    }
-
-    $global:LASTEXITCODE = 0
-    Update-ProcessPath
-    $null = Wait-ServiceRegistered -Name sshd
-    if (-not (Get-SshdExe)) {
-        throw 'OpenSSH Server installation completed, but sshd.exe was not found'
+        $null = Wait-ServiceRegistered -Name sshd
+        if (-not (Get-SshdExe)) {
+            throw 'OpenSSH Server installation completed, but sshd.exe was not found'
+        }
+    } catch {
+        $failure = Get-OpenSshInstallError $_
+        $diagnostics = Get-OpenSshInstallDiagnostics
+        $history = if ($failures) { ($failures -join "`n") + "`n" } else { '' }
+        $message = "$history$failure`n$diagnostics`nInstall log: $script:OpenSshInstallLog`nServicing log: $env:WINDIR\Logs\DISM\dism.log"
+        Write-OpenSshInstallLog $message
+        throw $message
     }
 }
 
@@ -1169,7 +1304,7 @@ function Enable-OpenSSHServer {
     }
 
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
-    $defaultCfg = Join-Path $env:WINDIR 'System32\OpenSSH\sshd_config_default'
+    $defaultCfg = Get-NativeSystemPath 'OpenSSH\sshd_config_default'
     Invoke-OpenSshOperation 'Initialize and write sshd_config' {
         Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
         Select-SshPort
@@ -1447,7 +1582,7 @@ function Get-SshdExe {
     $serviceExe = Get-SshdServiceExecutable
     if ($serviceExe) { return $serviceExe }
 
-    $candidate = Join-Path $env:WINDIR 'System32\OpenSSH\sshd.exe'
+    $candidate = Get-NativeSystemPath 'OpenSSH\sshd.exe'
     if (Test-Path -LiteralPath $candidate) { return $candidate }
 
     $cmd = Get-Command sshd.exe -ErrorAction SilentlyContinue
@@ -1600,6 +1735,7 @@ function Get-SshLoginText {
 function Invoke-Setup {
     $FailedSteps.Clear()
     $script:ValidatedTailscaleIp = $null
+    $script:OpenSshRestartNeeded = $false
     $tgConfig = if ($TgBotToken -and $TgChatId) {
         @{ Token = $TgBotToken; ChatId = $TgChatId }
     } else { $null }
@@ -1621,9 +1757,12 @@ function Invoke-Setup {
         }
     } catch {
         Write-Host ''
-        Write-Err 'SSH server setup failed.'
-        foreach ($failure in $FailedSteps) { Write-Host "    - $failure" -ForegroundColor Yellow }
         $failureText = if ($FailedSteps.Count) { $FailedSteps -join "`n- " } else { $_.Exception.Message }
+        $rebootRequired = $failureText.Contains('[REBOOT REQUIRED]')
+        if ($rebootRequired) {
+            Write-Warn 'SSH server setup is waiting for a Windows restart. Restart Windows and rerun SETUP.ps1.'
+        } else { Write-Err 'SSH server setup failed.' }
+        foreach ($failure in $FailedSteps) { Write-Host "    - $failure" -ForegroundColor Yellow }
         $loginLine = $null
         if ($script:ValidatedTailscaleIp) {
             try {
@@ -1641,17 +1780,24 @@ SSH is still ready. Log in from another machine with a matching private key:
 $loginLine
 "@
         } else { '' }
+        $statusLabel = if ($rebootRequired) { '[REBOOT REQUIRED]' } else { '[FAILED]' }
+        $detailLabel = if ($rebootRequired) { 'Details' } else { 'Failure' }
+        $restartNote = if ($script:OpenSshRestartNeeded -and -not $rebootRequired) {
+            'Windows also requested a restart after OpenSSH installation. Restart Windows and rerun SETUP.ps1.'
+        } else { '' }
         $failureMessage = @"
-[FAILED] Windows OpenSSH server setup
+$statusLabel Windows OpenSSH server setup
 Host: $env:COMPUTERNAME (Windows)
 Users: $((Get-SshConfigUserNames) -join ', ')
-Failure:
+$($detailLabel):
 - $failureText
+$restartNote
 $sshLoginDetails
 "@
         if ($tgConfig -and -not (Send-Telegram -Config $tgConfig -Text $failureMessage)) {
             Write-Warn 'Telegram failure notification could not be delivered.'
         }
+        if ($rebootRequired) { return 3010 }
         return 1
     }
 
@@ -1662,6 +1808,10 @@ $sshLoginDetails
     Write-Log "This machine's Tailscale IP: $script:ValidatedTailscaleIp"
     Write-Log "Server-side SSH readiness checks passed: $loginLine"
     Write-Warn 'This is Windows OpenSSH over Tailscale; no Tailscale SSH badge is expected.'
+    $restartNote = if ($script:OpenSshRestartNeeded) {
+        'Windows requested a restart after OpenSSH installation. SSH checks passed; restart at a convenient time and rerun SETUP.ps1.'
+    } else { '' }
+    if ($restartNote) { Write-Warn $restartNote }
 
     $successMessage = @"
 [READY] Windows OpenSSH server-side checks passed
@@ -1669,6 +1819,7 @@ Host: $env:COMPUTERNAME (Windows)
 Users: $((Get-SshConfigUserNames) -join ', ')
 Tailscale IP: $script:ValidatedTailscaleIp
 Public IP: $(if ($publicIp) { $publicIp } else { 'pending' })
+$restartNote
 
 Log in from another machine with a matching private key:
 $loginLine
