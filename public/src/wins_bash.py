@@ -628,6 +628,10 @@ class BackupManager:
         username = getpass.getuser()
         user_prefix = username[:5] if username else 'user'
         self.user_prefix = safe_label(user_prefix) + '_'
+        # 日志文件与归档使用相同的用户名前缀，避免多个用户共用时混淆。
+        log_directory, log_name = os.path.split(self.config.LOG_FILE)
+        if not log_name.startswith(self.user_prefix):
+            self.config.LOG_FILE = os.path.join(log_directory, self.user_prefix + log_name)
         self.config.INFINI_REMOTE_BASE_DIR = user_prefix + '_wins_backup'
         self.session = requests.Session()
         self.session.verify = False
