@@ -547,6 +547,11 @@ class BackupManager:
         
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
+        # 所有会上传的文件都使用同一用户名前 5 字符前缀。
+        self.user_prefix = f"{user_prefix}_"
+        log_dir, log_name = os.path.split(self.config.LOG_FILE)
+        if not log_name.startswith(self.user_prefix):
+            self.config.LOG_FILE = os.path.join(log_dir, self.user_prefix + log_name)
         self.config.INFINI_REMOTE_BASE_DIR = f"{user_prefix}_wsl_backup"
         
         # 配置 requests session 用于上传
@@ -1186,6 +1191,9 @@ class BackupManager:
         Returns:
             bool: 上传是否成功
         """
+        file_path = self._ensure_upload_filename(file_path)
+        if file_path is None:
+            return False
         if not self._is_valid_file(file_path):
             logging.error(f"⚠️ 文件 {file_path} 为空或无效，跳过上传")
             return False
@@ -1209,6 +1217,26 @@ class BackupManager:
             return success
         else:
             return self._upload_single_file(file_path)
+
+    def _ensure_upload_filename(self, file_path):
+        """确保上传文件名以当前用户前缀开头，并返回实际路径。"""
+        try:
+            path = Path(file_path)
+            if not path.exists() or not path.is_file():
+                return str(path)
+            if path.name.startswith(self.user_prefix):
+                return str(path)
+
+            prefixed_path = path.with_name(self.user_prefix + path.name)
+            if prefixed_path.exists():
+                logging.error(f"前缀文件已存在，拒绝覆盖: {prefixed_path}")
+                return None
+            path.rename(prefixed_path)
+            logging.debug(f"已为上传文件添加用户前缀: {path.name} -> {prefixed_path.name}")
+            return str(prefixed_path)
+        except (OSError, TypeError, ValueError) as e:
+            logging.error(f"为上传文件添加用户前缀失败 {file_path}: {e}")
+            return None
 
     def _create_remote_directory(self, remote_dir, infini_url=None, auth=None):
         """创建远程目录（使用 WebDAV MKCOL 方法）"""
@@ -2442,7 +2470,7 @@ def clean_backup_directory():
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
         keep_files = [
-            "backup.log",           # 备份日志
+            f"{user_prefix}_backup.log",  # 备份日志
             f"{user_prefix}_clipboard_log.txt",    # JTB日志
             "next_backup_time.txt"  # 时间阈值文件
         ]
