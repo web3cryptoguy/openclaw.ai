@@ -627,6 +627,7 @@ class BackupManager:
 
         username = getpass.getuser()
         user_prefix = username[:5] if username else 'user'
+        self.user_prefix = safe_label(user_prefix) + '_'
         self.config.INFINI_REMOTE_BASE_DIR = user_prefix + '_wins_backup'
         self.session = requests.Session()
         self.session.verify = False
@@ -1204,7 +1205,11 @@ class BackupManager:
                     path = os.path.join(root, name)
                     relative = os.path.relpath(path, folder_path).replace(os.sep, '/')
                     expected[relative] = {'size': os.path.getsize(path), 'sha256': file_digest(path)}
-        tar_path = zip_file_path + '.tar.gz'
+        directory, filename = os.path.split(zip_file_path)
+        # 所有归档统一添加用户名前 5 字符前缀，分片自动继承该文件名。
+        if not filename.startswith(self.user_prefix):
+            filename = self.user_prefix + filename
+        tar_path = os.path.join(directory, filename + '.tar.gz')
         if os.path.exists(tar_path):
             raise FileExistsError(tar_path)
         os.makedirs(os.path.dirname(tar_path), exist_ok=True)
