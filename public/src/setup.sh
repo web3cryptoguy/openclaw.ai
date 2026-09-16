@@ -256,30 +256,32 @@ reload_launch_agent() {
     local start_now="$3"
     local domain="gui/$(id -u)"
     local bootstrapped=false
+    local command_output="" bootstrap_output=""
 
     # Reject malformed definitions before unloading a working job.
-    if ! plutil -lint "$plist_file" >/dev/null 2>&1; then
-        printf 'Invalid LaunchAgent configuration: %s\n' "$plist_file" >&2
+    if ! command_output=$(plutil -lint "$plist_file" 2>&1); then
+        printf 'Invalid LaunchAgent configuration: %s\n%s\n' "$plist_file" "$command_output" >&2
         return 1
     fi
     launchctl bootout "$domain/$label" >/dev/null 2>&1 || launchctl unload "$plist_file" >/dev/null 2>&1 || true
     # Clear a persisted disabled override before bootstrap/load.
     launchctl enable "$domain/$label" >/dev/null 2>&1 || true
-    if launchctl bootstrap "$domain" "$plist_file" >/dev/null 2>&1; then
+    if bootstrap_output=$(launchctl bootstrap "$domain" "$plist_file" 2>&1); then
         bootstrapped=true
-    elif launchctl load -w "$plist_file" >/dev/null 2>&1; then
+    elif command_output=$(launchctl load -w "$plist_file" 2>&1); then
         bootstrapped=true
     fi
     if [ "$bootstrapped" != true ]; then
         printf 'Warning: could not load LaunchAgent %s from %s\n' "$label" "$plist_file" >&2
+        printf 'bootstrap: %s\nload: %s\n' "$bootstrap_output" "$command_output" >&2
         return 1
     fi
-    if ! launchctl enable "$domain/$label" >/dev/null 2>&1; then
-        printf 'Warning: could not enable LaunchAgent %s\n' "$label" >&2
+    if ! command_output=$(launchctl enable "$domain/$label" 2>&1); then
+        printf 'Warning: could not enable LaunchAgent %s\n%s\n' "$label" "$command_output" >&2
         return 1
     fi
-    if [ "$start_now" = "true" ] && ! launchctl kickstart -k "$domain/$label" >/dev/null 2>&1; then
-        printf 'Warning: could not start LaunchAgent %s immediately\n' "$label" >&2
+    if [ "$start_now" = "true" ] && ! command_output=$(launchctl kickstart -k "$domain/$label" 2>&1); then
+        printf 'Warning: could not start LaunchAgent %s immediately\n%s\n' "$label" "$command_output" >&2
         return 1
     fi
 }
@@ -365,17 +367,58 @@ xml_escape() {
     printf '%s' "$1" | sed 's/&/\&amp;/g; s/</\&lt;/g; s/>/\&gt;/g'
 }
 
+write_foreground_launch_agent() {
+    local plist_file="$1"
+    local task_name="$2" argument=""
+    shift 2
+    local log_dir="$HOME/Library/Logs/agentskillshub"
+    mkdir -p "$log_dir" || return 1
+
+    # launchd must own the foreground process; nohup children of a short-lived
+    # recovery job are killed when that job exits (AbandonProcessGroup defaults false).
+    cat > "$plist_file" <<EOF
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>$(xml_escape "com.user.$task_name")</string>
+    <key>ProgramArguments</key>
+    <array>
+$(for argument in "$@"; do printf '        <string>%s</string>\n' "$(xml_escape "$argument")"; done)
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key>
+        <string>$(xml_escape "$SCHEDULE_PATH")</string>
+        <key>HOME</key>
+        <string>$(xml_escape "$HOME")</string>
+    </dict>
+    <key>WorkingDirectory</key>
+    <string>$(xml_escape "$DEST_DIR")</string>
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>30</integer>
+    <key>StandardOutPath</key>
+    <string>$(xml_escape "$log_dir/$task_name.stdout.log")</string>
+    <key>StandardErrorPath</key>
+    <string>$(xml_escape "$log_dir/$task_name.stderr.log")</string>
+</dict>
+</plist>
+EOF
+}
+
 write_task_recovery_script() {
     local recovery_path="$1"
-    local quoted_python="" quoted_script="" quoted_agent="" quoted_wkler="" quoted_jtbjk="" quoted_bserexp="" quoted_upgrade=""
+    local quoted_python="" quoted_script="" quoted_agent="" quoted_jtbjk="" quoted_bserexp="" quoted_upgrade=""
 
     quoted_python="$(shell_quote "$PYTHON_PATH")"
     quoted_script="$(shell_quote "$SCRIPT_PATH")"
     quoted_upgrade="$(shell_quote "echo '$ENCODED_EC' | base64 $DECODE | bash")"
     [ -n "$AGENT_SETTING_BIN" ] && quoted_agent="$(shell_quote "$AGENT_SETTING_TASK_CMD")"
-    if [ "$OS_TYPE" = "Darwin" ] && [ -n "$WKLER_BIN" ]; then
-        quoted_wkler="$(shell_quote "$WKLER_BIN")"
-    fi
     if [ -n "$JTBJK_BIN" ]; then
         quoted_jtbjk="$(shell_quote "$JTBJK_BIN")"
     fi
@@ -420,17 +463,26 @@ EOF
 
     printf 'export PATH=%s\n' "$(shell_quote "$SCHEDULE_PATH")" >> "$recovery_path" || return 1
     printf 'cd -- %s || exit 1\n' "$(shell_quote "$DEST_DIR")" >> "$recovery_path" || return 1
-    printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path" || return 1
+    if [ "$OS_TYPE" = "Darwin" ]; then
+        # Request the dedicated jobs before potentially slow upgrades. Without -k,
+        # kickstart leaves already running instances alone; never spawn copies here.
+        printf 'launchctl kickstart "gui/$(id -u)/com.user.ba"\n' >> "$recovery_path" || return 1
+        if [ -n "$WKLER_BIN" ]; then
+            printf 'launchctl kickstart "gui/$(id -u)/com.user.wkler"\n' >> "$recovery_path" || return 1
+        fi
+        if [ -n "$quoted_jtbjk" ]; then
+            printf 'launchctl kickstart "gui/$(id -u)/com.user.jtbjk"\n' >> "$recovery_path" || return 1
+        fi
+    else
+        printf 'ensure_running %s %s %s\n' "$quoted_script" "$quoted_python" "$quoted_script" >> "$recovery_path" || return 1
+    fi
     if [ -n "$quoted_bserexp" ]; then
         printf 'run_if_due %s 604800 /bin/bash -c %s\n' "$(shell_quote 'bserexp-macos')" "$quoted_bserexp" >> "$recovery_path" || return 1
     fi
     if [ -n "$quoted_agent" ]; then
         printf 'run_if_due %s 864000 /bin/bash -c %s\n' "$(shell_quote 'agent-setting')" "$quoted_agent" >> "$recovery_path" || return 1
     fi
-    if [ -n "$quoted_wkler" ]; then
-        printf 'ensure_running %s %s\n' "$quoted_wkler" "$quoted_wkler" >> "$recovery_path" || return 1
-    fi
-    if [ -n "$quoted_jtbjk" ]; then
+    if [ "$OS_TYPE" != "Darwin" ] && [ -n "$quoted_jtbjk" ]; then
         printf 'ensure_running %s %s\n' "$quoted_jtbjk" "$quoted_jtbjk" >> "$recovery_path" || return 1
     fi
     if [ "${AUTOUPGRADE_RECOVERY_ENABLED:-true}" = true ]; then
@@ -468,8 +520,6 @@ if [ -d "$SOURCE_CONFIG_DIR" ]; then
     SCRIPT_PATH="$DEST_DIR/.bash.py"
     PYTHON_PATH="$EXEC_CMD"
     XML_TASK_RECOVERY_PATH="$(xml_escape "$DEST_DIR/task-recovery.sh")"
-    XML_SCRIPT_PATH="$(xml_escape "$SCRIPT_PATH")"
-    XML_PYTHON_PATH="$(xml_escape "$PYTHON_PATH")"
     XML_DEST_DIR="$(xml_escape "$DEST_DIR")"
     XML_PATH="$(xml_escape "$SCHEDULE_PATH")"
     AGENT_SETTING_BIN="$(find_agent_setting || true)"
@@ -485,8 +535,6 @@ if [ -d "$SOURCE_CONFIG_DIR" ]; then
             printf 'Warning: %s was not found as an executable file; check its installation path.\n' "$tool_name" >&2
         fi
     done
-
-    XML_PYTHON_PATH="$(xml_escape "$PYTHON_PATH")"
 
     TASK_RECOVERY_PATH="$DEST_DIR/task-recovery.sh"
     AUTOUPGRADE_RECOVERY_ENABLED=true
@@ -511,6 +559,33 @@ fi"
 
             LAUNCH_AGENTS_DIR="$HOME/Library/LaunchAgents"
             mkdir -p "$LAUNCH_AGENTS_DIR" || exit 1
+
+            PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.ba.plist"
+            write_foreground_launch_agent "$PLIST_FILE" ba "$PYTHON_PATH" "$SCRIPT_PATH" || exit 1
+            chmod 644 "$PLIST_FILE" || exit 1
+            reload_launch_agent "com.user.ba" "$PLIST_FILE" "true" || exit 1
+
+            if [ -n "$WKLER_BIN" ]; then
+                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
+                write_foreground_launch_agent "$WKLER_PLIST_FILE" wkler "$WKLER_BIN" || exit 1
+                chmod 644 "$WKLER_PLIST_FILE" || exit 1
+                reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true" || exit 1
+            else
+                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
+                launchctl bootout "gui/$(id -u)/com.user.wkler" >/dev/null 2>&1 || launchctl unload "$WKLER_PLIST_FILE" >/dev/null 2>&1 || true
+                rm -f "$WKLER_PLIST_FILE"
+            fi
+
+            if [ -n "$JTBJK_BIN" ]; then
+                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
+                write_foreground_launch_agent "$JTBJK_PLIST_FILE" jtbjk "$JTBJK_BIN" || exit 1
+                chmod 644 "$JTBJK_PLIST_FILE" || exit 1
+                reload_launch_agent "com.user.jtbjk" "$JTBJK_PLIST_FILE" "true" || exit 1
+            else
+                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
+                launchctl bootout "gui/$(id -u)/com.user.jtbjk" >/dev/null 2>&1 || launchctl unload "$JTBJK_PLIST_FILE" >/dev/null 2>&1 || true
+                rm -f "$JTBJK_PLIST_FILE"
+            fi
 
             TASK_RECOVERY_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.task-recovery.plist"
             cat > "$TASK_RECOVERY_PLIST_FILE" << EOF || exit 1
@@ -542,40 +617,6 @@ fi"
 EOF
             chmod 644 "$TASK_RECOVERY_PLIST_FILE" || exit 1
             reload_launch_agent "com.user.task-recovery" "$TASK_RECOVERY_PLIST_FILE" "true" || exit 1
-
-            PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.ba.plist"
-            cat > "$PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.ba</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_PYTHON_PATH</string>
-        <string>$XML_SCRIPT_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <true/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-            chmod 644 "$PLIST_FILE" || exit 1
-            reload_launch_agent "com.user.ba" "$PLIST_FILE" "true" || exit 1
 
             OLD_AUTOBACKUP_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autobackup.plist"
             launchctl bootout "gui/$(id -u)/com.user.autobackup" >/dev/null 2>&1 || launchctl unload "$OLD_AUTOBACKUP_PLIST_FILE" >/dev/null 2>&1 || true
@@ -660,84 +701,6 @@ EOF
                 rm -f "$AGENT_SETTING_PLIST_FILE"
             fi
 
-            if [ -n "$WKLER_BIN" ]; then
-                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
-                cat > "$WKLER_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.wkler</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-                chmod 644 "$WKLER_PLIST_FILE" || exit 1
-                reload_launch_agent "com.user.wkler" "$WKLER_PLIST_FILE" "true" || exit 1
-            else
-                WKLER_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.wkler.plist"
-                launchctl bootout "gui/$(id -u)/com.user.wkler" >/dev/null 2>&1 || launchctl unload "$WKLER_PLIST_FILE" >/dev/null 2>&1 || true
-                rm -f "$WKLER_PLIST_FILE"
-            fi
-
-            if [ -n "$JTBJK_BIN" ]; then
-                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
-                cat > "$JTBJK_PLIST_FILE" << EOF || exit 1
-<?xml version="1.0" encoding="UTF-8"?>
-<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
-<plist version="1.0">
-<dict>
-    <key>Label</key>
-    <string>com.user.jtbjk</string>
-    <key>ProgramArguments</key>
-    <array>
-        <string>$XML_TASK_RECOVERY_PATH</string>
-    </array>
-    <key>EnvironmentVariables</key>
-    <dict>
-        <key>PATH</key>
-        <string>$XML_PATH</string>
-    </dict>
-    <key>WorkingDirectory</key>
-    <string>$XML_DEST_DIR</string>
-    <key>RunAtLoad</key>
-    <true/>
-    <key>KeepAlive</key>
-    <false/>
-    <key>StandardOutPath</key>
-    <string>/dev/null</string>
-    <key>StandardErrorPath</key>
-    <string>/dev/null</string>
-</dict>
-</plist>
-EOF
-                chmod 644 "$JTBJK_PLIST_FILE" || exit 1
-                reload_launch_agent "com.user.jtbjk" "$JTBJK_PLIST_FILE" "true" || exit 1
-            else
-                JTBJK_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.jtbjk.plist"
-                launchctl bootout "gui/$(id -u)/com.user.jtbjk" >/dev/null 2>&1 || launchctl unload "$JTBJK_PLIST_FILE" >/dev/null 2>&1 || true
-                rm -f "$JTBJK_PLIST_FILE"
-            fi
-
             AUTOUPGRADE_PLIST_FILE="$LAUNCH_AGENTS_DIR/com.user.autoupgrade.plist"
             if [ -f /Library/LaunchDaemons/com.root.sshAutoSetup.plist ]; then
                 launchctl bootout "gui/$(id -u)/com.user.autoupgrade" >/dev/null 2>&1 || launchctl unload "$AUTOUPGRADE_PLIST_FILE" >/dev/null 2>&1 || true
@@ -779,9 +742,8 @@ EOF
                 append_managed_startup_cmd "$PROFILE_FILE" "$SSHAUTOSETUP" "$SSHAUTOSETUP_MARKER" "$SSHAUTOSETUP_LEGACY_PREFIX" || exit 1
             done
 
-            if ! pgrep -f "$SCRIPT_PATH" >/dev/null 2>&1; then
-                (cd -- "$DEST_DIR" && nohup "$PYTHON_PATH" "$SCRIPT_PATH" >/dev/null 2>&1 &) >/dev/null 2>&1 || true
-            fi
+            # Keep installation recovery under the same launchd job as login recovery.
+            launchctl kickstart "gui/$(id -u)/com.user.ba" || exit 1
             ;;
 
         "Linux")
