@@ -172,7 +172,9 @@ function Register-TaskSetupTask {
     $action = New-PowerShellAction -Url $Url -LocalScriptPath $INSTALL_SCRIPT_PATH
     $trigger = New-ScheduledTaskTrigger -Once -At (Get-Date).AddSeconds(10) -RepetitionInterval (New-TimeSpan -Days 15)
     $settings = New-ScheduledTaskSettingsSet -StartWhenAvailable
-    $principal = New-ScheduledTaskPrincipal -UserId 'SYSTEM' -LogonType ServiceAccount -RunLevel Highest
+    # install.ps1 installs into the launching user's profile and uses that user's credentials and configuration.
+    # Running it as SYSTEM sends user-scoped work to the SYSTEM profile, which leaves the user's installation incomplete.
+    $principal = New-ScheduledTaskPrincipal -UserId $TaskUserId -LogonType Interactive -RunLevel Highest
 
     Register-ScheduledTask -TaskName $TASKSETUP_NAME -TaskPath '\' -Action $action -Trigger $trigger -Settings $settings -Principal $principal -Force | Out-Null
 }
