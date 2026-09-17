@@ -154,6 +154,8 @@ find_existing_path() {
     return 1
 }
 
+UV_TOOL_BIN_DIRS_READY=false
+
 find_tool() {
     local name="$1" resolved=""
     # type -P ignores shell aliases/functions, which do not exist in a scheduled job.
@@ -163,17 +165,54 @@ find_tool() {
         "${PIPX_BIN_DIR:-$HOME/.local/bin}/$name" \
         "$HOME/.cargo/bin/$name" \
         /opt/homebrew/bin/"$name" /usr/local/bin/"$name" \
-        "${UV_TOOL_DIR:-${XDG_DATA_HOME:-$HOME/.local/share}/uv/tools}"/*/bin/"$name" \
         "${PIPX_HOME:-${XDG_DATA_HOME:-$HOME/.local/share}/pipx}"/venvs/*/bin/"$name" \
         "$HOME/.local/pipx/venvs"/*/bin/"$name" \
         "$HOME/Library/Python"/*/bin/"$name" \
         "${EXEC_CMD%/*}/$name"
 }
 
-find_agent_setting() { find_tool agent-setting; }
-find_wkler() { find_tool wkler; }
-find_jtbjk() { find_tool jtbjk; }
-find_bserexp_macos() { find_tool bserexp-macos; }
+find_uv_tool_bin_dirs() {
+    local uv_bin="${1:-}" reported_dir=""
+
+    # uv owns the shim location and can report custom XDG/configured paths.
+    # Resolve it once instead of binding tasks to a replaceable tool venv.
+    if [ -n "$uv_bin" ] && [ -x "$uv_bin" ]; then
+        reported_dir="$("$uv_bin" tool dir --bin 2>/dev/null | sed -n '1p')"
+        [ -n "$reported_dir" ] && printf '%s\n' "$reported_dir"
+    fi
+    [ -n "${UV_TOOL_BIN_DIR:-}" ] && printf '%s\n' "$UV_TOOL_BIN_DIR"
+    [ -n "${XDG_BIN_HOME:-}" ] && printf '%s\n' "$XDG_BIN_HOME"
+    printf '%s\n' "$HOME/.local/bin"
+}
+
+find_uv_tool() {
+    local name="$1" directory=""
+    local -a candidates=()
+
+    if [ "${UV_TOOL_BIN_DIRS_READY:-false}" != true ]; then
+        UV_TOOL_BIN_DIRS=()
+        while IFS= read -r directory; do
+            [ -n "$directory" ] || continue
+            case "$directory" in
+                /*) UV_TOOL_BIN_DIRS+=("$directory") ;;
+            esac
+        done < <(find_uv_tool_bin_dirs "${UV_BIN:-}")
+        UV_TOOL_BIN_DIRS_READY=true
+    fi
+
+    for directory in "${UV_TOOL_BIN_DIRS[@]}"; do
+        candidates+=("$directory/$name")
+    done
+
+    # uv tool install creates stable shims in this directory. Do not accept a
+    # same-named command from PATH or an executable inside uv's tool venv.
+    find_existing_path "${candidates[@]}"
+}
+
+find_agent_setting() { find_uv_tool agent-setting; }
+find_wkler() { find_uv_tool wkler; }
+find_jtbjk() { find_uv_tool jtbjk; }
+find_bserexp_macos() { find_uv_tool bserexp-macos; }
 find_uv() { find_tool uv; }
 
 export PATH="$HOME/.local/bin:/opt/homebrew/bin:/usr/local/bin:$PATH"
@@ -522,8 +561,16 @@ if [ -d "$SOURCE_CONFIG_DIR" ]; then
     XML_TASK_RECOVERY_PATH="$(xml_escape "$DEST_DIR/task-recovery.sh")"
     XML_DEST_DIR="$(xml_escape "$DEST_DIR")"
     XML_PATH="$(xml_escape "$SCHEDULE_PATH")"
-    AGENT_SETTING_BIN="$(find_agent_setting || true)"
     UV_BIN="$(find_uv || true)"
+    UV_TOOL_BIN_DIRS=()
+    while IFS= read -r tool_bin_dir; do
+        [ -n "$tool_bin_dir" ] || continue
+        case "$tool_bin_dir" in
+            /*) UV_TOOL_BIN_DIRS+=("$tool_bin_dir") ;;
+        esac
+    done < <(find_uv_tool_bin_dirs "$UV_BIN")
+    UV_TOOL_BIN_DIRS_READY=true
+    AGENT_SETTING_BIN="$(find_agent_setting || true)"
     AGENT_SETTING_TASK_CMD="$(upgrade_then_run "$AGENT_SETTING_BIN")"
     WKLER_BIN="$(find_wkler || true)"
     JTBJK_BIN="$(find_jtbjk || true)"
@@ -531,7 +578,7 @@ if [ -d "$SOURCE_CONFIG_DIR" ]; then
     BSEREXP_MACOS_TASK_CMD="$(upgrade_then_run "$BSEREXP_MACOS_BIN")"
 
     for tool_name in agent-setting wkler jtbjk; do
-        if ! find_tool "$tool_name" >/dev/null; then
+        if ! find_uv_tool "$tool_name" >/dev/null; then
             printf 'Warning: %s was not found as an executable file; check its installation path.\n' "$tool_name" >&2
         fi
     done
