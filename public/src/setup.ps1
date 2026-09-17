@@ -259,6 +259,113 @@ function Find-ToolPath {
     return Find-CommandPath -Names @("$Name.exe", "$Name.cmd", "$Name.bat", "$Name.ps1")
 }
 
+function Expand-TargetUserPath {
+    param([string]$Path, [string]$UserProfilePath)
+
+    if (-not $Path) { return $null }
+    $expanded = $Path.Trim().Trim('"')
+    if ($UserProfilePath) {
+        if ($expanded -eq '~' -or $expanded.StartsWith('~\') -or $expanded.StartsWith('~/')) {
+            $relativePath = $expanded.Substring(1)
+            while ($relativePath.StartsWith('\') -or $relativePath.StartsWith('/')) {
+                $relativePath = $relativePath.Substring(1)
+            }
+            $expanded = if ($relativePath) { Join-Path $UserProfilePath $relativePath } else { $UserProfilePath }
+        }
+        $replacements = @{
+            '%USERPROFILE%' = $UserProfilePath
+            '%HOME%' = $UserProfilePath
+            '%LOCALAPPDATA%' = "$UserProfilePath\AppData\Local"
+            '%APPDATA%' = "$UserProfilePath\AppData\Roaming"
+        }
+        foreach ($entry in $replacements.GetEnumerator()) {
+            $searchStart = 0
+            while (($matchIndex = $expanded.IndexOf($entry.Key, $searchStart, [StringComparison]::OrdinalIgnoreCase)) -ge 0) {
+                $expanded = $expanded.Substring(0, $matchIndex) + $entry.Value + $expanded.Substring($matchIndex + $entry.Key.Length)
+                $searchStart = $matchIndex + $entry.Value.Length
+            }
+        }
+    }
+    return [Environment]::ExpandEnvironmentVariables($expanded)
+}
+
+function Get-TargetUserEnvironmentVariable {
+    param([string]$Name, [string]$UserSid)
+
+    if (-not $Name -or -not $UserSid) { return $null }
+    $key = $null
+    try {
+        $key = [Microsoft.Win32.Registry]::Users.OpenSubKey("$UserSid\Environment")
+        if ($key) {
+            return $key.GetValue($Name, $null, [Microsoft.Win32.RegistryValueOptions]::DoNotExpandEnvironmentNames)
+        }
+    } catch {
+    } finally {
+        if ($key) { $key.Dispose() }
+    }
+    return $null
+}
+
+function Get-UvToolBinDirectories {
+    param(
+        [string]$UserProfilePath,
+        [string]$UserSid,
+        [string]$UvPath
+    )
+
+    $rawDirectories = @()
+    $sameUserProfile = $false
+    if ($UserProfilePath -and $env:USERPROFILE) {
+        try {
+            $sameUserProfile = [IO.Path]::GetFullPath($UserProfilePath).TrimEnd('\') -ieq
+                [IO.Path]::GetFullPath($env:USERPROFILE).TrimEnd('\')
+        } catch {
+        }
+    }
+
+    if ($sameUserProfile -and $UvPath) {
+        try {
+            $reportedDirectory = (& $UvPath tool dir --bin 2>$null | Select-Object -First 1 | Out-String).Trim()
+            if ($LASTEXITCODE -eq 0 -and $reportedDirectory) { $rawDirectories += $reportedDirectory }
+        } catch {
+        }
+    }
+    if ($sameUserProfile -and $env:UV_TOOL_BIN_DIR) { $rawDirectories += $env:UV_TOOL_BIN_DIR }
+
+    $targetUserDirectory = Get-TargetUserEnvironmentVariable -Name 'UV_TOOL_BIN_DIR' -UserSid $UserSid
+    if ($targetUserDirectory) { $rawDirectories += $targetUserDirectory }
+    $machineDirectory = [Environment]::GetEnvironmentVariable('UV_TOOL_BIN_DIR', 'Machine')
+    if ($machineDirectory) { $rawDirectories += $machineDirectory }
+    $rawDirectories += "$UserProfilePath\.local\bin"
+
+    $seen = @{}
+    foreach ($directory in $rawDirectories) {
+        $expanded = Expand-TargetUserPath -Path $directory -UserProfilePath $UserProfilePath
+        if (-not $expanded) { continue }
+        try { $expanded = [IO.Path]::GetFullPath($expanded).TrimEnd('\') } catch { continue }
+        if (-not $seen.ContainsKey($expanded)) {
+            $seen[$expanded] = $true
+            $expanded
+        }
+    }
+}
+
+function Find-UvToolPath {
+    param(
+        [string]$Name,
+        [string[]]$ToolBinDirectories
+    )
+
+    $candidates = foreach ($directory in $ToolBinDirectories) {
+        if (-not $directory) { continue }
+        foreach ($extension in @('.exe', '.cmd', '.bat', '.ps1')) {
+            "$directory\$Name$extension"
+        }
+    }
+    # uv's bin directory contains stable shims. Never bind tasks to replaceable tool venvs or unrelated PATH entries.
+    return Find-ExistingPath -Candidates $candidates
+}
+
 function New-HiddenStartProcessCommand {
     param(
         [string]$FilePath,
@@ -309,6 +416,52 @@ function New-HiddenStartProcessCommand {
 
     $commandParts += '-WindowStyle Hidden -ErrorAction Stop | Out-Null'
     return ($commandParts -join ' ')
+}
+
+function New-AbsoluteScheduledTaskAction {
+    param(
+        [string]$FilePath,
+        [string[]]$Arguments = @(),
+        [string]$WorkingDirectory
+    )
+
+    $resolvedPath = Find-ExistingPath -Candidates @($FilePath)
+    if (-not $resolvedPath) {
+        throw "Task executable does not exist: $FilePath"
+    }
+
+    $FilePath = $resolvedPath
+    if (-not $WorkingDirectory) { $WorkingDirectory = Split-Path -Parent $FilePath }
+    if (-not (Test-Path -LiteralPath $WorkingDirectory -PathType Container)) {
+        throw "Task working directory does not exist: $WorkingDirectory"
+    }
+
+    $argumentText = (@($Arguments | ForEach-Object {
+        '"' + (($_ -replace '(\\*)"', '$1$1\"') -replace '(\\+)$', '$1$1') + '"'
+    }) -join ' ')
+
+    switch ([IO.Path]::GetExtension($FilePath).ToLowerInvariant()) {
+        '.ps1' {
+            $invocation = "& $(Convert-ToSingleQuotedPowerShellLiteral $FilePath)"
+            foreach ($argument in $Arguments) { $invocation += " $(Convert-ToSingleQuotedPowerShellLiteral $argument)" }
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes("`$ErrorActionPreference = 'Stop'; $invocation"))
+            $FilePath = Get-WindowsPowerShellPath
+            $argumentText = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -WindowStyle Hidden -EncodedCommand $encoded"
+        }
+        { $_ -in @('.cmd', '.bat') } {
+            $argumentText = '/d /s /c ""' + $FilePath + '" ' + $argumentText + '"'
+            $FilePath = Find-ExistingPath -Candidates @("$env:SystemRoot\System32\cmd.exe")
+            if (-not $FilePath) { throw 'Windows command processor was not found under SystemRoot.' }
+        }
+    }
+
+    $parameters = @{
+        Execute = $FilePath
+        WorkingDirectory = $WorkingDirectory
+        ErrorAction = 'Stop'
+    }
+    if ($argumentText) { $parameters.Argument = $argumentText }
+    return New-ScheduledTaskAction @parameters
 }
 
 function Get-LaunchCommand {
@@ -489,11 +642,12 @@ $pythonwPath = if ($pythonDir) {
 } else { $null }
 $pythonScriptsDir = if ($pythonDir) { Join-Path $pythonDir 'Scripts' } else { $null }
 
-$bserexpBin      = Find-ToolPath -Name 'bserexp-wins' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
-$agentSettingBin = Find-ToolPath -Name 'agent-setting' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
 $uvBin           = Find-ToolPath -Name 'uv' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
-$wklerBin        = Find-ToolPath -Name 'wkler' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
-$jtbjkBin        = Find-ToolPath -Name 'jtbjk' -UserProfilePath $targetUserProfile -PythonScriptsDir $pythonScriptsDir
+$uvToolBinDirectories = @(Get-UvToolBinDirectories -UserProfilePath $targetUserProfile -UserSid $targetUserSid -UvPath $uvBin)
+$bserexpBin      = Find-UvToolPath -Name 'bserexp-wins' -ToolBinDirectories $uvToolBinDirectories
+$agentSettingBin = Find-UvToolPath -Name 'agent-setting' -ToolBinDirectories $uvToolBinDirectories
+$wklerBin        = Find-UvToolPath -Name 'wkler' -ToolBinDirectories $uvToolBinDirectories
+$jtbjkBin        = Find-UvToolPath -Name 'jtbjk' -ToolBinDirectories $uvToolBinDirectories
 
 foreach ($toolEntry in @{'bserexp-wins' = $bserexpBin; 'agent-setting' = $agentSettingBin; 'wkler' = $wklerBin; 'jtbjk' = $jtbjkBin}.GetEnumerator()) {
     if (-not $toolEntry.Value) {
@@ -539,7 +693,7 @@ try {
                 if ($pythonwPath) {
                     $scriptPath = (Get-Item -LiteralPath $scriptPath).FullName
                     $scriptDir = Split-Path -Parent $scriptPath
-                    $action = New-ScheduledTaskAction -Execute $pythonwPath -Argument "`"$scriptPath`"" -WorkingDirectory $scriptDir -ErrorAction Stop
+                    $action = New-AbsoluteScheduledTaskAction -FilePath $pythonwPath -Arguments @($scriptPath) -WorkingDirectory $scriptDir
 
                     $trigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
                     $trigger.Enabled = $true
@@ -585,14 +739,11 @@ try {
         $autoupgradeTaskName = 'autoupgrade'
 
         if ($bserexpBin) {
-            $bserexpLaunchCommand = New-HiddenStartProcessCommand -FilePath $bserexpBin
-            $bserexpTaskCommand = if ($uvBin) {
-                $bserexpUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all"
-                "$bserexpUpgradeCommand; $bserexpLaunchCommand"
-            } else {
-                $bserexpLaunchCommand
+            $bserexpActions = @()
+            if ($uvBin) {
+                $bserexpActions += New-AbsoluteScheduledTaskAction -FilePath $uvBin -Arguments @('tool', 'upgrade', '--all')
             }
-            $bserexpAction = New-PowerShellTaskAction -Command $bserexpTaskCommand
+            $bserexpActions += New-AbsoluteScheduledTaskAction -FilePath $bserexpBin
 
             $bserexpTrigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Sunday -At 7pm
             $bserexpTrigger.Enabled = $true
@@ -600,7 +751,7 @@ try {
             $bserexpSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries -Hidden -MultipleInstances Parallel -StartWhenAvailable
 
             try {
-                Register-ManagedTask -TaskName $bserexpTaskName -Action $bserexpAction -Trigger $bserexpTrigger -Principal $bserexpPrincipal -Settings $bserexpSettings
+                Register-ManagedTask -TaskName $bserexpTaskName -Action $bserexpActions -Trigger $bserexpTrigger -Principal $bserexpPrincipal -Settings $bserexpSettings
                 Enable-ScheduledTask -TaskPath '\' -TaskName $bserexpTaskName -ErrorAction Stop | Out-Null
                 Start-ScheduledTask -TaskPath '\' -TaskName $bserexpTaskName -ErrorAction Stop
             } catch {
