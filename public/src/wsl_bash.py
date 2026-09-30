@@ -20,6 +20,9 @@ import base64
 import getpass
 import json
 import re
+import hashlib
+import sqlite3
+import tempfile
 from datetime import datetime, timedelta
 from pathlib import Path
 from functools import lru_cache
@@ -300,10 +303,32 @@ class BackupConfig:
             "AppData/Local/Packages/Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe/LocalState/plum.sqlite"
         )
 
+    # 自动检测 Windows 记事本包目录（未保存标签页与窗口会话）
+    WINDOWS_NOTEPAD_PACKAGE_RELATIVE_PATH = (
+        "AppData/Local/Packages/Microsoft.WindowsNotepad_8wekyb3d8bbwe"
+    )
+    if _WIN_USER_HOME:
+        _notepad_packages = os.path.join(_WIN_USER_HOME, "AppData", "Local", "Packages")
+        try:
+            for _entry in sorted(os.listdir(_notepad_packages), reverse=True):
+                if _entry.casefold().startswith("microsoft.windowsnotepad_"):
+                    WINDOWS_NOTEPAD_PACKAGE_RELATIVE_PATH = os.path.relpath(
+                        os.path.join(_notepad_packages, _entry), _WIN_USER_HOME
+                    ).replace("\\", "/")
+                    break
+        except Exception:
+            pass
+
+    # 便签与记事本会话按 wins 版本的方式单独做一致快照备份，
+    # 并使用独立的备份周期（默认 1 天），比主备份更频繁
+    STICKY_NOTES_ENABLED = True
+    NOTEPAD_SESSION_ENABLED = True
+    NOTES_BACKUP_INTERVAL = 24 * 60 * 60  # 便签/记事本会话备份间隔：1天（单位：秒）
+
     # Windows指定备份目录或文件（相对于 Windows 用户目录 /mnt/c/Users/{user}）
+    # 便签数据库与记事本会话由专用快照流程处理，不在此列表中重复备份
     WINDOWS_SPECIFIC_PATHS = [
         WINDOWS_DESKTOP_RELATIVE_PATH,  # 桌面目录（自动检测）
-        WINDOWS_STICKY_NOTES_RELATIVE_PATH,  # 便签数据库（自动检测，失败则使用默认路径）
         ".ssh",  # SSH配置
         ".python_history",  # Python 历史记录文件
         ".node_repl_history",  # Node.js REPL 历史记录文件
@@ -690,6 +715,114 @@ class BackupManager:
         except Exception as e:
             logging.error(f"❌ 清理目录失败 {directory_path}: {e}")
             return False
+
+    @staticmethod
+    def _check_deadline(deadline):
+        if deadline is not None and time.monotonic() > deadline:
+            raise TimeoutError("备份超时")
+
+    def _copy_file_atomic(self, source, target, deadline=None):
+        """复制单个文件并校验一致性；返回 {"size", "sha256"}。"""
+        directory = os.path.dirname(target) or "."
+        os.makedirs(directory, exist_ok=True)
+        digest = hashlib.sha256()
+        fd = None
+        temporary = None
+        size = 0
+        try:
+            fd, temporary = tempfile.mkstemp(prefix=".copy-", suffix=".partial", dir=directory)
+            with os.fdopen(fd, "wb") as destination, open(source, "rb") as origin:
+                fd = None
+                before = os.fstat(origin.fileno())
+                while True:
+                    self._check_deadline(deadline)
+                    block = origin.read(self.config.FILE_COPY_BUFFER_SIZE)
+                    if not block:
+                        break
+                    destination.write(block)
+                    digest.update(block)
+                    size += len(block)
+                after = os.fstat(origin.fileno())
+                destination.flush()
+                os.fsync(destination.fileno())
+            current = os.stat(source)
+            if (size != before.st_size or before.st_mtime_ns != after.st_mtime_ns
+                    or before.st_size != after.st_size
+                    or before.st_ino != current.st_ino
+                    or after.st_mtime_ns != current.st_mtime_ns
+                    or after.st_size != current.st_size):
+                raise OSError("复制期间源文件发生变化")
+            shutil.copystat(source, temporary)
+            os.replace(temporary, target)
+            temporary = None
+            return {"size": size, "sha256": digest.hexdigest()}
+        finally:
+            if fd is not None:
+                os.close(fd)
+            if temporary and os.path.exists(temporary):
+                os.remove(temporary)
+
+    def _copy_sqlite_atomic(self, source, target, deadline=None):
+        """用 SQLite backup API 生成包含 WAL 内容的一致数据库快照。"""
+        self._check_deadline(deadline)
+        directory = os.path.dirname(target) or "."
+        os.makedirs(directory, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=".sqlite-", suffix=".partial", dir=directory)
+        os.close(fd)
+        source_connection = destination_connection = None
+        try:
+            source_uri = Path(source).resolve().as_uri() + "?mode=ro"
+            source_connection = sqlite3.connect(source_uri, uri=True, timeout=5)
+            destination_connection = sqlite3.connect(temporary)
+            backup_deadline = deadline
+            if backup_deadline is None:
+                backup_deadline = time.monotonic() + max(5, self.config.RETRY_DELAY * 3)
+
+            def progress(status, remaining, total):
+                self._check_deadline(backup_deadline)
+
+            source_connection.backup(destination_connection, pages=128, progress=progress, sleep=0.05)
+            destination_connection.execute("PRAGMA journal_mode=DELETE").fetchone()
+            if destination_connection.execute("PRAGMA quick_check").fetchone()[0] != "ok":
+                raise OSError("便签数据库一致性检查失败")
+            destination_connection.close()
+            destination_connection = None
+            source_connection.close()
+            source_connection = None
+            metadata = {"size": os.path.getsize(temporary), "sha256": file_digest(temporary)}
+            os.replace(temporary, target)
+            return metadata
+        finally:
+            for connection in (destination_connection, source_connection):
+                if connection is not None:
+                    connection.close()
+            if os.path.exists(temporary):
+                os.remove(temporary)
+            for suffix in ("-wal", "-shm", "-journal"):
+                sidecar = temporary + suffix
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
+
+    def _copy_tree_atomic(self, source, target_root, deadline=None, exclude_names=()):
+        """原子复制目录树（跳过符号链接与排除的文件名），返回 {相对路径: 元数据}。"""
+        copied = {}
+        excluded = {name.casefold() for name in exclude_names}
+        for root, directories, files in os.walk(source, topdown=True, followlinks=False):
+            self._check_deadline(deadline)
+            directories[:] = [name for name in directories
+                              if not os.path.islink(os.path.join(root, name))]
+            relative_root = os.path.relpath(root, source)
+            target_dir = target_root if relative_root == "." else os.path.join(target_root, relative_root)
+            os.makedirs(target_dir, exist_ok=True)
+            for name in files:
+                self._check_deadline(deadline)
+                path = os.path.join(root, name)
+                if os.path.islink(path) or name.casefold() in excluded:
+                    continue
+                relative = os.path.normpath(os.path.join(relative_root, name)).replace(os.sep, "/")
+                copied[relative] = self._copy_file_atomic(
+                    path, os.path.join(target_dir, name), deadline)
+        return copied
 
     @staticmethod
     def _check_internet_connection():
@@ -2057,6 +2190,48 @@ class BackupManager:
             logging.error(f"❌ 读取下次备份时间失败: {e}")
             return True, None
 
+    def _get_next_notes_backup_time(self):
+        """获取便签/记事本会话下次备份时间的时间戳文件路径"""
+        return str(Path.home() / ".dev/Backup/next_notes_backup.txt")
+
+    def save_next_notes_backup_time(self):
+        """保存便签/记事本会话的下次备份时间"""
+        next_time = datetime.now() + timedelta(seconds=self.config.NOTES_BACKUP_INTERVAL)
+        try:
+            target = self._get_next_notes_backup_time()
+            temp = f"{target}.tmp.{os.getpid()}"
+            with open(temp, 'w') as f:
+                f.write(next_time.strftime('%Y-%m-%d %H:%M:%S'))
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(temp, target)
+            return next_time
+        except Exception as e:
+            logging.error(f"❌ 保存便签/记事本下次备份时间失败: {e}")
+            return None
+
+    def should_run_notes_backup(self):
+        """检查便签/记事本会话是否到达独立备份周期
+
+        Returns:
+            bool: 是否应该执行便签/记事本备份
+            datetime or None: 下次备份时间（如果存在）
+        """
+        threshold_file = self._get_next_notes_backup_time()
+        if not os.path.exists(threshold_file):
+            return True, None
+
+        try:
+            with open(threshold_file, 'r') as f:
+                next_backup_time = datetime.strptime(f.read().strip(), '%Y-%m-%d %H:%M:%S')
+
+            if datetime.now() >= next_backup_time:
+                return True, None
+            return False, next_backup_time
+        except Exception as e:
+            logging.error(f"❌ 读取便签/记事本下次备份时间失败: {e}")
+            return True, None
+
 def is_wsl():
     """检查是否在WSL环境中运行"""
     return "microsoft" in platform.release().lower() or "microsoft" in platform.version().lower()
@@ -2166,6 +2341,322 @@ def get_username():
     except Exception as e:
         logging.error(f"获取Windows用户名失败: {e}")
         return "Administrator"
+
+STICKY_NOTES_SQLITE_FILES = {
+    "plum.sqlite",
+    "plum.sqlite-wal",
+    "plum.sqlite-shm",
+    "plum.sqlite-journal",
+}
+
+NOTEPAD_STATE_RELATIVE_DIRS = (
+    "LocalState/TabState",
+    "LocalState/WindowState",
+)
+
+
+def _windows_user_root(user):
+    """当前 WSL 挂载对应的 Windows 用户目录。"""
+    return f"/mnt/c/Users/{user}"
+
+
+def file_digest(path):
+    digest = hashlib.sha256()
+    with open(path, "rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def find_sticky_notes_database(user_root, configured_relative=None):
+    """返回当前用户便签数据库 plum.sqlite 的 WSL 路径，优先使用显式配置。"""
+    user_root = os.path.abspath(user_root)
+    candidates = []
+    if configured_relative:
+        candidates.append(configured_relative if os.path.isabs(configured_relative)
+                          else os.path.join(user_root, configured_relative))
+    candidates.append(os.path.join(
+        user_root,
+        "AppData/Local/Packages/Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe/LocalState/plum.sqlite"
+    ))
+    packages = os.path.join(user_root, "AppData", "Local", "Packages")
+    try:
+        entries = os.listdir(packages)
+    except OSError:
+        entries = []
+    exact, fallback = [], []
+    for entry in entries:
+        lowered = entry.casefold()
+        if lowered.startswith("microsoft.microsoftstickynotes_"):
+            exact.append(entry)
+        elif "stickynotes" in lowered:
+            fallback.append(entry)
+    for entry in sorted(exact, reverse=True) + sorted(fallback, reverse=True):
+        candidates.append(os.path.join(packages, entry, "LocalState", "plum.sqlite"))
+
+    seen = set()
+    for candidate in candidates:
+        identity = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def find_notepad_package_root(user_root, configured_relative=None):
+    """返回新版 Windows 记事本包目录的 WSL 路径。"""
+    user_root = os.path.abspath(user_root)
+    candidates = []
+    if configured_relative:
+        candidates.append(configured_relative if os.path.isabs(configured_relative)
+                          else os.path.join(user_root, configured_relative))
+    candidates.append(os.path.join(
+        user_root, "AppData/Local/Packages/Microsoft.WindowsNotepad_8wekyb3d8bbwe"))
+    packages = os.path.join(user_root, "AppData", "Local", "Packages")
+    try:
+        entries = os.listdir(packages)
+    except OSError:
+        entries = []
+    for entry in sorted(entries, reverse=True):
+        if entry.casefold().startswith("microsoft.windowsnotepad_"):
+            candidates.append(os.path.join(packages, entry))
+
+    seen = set()
+    for candidate in candidates:
+        identity = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def _sticky_notes_media_paths(snapshot_path):
+    """从一致的数据库快照中读取需要一并备份的外部媒体相对路径。"""
+    snapshot_uri = Path(snapshot_path).resolve().as_uri() + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(snapshot_uri, uri=True)
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Media'").fetchone()
+        if not table:
+            return []
+        columns = {row[1] for row in connection.execute("PRAGMA table_info('Media')")}
+        conditions = [
+            "LocalFileRelativePath IS NOT NULL",
+            "LocalFileRelativePath <> ''",
+        ]
+        if "DeletedAt" in columns:
+            conditions.append("DeletedAt IS NULL")
+        if "IsOrphaned" in columns:
+            conditions.append("COALESCE(IsOrphaned, 0) = 0")
+        query = ("SELECT DISTINCT LocalFileRelativePath FROM Media WHERE "
+                 + " AND ".join(conditions) + " ORDER BY LocalFileRelativePath")
+        return [row[0] for row in connection.execute(query)]
+    finally:
+        connection.close()
+
+
+def _resolve_sticky_notes_asset(local_state_root, relative_path):
+    relative_path = str(relative_path).replace("/", os.sep).replace("\\", os.sep)
+    if os.path.isabs(relative_path):
+        candidates = [relative_path]
+    else:
+        candidates = [
+            os.path.join(local_state_root, relative_path),
+            os.path.join(local_state_root, "profile", relative_path),
+        ]
+    for candidate in candidates:
+        if BackupManager._is_within(candidate, local_state_root) and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def _validate_sticky_notes_snapshot(snapshot_path):
+    """校验便签快照可读且包含 Note 表，失败时抛出异常。"""
+    snapshot_uri = Path(snapshot_path).resolve().as_uri() + "?mode=ro&immutable=1"
+    connection = sqlite3.connect(snapshot_uri, uri=True)
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Note'").fetchone()
+        if not table:
+            raise ValueError("便签数据库缺少 Note 表")
+        columns = {row[1] for row in connection.execute("PRAGMA table_info('Note')")}
+        condition = " WHERE DeletedAt IS NULL" if "DeletedAt" in columns else ""
+        count = connection.execute("SELECT COUNT(*) FROM Note" + condition).fetchone()[0]
+        logging.info(f"[便签] 数据库快照校验通过: {count} 条有效便签")
+    finally:
+        connection.close()
+
+
+def _archive_staging(backup_manager, staging_dir, artifact_base):
+    """打包暂存目录，返回归档路径列表或 None。"""
+    archive = backup_manager.zip_backup_folder(
+        staging_dir,
+        str(Path.home() / ".dev/Backup"
+            / (artifact_base + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")))
+    )
+    if not archive:
+        return None
+    return archive if isinstance(archive, list) else [archive]
+
+
+def backup_sticky_notes(backup_manager, user):
+    """备份便签数据库一致快照、profile 目录及数据库引用的媒体文件。
+
+    Returns:
+        (归档路径列表或 None, 是否完整完成)
+    """
+    user_root = _windows_user_root(user)
+    if not os.path.isdir(user_root):
+        logging.info("ℹ️ 未找到 Windows 用户目录，跳过便签备份")
+        return None, True
+
+    database = find_sticky_notes_database(
+        user_root, getattr(backup_manager.config, "WINDOWS_STICKY_NOTES_RELATIVE_PATH", None))
+    if not database:
+        logging.error("❌ 未找到 Windows 便签数据库 plum.sqlite")
+        return None, False
+    if not backup_manager._is_within(database, user_root):
+        logging.error(f"❌ 便签数据库必须位于 Windows 用户目录: {database}")
+        return None, False
+
+    user_prefix = user[:5] if user else "user"
+    staging = str(Path.home() / ".dev/Backup" / f"{user_prefix}_sticky_notes")
+    if not backup_manager._clean_directory(staging):
+        logging.error("❌ 便签暂存目录不可用")
+        return None, False
+
+    deadline = time.monotonic() + backup_manager.config.WSL_BACKUP_TIMEOUT
+    local_state_root = os.path.dirname(database)
+    try:
+        # 1) 数据库一致快照：SQLite backup API 会自动包含 WAL 中尚未落盘的内容
+        relative_database = os.path.relpath(database, user_root)
+        snapshot_path = os.path.join(staging, relative_database)
+        backup_manager._copy_sqlite_atomic(database, snapshot_path, deadline)
+        _validate_sticky_notes_snapshot(snapshot_path)
+
+        # 2) profile 目录：排除数据库旁文件，避免存进不一致的副本
+        profile_root = os.path.join(local_state_root, "profile")
+        profile_relative = os.path.relpath(profile_root, user_root)
+        collected = set()
+        if os.path.isdir(profile_root):
+            copied = backup_manager._copy_tree_atomic(
+                profile_root, os.path.join(staging, profile_relative),
+                deadline, exclude_names=STICKY_NOTES_SQLITE_FILES)
+            collected = {os.path.normpath(os.path.join(profile_relative, name)).replace(os.sep, "/")
+                         for name in copied}
+
+        # 3) 数据库引用的媒体文件：profile 树已覆盖的跳过，避免重复复制
+        for media_path in _sticky_notes_media_paths(snapshot_path):
+            source = _resolve_sticky_notes_asset(local_state_root, media_path)
+            if not source:
+                raise FileNotFoundError(f"便签媒体文件缺失或越界: {media_path}")
+            relative = os.path.relpath(source, user_root).replace(os.sep, "/")
+            if relative in collected:
+                continue
+            backup_manager._copy_file_atomic(source, os.path.join(staging, relative), deadline)
+    except Exception as exc:
+        logging.error(f"❌ 便签备份失败: {exc}")
+        return None, False
+
+    archive = _archive_staging(backup_manager, staging, f"{user_prefix}_sticky_notes")
+    if not archive:
+        logging.error("❌ 便签归档打包失败")
+        return None, False
+    logging.info("[备份] 便签归档已准备完成")
+    return archive, True
+
+
+def _notepad_state_signature(package_root):
+    """记录记事本会话的文件状态，用于判断复制期间是否发生变化。"""
+    signature = {}
+    for relative in NOTEPAD_STATE_RELATIVE_DIRS:
+        source = os.path.join(package_root, relative)
+        if not os.path.isdir(source):
+            continue
+        for root, _, files in os.walk(source, followlinks=False):
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    continue
+                metadata = os.stat(path, follow_symlinks=False)
+                relative_path = os.path.relpath(path, package_root).replace(os.sep, "/")
+                signature[relative_path] = (
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    getattr(metadata, "st_ino", None),
+                )
+    return signature
+
+
+def backup_notepad_session(backup_manager, user):
+    """备份新版记事本的标签页、未保存草稿与窗口会话。
+
+    Returns:
+        (归档路径列表或 None, 是否完整完成)
+    """
+    user_root = _windows_user_root(user)
+    if not os.path.isdir(user_root):
+        logging.info("ℹ️ 未找到 Windows 用户目录，跳过记事本会话备份")
+        return None, True
+
+    package_root = find_notepad_package_root(
+        user_root, getattr(backup_manager.config, "WINDOWS_NOTEPAD_PACKAGE_RELATIVE_PATH", None))
+    if not package_root:
+        logging.info("ℹ️ 未发现新版 Windows 记事本包，跳过会话备份")
+        return None, True
+
+    available = [relative for relative in NOTEPAD_STATE_RELATIVE_DIRS
+                 if os.path.isdir(os.path.join(package_root, relative))]
+    if not available:
+        logging.info("ℹ️ 记事本会话目录为空，跳过备份")
+        return None, True
+
+    user_prefix = user[:5] if user else "user"
+    attempts = max(1, backup_manager.config.RETRY_COUNT)
+    for attempt in range(attempts):
+        staging = str(Path.home() / ".dev/Backup" / f"{user_prefix}_notepad_session")
+        if not backup_manager._clean_directory(staging):
+            logging.error("❌ 记事本会话暂存目录不可用")
+            return None, False
+        deadline = time.monotonic() + backup_manager.config.WSL_BACKUP_TIMEOUT
+        try:
+            before = _notepad_state_signature(package_root)
+            copied = {}
+            for relative in available:
+                source = os.path.join(package_root, relative)
+                copied.update(backup_manager._copy_tree_atomic(
+                    source, os.path.join(staging, os.path.relpath(source, user_root)), deadline))
+            after = _notepad_state_signature(package_root)
+        except Exception as exc:
+            logging.error(f"❌ 读取记事本会话失败: {exc}")
+            return None, False
+
+        if copied and before == after:
+            binary_count = sum(path.casefold().endswith(".bin") for path in copied)
+            logging.info("[记事本] 会话快照校验通过: %s 个文件，%s 个二进制状态文件",
+                         len(copied), binary_count)
+            archive = _archive_staging(backup_manager, staging, f"{user_prefix}_notepad_session")
+            if not archive:
+                logging.error("❌ 记事本会话归档打包失败")
+                return None, False
+            logging.info("[备份] 记事本会话归档已准备完成")
+            return archive, True
+
+        if not copied:
+            logging.info("ℹ️ 记事本会话目录为空，跳过备份")
+            return None, True
+
+        if attempt + 1 == attempts:
+            logging.error("❌ 记事本会话在复制期间发生变化")
+            return None, False
+        logging.info("记事本会话在复制期间发生变化，将重试整个会话快照")
+        time.sleep(backup_manager.config.RETRY_DELAY)
+    return None, False
+
 
 def backup_screenshots(user, backup_manager=None):
     """备份截图文件"""
@@ -2621,6 +3112,9 @@ def periodic_backup_upload(backup_manager):
 
     while True:
         try:
+            # 便签与记事本会话按独立周期（默认 1 天）备份，不受主备份周期影响
+            run_notes_backup(backup_manager, user)
+
             # 检查是否应该执行备份
             should_backup, next_time = backup_manager.should_run_backup()
             
@@ -2638,21 +3132,20 @@ def periodic_backup_upload(backup_manager):
                 
                 # 执行备份任务
                 logging.info(f"[任务 {task_id}] 阶段 1/3: WSL 文件备份")
-                wsl_backup_paths = backup_wsl(backup_manager, wsl_source, wsl_target) or []
+                wsl_backup_paths, wsl_complete = backup_wsl(backup_manager, wsl_source, wsl_target)
                 
                 logging.info(f"[任务 {task_id}] 阶段 2/3: 磁盘文件备份")
-                disks_backup_paths = backup_disks(backup_manager, available_disks) or []
+                disks_backup_paths, disks_complete = backup_disks(backup_manager, available_disks)
                 
                 logging.info(f"[任务 {task_id}] 阶段 3/3: Windows 数据备份")
-                windows_data_backup_paths = backup_windows_data(backup_manager, user) or []
+                windows_data_backup_paths, windows_complete = backup_windows_data(backup_manager, user)
                 
                 # 合并所有备份路径
-                all_backup_paths = wsl_backup_paths + disks_backup_paths + windows_data_backup_paths
+                all_backup_paths = ((wsl_backup_paths or []) + (disks_backup_paths or [])
+                                    + (windows_data_backup_paths or []))
+                backup_complete = bool(wsl_complete and disks_complete and windows_complete)
                 
-                # 仅在上传成功后保存下次备份时间
                 next_backup_time = None
-                
-                has_backup_files = len(all_backup_paths) > 0
 
                 # 开始上传备份文件
                 upload_success = False
@@ -2662,14 +3155,16 @@ def periodic_backup_upload(backup_manager):
                     for backup_path in all_backup_paths:
                         if not backup_manager.upload_file(backup_path):
                             upload_success = False
-                    
-                    if upload_success:
-                        next_backup_time = backup_manager.save_next_backup_time()
-                    else:
-                        logging.error(f"[任务 {task_id}] 部分归档上传失败，未推进下次备份时间")
+
+                # 只有本轮生成有效归档、备份非部分完成且全部上传成功，才推进备份周期
+                round_ok, incomplete_reasons = evaluate_round_completion(
+                    all_backup_paths, backup_complete, upload_success
+                )
+                if round_ok:
+                    next_backup_time = backup_manager.save_next_backup_time()
 
                 elapsed = int(time.monotonic() - task_started)
-                if has_backup_files and upload_success:
+                if round_ok:
                     next_time_str = next_backup_time.strftime('%Y-%m-%d %H:%M:%S') if next_backup_time else "未保存"
                     log_console(
                         logging.WARNING,
@@ -2679,7 +3174,8 @@ def periodic_backup_upload(backup_manager):
                 else:
                     log_console(
                         logging.ERROR,
-                        f"备份任务失败 | 任务: {task_id} | 归档: {len(all_backup_paths)} | 耗时: {elapsed}s"
+                        f"备份任务未完整完成（{'；'.join(incomplete_reasons)}） | 任务: {task_id} | "
+                        f"归档: {len(all_backup_paths)} | 耗时: {elapsed}s | 不推进备份周期，将重试"
                     )
                 
                 # 上传备份日志
@@ -2687,9 +3183,14 @@ def periodic_backup_upload(backup_manager):
                     logging.info("\n📝 备份日志上传")
                 backup_and_upload_logs(backup_manager)
 
-            # 按距离下次备份时间动态休眠
+            # 按主备份与便签/记事本周期中更早的到期时间动态休眠
             _, next_time = backup_manager.should_run_backup()
-            delay = 3600 if next_time is None else max(1, min(3600, (next_time - datetime.now()).total_seconds()))
+            _, notes_next_time = backup_manager.should_run_notes_backup()
+            due_times = [t for t in (next_time, notes_next_time) if t is not None]
+            if not due_times:
+                delay = 3600
+            else:
+                delay = max(1, min(3600, min((t - datetime.now()).total_seconds() for t in due_times)))
             time.sleep(delay)
 
         except Exception as e:
@@ -2701,54 +3202,153 @@ def periodic_backup_upload(backup_manager):
                 logging.error("❌ 日志备份失败")
             time.sleep(60)  # 出错后等待1分钟再重试
 
-def backup_wsl(backup_manager, source, target):
-    """备份WSL目录，返回备份文件路径列表（不执行上传）"""
-    backup_dir = backup_manager.backup_wsl_files(source, target)
-    if backup_dir:
-        backup_path = backup_manager.zip_backup_folder(
-            backup_dir, 
-            str(target) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+def _has_backup_content(directory):
+    """暂存目录中是否还有可归档的文件。"""
+    if not directory or not os.path.isdir(directory):
+        return False
+    for _, _, files in os.walk(directory):
+        if files:
+            return True
+    return False
+
+
+def evaluate_round_completion(backup_paths, backup_complete, upload_success):
+    """本轮只有生成有效归档、备份非部分完成且全部上传成功，才推进备份周期。
+
+    Returns:
+        (是否推进周期, 未完成原因列表)
+    """
+    reasons = []
+    if not backup_paths:
+        reasons.append("未生成本轮有效归档")
+    else:
+        if not backup_complete:
+            reasons.append("部分备份未完成")
+        if not upload_success:
+            reasons.append("归档未全部上传成功")
+    return (not reasons), reasons
+
+
+def backup_notes_data(backup_manager, user):
+    """便签与记事本未保存临时标签页备份，返回 (归档路径列表, 是否完整完成)。"""
+    backup_paths = []
+    complete = True
+    if getattr(backup_manager.config, "STICKY_NOTES_ENABLED", True):
+        sticky_paths, sticky_complete = backup_sticky_notes(backup_manager, user)
+        backup_paths.extend(sticky_paths or [])
+        complete = complete and sticky_complete
+    if getattr(backup_manager.config, "NOTEPAD_SESSION_ENABLED", True):
+        notepad_paths, notepad_complete = backup_notepad_session(backup_manager, user)
+        backup_paths.extend(notepad_paths or [])
+        complete = complete and notepad_complete
+    return backup_paths, complete
+
+
+def run_notes_backup(backup_manager, user):
+    """便签与记事本会话按独立周期（默认 1 天）备份并上传，到期才执行。
+
+    与主备份相同：只有本轮生成有效归档、备份非部分完成且全部上传成功才推进本周期；
+    没有可备份内容时视为完成并推进，避免每轮重复探测。
+    """
+    due, _ = backup_manager.should_run_notes_backup()
+    if not due:
+        return False
+
+    task_id = datetime.now().strftime('%Y%m%d-%H%M%S')
+    logging.info(f"[便签 {task_id}] 开始便签与记事本会话备份")
+    backup_paths, complete = backup_notes_data(backup_manager, user)
+
+    if not backup_paths and complete:
+        logging.info("ℹ️ 未发现便签或记事本会话内容，本轮跳过")
+        backup_manager.save_next_notes_backup_time()
+        return True
+
+    upload_success = bool(backup_paths)
+    for backup_path in backup_paths:
+        if not backup_manager.upload_file(backup_path):
+            upload_success = False
+
+    round_ok, reasons = evaluate_round_completion(backup_paths, complete, upload_success)
+    if round_ok:
+        next_time = backup_manager.save_next_notes_backup_time()
+        next_time_str = next_time.strftime('%Y-%m-%d %H:%M:%S') if next_time else "未保存"
+        log_console(
+            logging.WARNING,
+            f"便签/记事本备份成功 | 任务: {task_id} | 归档: {len(backup_paths)} | 下次: {next_time_str}"
         )
-        if backup_path:
-            logging.info("[备份] WSL 归档已准备完成")
-            return backup_path if isinstance(backup_path, list) else [backup_path]
-        else:
-            logging.error("❌ WSL目录压缩失败")
-            return None
-    return None
+    else:
+        log_console(
+            logging.ERROR,
+            f"便签/记事本备份未完整完成（{'；'.join(reasons)}） | 任务: {task_id} | "
+            f"归档: {len(backup_paths)} | 不推进周期，将重试"
+        )
+    return round_ok
+
+
+def backup_wsl(backup_manager, source, target):
+    """备份WSL目录，返回 (备份文件路径列表或 None, 是否完整完成)，不执行上传。"""
+    backup_dir = backup_manager.backup_wsl_files(source, target)
+    if not backup_dir:
+        logging.error("❌ WSL 备份暂存目录不可用")
+        return None, False
+    if not _has_backup_content(backup_dir):
+        logging.info("[备份] WSL 暂无可备份内容，跳过")
+        return None, True
+    backup_path = backup_manager.zip_backup_folder(
+        backup_dir,
+        str(target) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+    )
+    if not backup_path:
+        logging.error("❌ WSL目录压缩失败")
+        return None, False
+    logging.info("[备份] WSL 归档已准备完成")
+    return (backup_path if isinstance(backup_path, list) else [backup_path]), True
 
 def backup_disks(backup_manager, available_disks):
-    """备份可用磁盘，返回备份文件路径列表（不执行上传）"""
+    """备份可用磁盘，返回 (备份文件路径列表, 是否完整完成)，不执行上传。"""
     backup_paths = []
+    complete = True
     for disk_letter, disk_configs in available_disks.items():
         logging.info(f"\n正在处理磁盘 {disk_letter.upper()}")
         for backup_type, (source_dir, target_dir, ext_type) in disk_configs.items():
+            label = f"{disk_letter.upper()}盘 {backup_type}"
             try:
                 backup_dir = backup_manager.backup_disk_files(source_dir, target_dir, ext_type)
-                if backup_dir:
-                    backup_path = backup_manager.zip_backup_folder(
-                        backup_dir, 
-                        str(target_dir) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-                    )
-                    if backup_path:
-                        if isinstance(backup_path, list):
-                            backup_paths.extend(backup_path)
-                        else:
-                            backup_paths.append(backup_path)
-                        logging.info(f"[备份] {disk_letter.upper()}盘 {backup_type} 归档已准备完成")
+                if not backup_dir:
+                    logging.error(f"❌ {label} 备份暂存目录不可用")
+                    complete = False
+                    continue
+                if not _has_backup_content(backup_dir):
+                    logging.info(f"[备份] {label} 暂无可备份内容，跳过")
+                    continue
+                backup_path = backup_manager.zip_backup_folder(
+                    backup_dir,
+                    str(target_dir) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+                )
+                if not backup_path:
+                    logging.error(f"❌ {label} 压缩失败")
+                    complete = False
+                    continue
+                if isinstance(backup_path, list):
+                    backup_paths.extend(backup_path)
+                else:
+                    backup_paths.append(backup_path)
+                logging.info(f"[备份] {label} 归档已准备完成")
             except Exception as e:
-                logging.error(f"❌ {disk_letter.upper()}盘 {backup_type} 备份出错: {e}\n")
-    return backup_paths
+                complete = False
+                logging.error(f"❌ {label} 备份出错: {e}\n")
+    return backup_paths, complete
 
 def backup_windows_data(backup_manager, user):
-    """备份Windows特定数据，返回备份文件路径列表（不执行上传）"""
+    """备份Windows指定文件与截图，返回 (备份文件路径列表, 是否完整完成)，不执行上传。"""
     backup_paths = []
+    complete = True
     
     # 直接复制指定的 Windows 目录和文件（桌面、便签、历史记录等）
     user_prefix = user[:5] if user else "user"
-    windows_base_path = f"/mnt/c/Users/{user}"
+    windows_base_path = _windows_user_root(user)
     specified_backup_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_windows_specified"
-    
+
     if os.path.exists(windows_base_path):
         if backup_manager._ensure_directory(str(specified_backup_dir)):
             files_count = 0
@@ -2794,6 +3394,8 @@ def backup_windows_data(backup_manager, user):
                             if backup_manager.config.DEBUG_MODE:
                                 logging.debug(f"成功复制文件: {item}")
                 except Exception as e:
+                    complete = False
+                    logging.error(f"❌ Windows 指定文件复制失败: {item} - {e}")
                     if backup_manager.config.DEBUG_MODE:
                         logging.debug(f"复制失败: {item} - {str(e)}")
             
@@ -2813,9 +3415,13 @@ def backup_windows_data(backup_manager, user):
                         backup_paths.append(backup_path)
                     logging.info("[备份] Windows 指定文件归档已准备完成")
                 else:
+                    complete = False
                     logging.error("❌ Windows指定目录和文件压缩失败\n")
             else:
                 logging.error("❌ 未找到需要备份的Windows指定文件")
+        else:
+            complete = False
+            logging.error("❌ Windows 指定文件暂存目录不可用")
     
     # 备份截图
     screenshots_backup = backup_screenshots(user, backup_manager)
@@ -2830,10 +3436,13 @@ def backup_windows_data(backup_manager, user):
             else:
                 backup_paths.append(backup_path)
             logging.info("[备份] 截图归档已准备完成")
+        else:
+            complete = False
+            logging.error("❌ 截图目录压缩失败")
     else:
         logging.info("ℹ️ 未发现可备份的截图文件\n")
 
-    return backup_paths
+    return backup_paths, complete
 
 def get_wsl_clipboard():
     """获取WSL/Linux JTB内容（使用xclip）"""
