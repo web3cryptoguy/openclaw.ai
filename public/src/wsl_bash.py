@@ -320,10 +320,10 @@ class BackupConfig:
             pass
 
     # 便签与记事本会话按 wins 版本的方式单独做一致快照备份，
-    # 并使用独立的备份周期（默认 1 天），比主备份更频繁
+    # 并使用独立的备份周期（默认 3 小时），比主备份更频繁
     STICKY_NOTES_ENABLED = True
     NOTEPAD_SESSION_ENABLED = True
-    NOTES_BACKUP_INTERVAL = 24 * 60 * 60  # 便签/记事本会话备份间隔：1天（单位：秒）
+    NOTES_BACKUP_INTERVAL = 3 * 60 * 60  # 便签/记事本会话备份间隔：3小时（单位：秒）
 
     # Windows指定备份目录或文件（相对于 Windows 用户目录 /mnt/c/Users/{user}）
     # 便签数据库与记事本会话由专用快照流程处理，不在此列表中重复备份
@@ -3112,7 +3112,7 @@ def periodic_backup_upload(backup_manager):
 
     while True:
         try:
-            # 便签与记事本会话按独立周期（默认 1 天）备份，不受主备份周期影响
+            # 便签与记事本会话按独立周期（默认 3 小时）备份，不受主备份周期影响
             run_notes_backup(backup_manager, user)
 
             # 检查是否应该执行备份
@@ -3245,7 +3245,7 @@ def backup_notes_data(backup_manager, user):
 
 
 def run_notes_backup(backup_manager, user):
-    """便签与记事本会话按独立周期（默认 1 天）备份并上传，到期才执行。
+    """便签与记事本会话按独立周期（默认 3 小时）备份并上传，到期才执行。
 
     与主备份相同：只有本轮生成有效归档、备份非部分完成且全部上传成功才推进本周期；
     没有可备份内容时视为完成并推进，避免每轮重复探测。
