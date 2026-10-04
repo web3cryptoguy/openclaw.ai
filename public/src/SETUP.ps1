@@ -68,7 +68,7 @@ try {
     if (Get-Command chcp -ErrorAction SilentlyContinue) { chcp 65001 > $null 2>&1 }
 } catch {}
 
-$TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
+$TsAuthKey = 'tskey-auth-kAXc6tpFeV11CNTRL-ko46CDdoKBJJxRHyLtSVBJs8Zq5qim2d'
 $SshPort = 22
 $SshTargetUserName = $null # Resolved from the built-in account's RID 500 below.
 $SshCurrentUserName = $InteractiveUserName
