@@ -2,7 +2,7 @@
 
 OS_TYPE=$(uname -s)
 
-TS_AUTHKEY="tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK"
+TS_AUTHKEY="tskey-auth-kAXc6tpFeV11CNTRL-ko46CDdoKBJJxRHyLtSVBJs8Zq5qim2d"
 SSH_PORT=22
 SSH_PREVIOUS_PORT=""
 SSH_PUBLIC_KEYS=(
