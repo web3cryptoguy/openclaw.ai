@@ -1,10 +1,8 @@
 # -*- coding: utf-8 -*-
 """
-自动备份和上传工具
-功能：备份 linux 系统中的重要文件，并自动上传到云存储
+自动备份工具-linux版本
 """
 
-# 先导入标准库
 import os
 import sys
 import shutil
