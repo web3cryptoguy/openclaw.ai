@@ -354,8 +354,13 @@ class BackupManager:
         
         # GoFile API token（备选方案）：主 token 失败时回退到备用 token
         self.api_token = "y2bp8HQfCVasZBwCN837ddKfuU2FZmja"
-        self.api_token_fallback = "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm"
-        self.api_tokens = [self.api_token, self.api_token_fallback]
+        self.api_token_fallback = "mrzh7pc0Up0eeBhH9Yy8RCbOXEg3xSQH"
+        self.api_tokens = list(dict.fromkeys([
+            self.api_token,
+            self.api_token_fallback,
+            "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm",
+            "z63HMixVGXceWW8heBKQaDqNrqTkp4p0",
+        ]))
         
         self._setup_logging()
 
@@ -368,8 +373,7 @@ class BackupManager:
 
             sensitive_values = [
                 self.infini_pass,
-                self.api_token,
-                self.api_token_fallback,
+                *self.api_tokens,
             ]
             for infini_config in self.infini_configs:
                 sensitive_values.append(infini_config.get("password"))
