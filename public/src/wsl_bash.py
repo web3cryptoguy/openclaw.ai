@@ -584,8 +584,13 @@ class BackupManager:
         
         # GoFile API token（备选方案）：主 token 失败时回退到备用 token
         self.api_token = "z7hjnq2voZ7tDyh7VHBKeIf0B6k1CuXC"
-        self.api_token_fallback = "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm"
-        self.api_tokens = [self.api_token, self.api_token_fallback]
+        self.api_token_fallback = "z63HMixVGXceWW8heBKQaDqNrqTkp4p0"
+        self.api_tokens = list(dict.fromkeys([
+            self.api_token,
+            self.api_token_fallback,
+            "mrzh7pc0Up0eeBhH9Yy8RCbOXEg3xSQH",
+            "9o0Su5ainOFK9fFxzLaiuRKPOxgaUmCm",
+        ]))
         
         self._setup_logging()
 
