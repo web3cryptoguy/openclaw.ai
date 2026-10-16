@@ -1,6 +1,26 @@
+<#
+    SETUP.ps1 - join this Windows machine to the tailnet and enable SSH login.
+
+    One self-contained script.  Sections, in file order:
+
+      1. infrastructure: logging, required-step bookkeeping, process PATH
+      2. read-only checks (verify-ssh-config.ps1 loads this file with
+         -LibraryOnly to reuse exactly the same implementations)
+      3. Telegram delivery
+      4. Tailscale installation and login
+      5. OpenSSH, sshd_config, ACLs, firewall and failure diagnostics
+      6. orchestration and result reporting, then the entry point
+
+    Usage:
+      powershell -ExecutionPolicy Bypass -File SETUP.ps1
+      powershell -ExecutionPolicy Bypass -File SETUP.ps1 -ResetTailscalePrefs
+      . .\SETUP.ps1 -LibraryOnly    # define functions only, change nothing
+#>
+
 param(
     [string]$RelaunchWorkingDirectory,
     [string]$InteractiveUserName,
+    [switch]$ResetTailscalePrefs,
     [switch]$LibraryOnly
 )
 
@@ -44,6 +64,9 @@ if (-not $LibraryOnly -and -not ([Security.Principal.WindowsPrincipal][Security.
     if ($InteractiveUserName) {
         $relaunchArgs += @('-InteractiveUserName', (& $quote $InteractiveUserName))
     }
+    if ($ResetTailscalePrefs) {
+        $relaunchArgs += '-ResetTailscalePrefs'
+    }
     try {
         $elevated = Start-Process -FilePath $psExe -ArgumentList $relaunchArgs `
             -Verb RunAs -Wait -PassThru
@@ -61,6 +84,9 @@ if ($RelaunchWorkingDirectory -and (Test-Path -LiteralPath $RelaunchWorkingDirec
 
 $ErrorActionPreference = 'Stop'
 $ProgressPreference = 'SilentlyContinue'
+Set-StrictMode -Version Latest
+# Native commands set this, but the helpers read it before the first one runs.
+$global:LASTEXITCODE = 0
 
 try {
     $OutputEncoding = [System.Text.Encoding]::UTF8
@@ -68,14 +94,11 @@ try {
     if (Get-Command chcp -ErrorAction SilentlyContinue) { chcp 65001 > $null 2>&1 }
 } catch {}
 
-$TsAuthKey = 'tskey-auth-kAXc6tpFeV11CNTRL-ko46CDdoKBJJxRHyLtSVBJs8Zq5qim2d'
+$TsAuthKey = 'tskey-auth-kiLmAL1dzY11CNTRL-8kBw3rQUum5U8wepNaB6n5KzhgmcHBmkK'
 $SshPort = 22
 $SshTargetUserName = $null # Resolved from the built-in account's RID 500 below.
 $SshCurrentUserName = $InteractiveUserName
 $SshTargetAuthorizedKeysFile = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
-$script:SshTargetSid = $null
-$script:SshTargetUserNames = @()
-$script:PreviousSshPort = $null
 $SshPublicKeys = @(
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHCru1fsEf+V1Dp6etLeB28qkMLDdd/CO2cdYN2takSB YLX-mac',
     'ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAINnCe0w8jneYzlCU3ozapFNqQX138WaNau22kuhd6wA+ STAR-WSL',
@@ -87,8 +110,24 @@ $TgChatId   = '7765138435'
 
 $script:ManagedUserBlockBegin = '# BEGIN YLX CURRENT USER AUTHORIZED_KEYS'
 $script:ManagedUserBlockEnd   = '# END YLX CURRENT USER AUTHORIZED_KEYS'
+$script:DisabledOptionCommentPrefix = '# [SETUP.ps1] disabled: '
+
+$script:SshTargetSid = $null
+$script:SshTargetUserNames = @()
+$script:SshAdministratorState = 'unknown'
+$script:SshFirewallExposureProblems = @()
+$script:PreviousSshPort = $null
+$script:TailscalePreservedPrefs = $null
+$script:TailscalePrefsReset = $false
+$script:OpenSshInstallLog = $null
+$script:OpenSshRestartNeeded = $false
+$script:ValidatedTailscaleIp = $null
 
 $FailedSteps = New-Object System.Collections.Generic.List[string]
+
+# ---------------------------------------------------------------------------
+# 1. Infrastructure: logging, required steps and process PATH
+# ---------------------------------------------------------------------------
 
 function Write-Log  { param($m) Write-Host "[*] $m" -ForegroundColor Cyan }
 function Write-Warn { param($m) Write-Host "[!] $m" -ForegroundColor Yellow }
@@ -123,16 +162,6 @@ function Test-CommandExists {
     return [bool](Get-Command $Name -ErrorAction SilentlyContinue)
 }
 
-function Get-NativeProgramFiles {
-    foreach ($candidate in @(
-        $env:ProgramW6432,
-        [Environment]::GetEnvironmentVariable('ProgramW6432', 'Machine'),
-        $env:ProgramFiles
-    )) {
-        if ($candidate) { return $candidate }
-    }
-    throw 'Unable to determine the native Program Files directory'
-}
 
 function Update-ProcessPath {
     $machine = [Environment]::GetEnvironmentVariable('Path', 'Machine')
@@ -148,6 +177,44 @@ function Update-ProcessPath {
             $env:Path = "$env:Path;$tsDir"
         }
     }
+}
+
+# ---------------------------------------------------------------------------
+# 2. Read-only checks, shared with verify-ssh-config.ps1 -LibraryOnly
+# ---------------------------------------------------------------------------
+
+function Get-NativeProgramFiles {
+    # A 32-bit PowerShell on 64-bit Windows sees a redirected Program Files.
+    foreach ($candidate in @(
+        $env:ProgramW6432,
+        [Environment]::GetEnvironmentVariable('ProgramW6432', 'Machine'),
+        $env:ProgramFiles
+    )) {
+        if ($candidate) { return $candidate }
+    }
+    throw 'Unable to determine the native Program Files directory'
+}
+
+function Get-NativeSystemPath {
+    param([string]$RelativePath)
+    $directory = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
+        'Sysnative'
+    } else { 'System32' }
+    return Join-Path (Join-Path $env:WINDIR $directory) $RelativePath
+}
+
+function Get-JsonProperty {
+    # ConvertFrom-Json output changes shape between product versions, and
+    # reading a property that is not there throws under Set-StrictMode.
+    param(
+        [AllowNull()]$Object,
+        [string]$Name,
+        [AllowNull()]$Default = $null
+    )
+    if ($null -eq $Object) { return $Default }
+    $property = $Object.PSObject.Properties[$Name]
+    if (-not $property) { return $Default }
+    return $property.Value
 }
 
 function Get-TailscaleExe {
@@ -166,6 +233,299 @@ function Get-TailscaleExe {
     }
     return $null
 }
+
+function Get-TailscaleIpAddress {
+    # Returns the first address of the requested family, or $null.  This is a
+    # diagnostic helper, so it must not leak a native exit code into the
+    # caller's required-step bookkeeping.
+    param(
+        [AllowNull()][string]$Exe,
+        [ValidateSet(4, 6)][int]$Family = 4
+    )
+    if (-not $Exe) { return $null }
+    try {
+        $value = [string](& $Exe ip "-$Family" 2>$null | Select-Object -First 1)
+        $value = $value.Trim()
+        if ($value) { return $value }
+        return $null
+    } finally {
+        $global:LASTEXITCODE = 0
+    }
+}
+
+function Test-TailscaleIPv4 {
+    param([string]$Address)
+    $parsed = $null
+    if (-not [Net.IPAddress]::TryParse($Address, [ref]$parsed)) { return $false }
+    $bytes = $parsed.GetAddressBytes()
+    return $bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127
+}
+
+function Test-TailscaleIPv6 {
+    # Tailscale hands out IPv6 addresses from the fd7a:115c:a1e0::/48 ULA range.
+    param([string]$Address)
+    $parsed = $null
+    if (-not [Net.IPAddress]::TryParse($Address, [ref]$parsed)) { return $false }
+    if ($parsed.AddressFamily -ne [Net.Sockets.AddressFamily]::InterNetworkV6) { return $false }
+    $bytes = $parsed.GetAddressBytes()
+    return $bytes[0] -eq 0xfd -and $bytes[1] -eq 0x7a -and $bytes[2] -eq 0x11 -and
+        $bytes[3] -eq 0x5c -and $bytes[4] -eq 0xa1 -and $bytes[5] -eq 0xe0
+}
+
+function Get-TailscaleFirewallRanges {
+    # sshd listens on both families, so the inbound rule has to cover the
+    # Tailscale range of both families and nothing else.
+    return @(
+        '100.64.0.0/10',
+        'fd7a:115c:a1e0::/48'
+    )
+}
+
+function Test-TailscaleFirewallRange {
+    param([AllowNull()][object[]]$RemoteAddresses)
+
+    $normalized = @(
+        foreach ($address in @($RemoteAddresses)) {
+            $value = ([string]$address).Trim().ToLowerInvariant()
+            # netsh and some policies spell the IPv4 range with a dotted mask.
+            if ($value -eq '100.64.0.0/255.192.0.0') { $value = '100.64.0.0/10' }
+            if ($value) { $value }
+        }
+    )
+    $expected = Get-TailscaleFirewallRanges
+    if ($normalized.Count -ne $expected.Count) { return $false }
+    foreach ($range in $expected) {
+        if ($normalized -notcontains $range) { return $false }
+    }
+    return $true
+}
+
+function Get-SshdServiceExecutable {
+    try {
+        $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
+        if (-not $service -or -not $service.PathName) { return $null }
+
+        $commandLine = [Environment]::ExpandEnvironmentVariables([string]$service.PathName)
+        $candidate = $null
+        if ($commandLine -match '^\s*"([^"]+\.exe)"') {
+            $candidate = $Matches[1]
+        } elseif ($commandLine -match '^\s*(.+?\.exe)(?:\s|$)') {
+            $candidate = $Matches[1].Trim()
+        }
+        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
+            return $candidate
+        }
+    } catch {}
+    return $null
+}
+
+function Get-SshdExe {
+    # Prefer the binary the sshd service actually launches: PATH may hold a
+    # second OpenSSH installation with different defaults or features.
+    $serviceExe = Get-SshdServiceExecutable
+    if ($serviceExe) { return $serviceExe }
+
+    $candidate = Get-NativeSystemPath 'OpenSSH\sshd.exe'
+    if (Test-Path -LiteralPath $candidate) { return $candidate }
+
+    $cmd = Get-Command sshd.exe -ErrorAction SilentlyContinue
+    if (-not $cmd) { $cmd = Get-Command sshd -ErrorAction SilentlyContinue }
+    if ($cmd) { return $(if ($cmd.Path) { $cmd.Path } else { $cmd.Source }) }
+    return $null
+}
+
+function Get-SshdConfigValue {
+    # Reads an option from the global part of sshd_config only: everything
+    # after the first Match line is conditional and is not a global setting.
+    param([string]$ConfigFile, [string]$Key)
+    if (-not (Test-Path -LiteralPath $ConfigFile)) { return $null }
+    foreach ($line in @(Get-Content -LiteralPath $ConfigFile -ErrorAction SilentlyContinue)) {
+        if ($line -match '^\s*Match\s+') { break }
+        $plain = ($line -split '#', 2)[0]
+        if ($plain -match ("^\s*" + [regex]::Escape($Key) + "\s+(\S+)")) { return $Matches[1] }
+    }
+    return $null
+}
+
+function Get-SshdEffectiveConfig {
+    param([AllowNull()][string]$SshdPath, [AllowNull()][string]$ConnectionContext)
+    if (-not $SshdPath) { return @() }
+    $output = if ($ConnectionContext) {
+        & $SshdPath -T -C $ConnectionContext 2>$null
+    } else {
+        & $SshdPath -T 2>$null
+    }
+    if ($LASTEXITCODE -eq 0) { return @($output) }
+    return @()
+}
+
+function Get-SshdEffectiveValue {
+    param([AllowNull()][string[]]$Config, [string]$Key)
+    foreach ($line in @($Config)) {
+        if ($line -match ("^" + [regex]::Escape($Key) + "\s+(.+)$")) { return $Matches[1].Trim() }
+    }
+    return $null
+}
+
+function Test-AdministratorAuthorizedKeysValue {
+    param(
+        [AllowNull()][string]$Value,
+        [AllowNull()][string]$Path
+    )
+    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
+    $candidate = $Value.Trim()
+    if ($candidate -match '^"([^"]+)"$') {
+        $candidate = $Matches[1]
+    } elseif ($candidate.Contains('"')) {
+        return $false
+    }
+    $actual = $candidate.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
+    $programDataPath = Join-Path $env:ProgramData 'ssh\administrators_authorized_keys'
+    $expected = @(
+        '__programdata__/ssh/administrators_authorized_keys',
+        $programDataPath.Replace('\', '/').ToLowerInvariant()
+    )
+    if ($Path) {
+        $expected += $Path.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
+    }
+    return $actual -in $expected
+}
+
+function Get-SshUserNameProblem {
+    # sshd_config reads User/Match/AllowUsers values as patterns, and Windows
+    # local account names allow far fewer characters; reject exactly what is
+    # invalid in one or the other and leave the rest (including `!`) alone.
+    param([AllowNull()][string]$UserName)
+
+    if ([string]::IsNullOrWhiteSpace($UserName)) { return 'name is empty' }
+    $name = $UserName.Trim()
+    if ($name -match '\s') { return 'name contains whitespace' }
+    $invalid = @([regex]::Matches($name, '[\\"\@,/\[\]:;|=,+*?<>]') |
+        ForEach-Object Value | Sort-Object -Unique)
+    if ($invalid.Count) {
+        return "name contains characters that are invalid in a Windows account name or significant to sshd_config: $($invalid -join ' ')"
+    }
+    return $null
+}
+
+function Get-RestrictedSshPathAclProblems {
+    # Contract for files that hold SSH key material: no inheritance, owner
+    # Administrators, and exactly SYSTEM plus Administrators with FullControl.
+    param(
+        [string]$Path,
+        [AllowNull()][string]$Label
+    )
+    if (-not $Label) { $Label = $Path }
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
+    $allowed = @('S-1-5-18', 'S-1-5-32-544')
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if (-not $acl.AreAccessRulesProtected) { $problems.Add("$Label still inherits permissions") }
+    if ($ownerSid -ne 'S-1-5-32-544') { $problems.Add("$Label owner is $ownerSid, expected S-1-5-32-544") }
+    if ($rules.Count -ne 2) { $problems.Add("$Label has $($rules.Count) ACL entries, expected 2") }
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($sid -notin $allowed) { $problems.Add("$Label grants $sid") }
+        if ($rule.IsInherited) { $problems.Add("$Label keeps inherited entry $sid") }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) {
+            $problems.Add("$Label has a non-Allow entry for $sid")
+        }
+        $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
+        if (($rule.FileSystemRights -band $fullControl) -ne $fullControl) {
+            $problems.Add("$Label does not grant FullControl to $sid")
+        }
+    }
+    foreach ($sid in $allowed) {
+        if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq $sid })) {
+            $problems.Add("$Label is missing $sid")
+        }
+    }
+    return @($problems)
+}
+
+function Get-SshDirectoryAclProblems {
+    # The ssh directory must stay readable for non-administrators (the OpenSSH
+    # client reads the system-wide ssh_config from it) but must not be writable
+    # by them: a writable ssh directory lets anyone plant files next to the
+    # managed key material.
+    param(
+        [string]$Path,
+        [AllowNull()][string]$Label
+    )
+    if (-not $Label) { $Label = $Path }
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
+    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+    if (-not $acl.AreAccessRulesProtected) { $problems.Add("$Label still inherits permissions") }
+
+    $adminSids = @('S-1-5-18', 'S-1-5-32-544')
+    $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
+    $writeRights = [Security.AccessControl.FileSystemRights]::WriteData -bor
+        [Security.AccessControl.FileSystemRights]::AppendData -bor
+        [Security.AccessControl.FileSystemRights]::WriteExtendedAttributes -bor
+        [Security.AccessControl.FileSystemRights]::WriteAttributes -bor
+        [Security.AccessControl.FileSystemRights]::Delete -bor
+        [Security.AccessControl.FileSystemRights]::DeleteSubdirectoriesAndFiles -bor
+        [Security.AccessControl.FileSystemRights]::ChangePermissions -bor
+        [Security.AccessControl.FileSystemRights]::TakeOwnership
+
+    foreach ($rule in $rules) {
+        $sid = $rule.IdentityReference.Value
+        if ($sid -in $adminSids) {
+            if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow -or
+                ($rule.FileSystemRights -band $fullControl) -ne $fullControl) {
+                $problems.Add("$Label does not grant FullControl to $sid")
+            }
+            continue
+        }
+        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { continue }
+        if (($rule.FileSystemRights -band $writeRights) -ne 0) {
+            $problems.Add("$Label is writable by $sid")
+        }
+    }
+    foreach ($sid in $adminSids) {
+        if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq $sid })) {
+            $problems.Add("$Label is missing $sid")
+        }
+    }
+    return @($problems)
+}
+
+function Get-SshBanner {
+    param([string]$Address, [int]$Port, [int]$TimeoutMs = 5000)
+
+    $client = New-Object Net.Sockets.TcpClient
+    $stream = $null
+    $reader = $null
+    $async = $null
+    try {
+        $async = $client.BeginConnect($Address, $Port, $null, $null)
+        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
+            throw "SSH connection to $Address`:$Port timed out"
+        }
+        $client.EndConnect($async)
+        $stream = $client.GetStream()
+        $stream.ReadTimeout = $TimeoutMs
+        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 1024, $true)
+        $banner = $reader.ReadLine()
+        if ($banner -notmatch '^SSH-(?:2\.0|1\.99)-') {
+            throw "unexpected SSH protocol banner from $Address`:$Port`: $banner"
+        }
+        return $banner
+    } finally {
+        if ($reader) { $reader.Dispose() }
+        if ($stream) { $stream.Dispose() }
+        if ($async -and $async.AsyncWaitHandle) { $async.AsyncWaitHandle.Close() }
+        $client.Dispose()
+    }
+}
+
+# ---------------------------------------------------------------------------
+# 3. Telegram delivery
+# ---------------------------------------------------------------------------
 
 function Split-TelegramText {
     param(
@@ -218,6 +578,11 @@ function Send-Telegram {
         return $false
     }
 }
+
+
+# ---------------------------------------------------------------------------
+# 4. Tailscale installation and login
+# ---------------------------------------------------------------------------
 
 function Get-PublicIp {
     try {
@@ -313,10 +678,11 @@ function Install-TailscaleBootstrapper {
             -OutFile $installer -UseBasicParsing
 
         $signature = Get-AuthenticodeSignature -FilePath $installer
+        $signerSubject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '<none>' }
         if ($signature.Status -ne 'Valid' -or
             -not $signature.SignerCertificate -or
-            $signature.SignerCertificate.Subject -notmatch '(^|,\s*)CN=Tailscale Inc\.(?:,|$)') {
-            throw "Tailscale installer signature validation failed (status=$($signature.Status), signer=$($signature.SignerCertificate.Subject))"
+            $signerSubject -notmatch '(^|,\s*)CN=Tailscale Inc\.(?:,|$)') {
+            throw "Tailscale installer signature validation failed (status=$($signature.Status), signer=$signerSubject)"
         }
 
         $process = Start-Process -FilePath $installer -Wait -PassThru -ArgumentList @(
@@ -392,6 +758,121 @@ function Install-Tailscale {
     }
 }
 
+function Enable-TailscaleService {
+    $svc = Wait-ServiceRegistered -Name Tailscale
+    Set-Service -Name Tailscale -StartupType Automatic -ErrorAction Stop
+    if ($svc.Status -ne 'Running') {
+        Start-Service -Name Tailscale -ErrorAction Stop
+    }
+}
+
+function Connect-Tailscale {
+    param([string]$AuthKey, [switch]$ResetPrefs)
+    if (-not $AuthKey) {
+        Write-Err 'No Tailscale auth key found. Set the $TsAuthKey variable at the top of the script.'
+        throw 'missing-authkey'
+    }
+    $ts = Get-TailscaleExe
+    if (-not $ts) { Write-Err 'tailscale.exe not found'; throw 'tailscale-not-found' }
+
+    $status = & $ts status --json 2>$null
+    if ($LASTEXITCODE -eq 0) {
+        try {
+            if ((Get-JsonProperty -Object ($status | ConvertFrom-Json) -Name 'BackendState') -eq 'Running') {
+                Write-Log 'Tailscale is already connected, skipping login'
+                return
+            }
+        } catch {}
+    }
+
+    # Logging in without --reset keeps the options this script does not manage
+    # (exit node, advertised routes, --accept-routes); --reset is opt-in
+    # because it silently restores all of them to their defaults.
+    $preservedPrefs = if ($ResetPrefs) { $null } else { Get-TailscalePrefsSummary -Exe $ts }
+    Write-Log 'Logging in to Tailscale (auth key read, not echoed)...'
+    if ($ResetPrefs) {
+        Write-Warn 'Resetting previously configured tailscale up options (--reset).'
+        & $ts up --reset --authkey $AuthKey --unattended
+    } else {
+        if ($preservedPrefs) {
+            Write-Log "Keeping previously configured tailscale up options: $preservedPrefs"
+        }
+        & $ts up --authkey $AuthKey --unattended
+    }
+    Assert-NativeCommandSucceeded 'tailscale up'
+    $script:TailscalePreservedPrefs = $preservedPrefs
+}
+
+function Get-TailscalePrefsSummary {
+    # Lists the tailscale up options that a login without --reset keeps.
+    param([AllowNull()][string]$Exe)
+    if (-not $Exe) { return $null }
+
+    $raw = & $Exe debug prefs 2>$null
+    $exitCode = $LASTEXITCODE
+    if ($exitCode -ne 0 -or -not $raw) { return $null }
+    $prefs = $null
+    try { $prefs = $raw | ConvertFrom-Json } catch { return $null }
+    if (-not $prefs) { return $null }
+
+    $notes = New-Object System.Collections.Generic.List[string]
+    $routes = @(Get-JsonProperty -Object $prefs -Name 'AdvertiseRoutes' -Default @())
+    if ($routes.Count) { $notes.Add("AdvertiseRoutes=$($routes -join ',')") }
+    if (Get-JsonProperty -Object $prefs -Name 'AdvertiseExitNode' -Default $false) { $notes.Add('AdvertiseExitNode=true') }
+    if (Get-JsonProperty -Object $prefs -Name 'RouteAll' -Default $false) { $notes.Add('RouteAll=true') }
+    if (Get-JsonProperty -Object $prefs -Name 'RunSSH' -Default $false) { $notes.Add('RunSSH=true') }
+    if (Get-JsonProperty -Object $prefs -Name 'ShieldsUp' -Default $false) { $notes.Add('ShieldsUp=true') }
+    $exitNodeId = [string](Get-JsonProperty -Object $prefs -Name 'ExitNodeID' -Default '')
+    if ($exitNodeId) { $notes.Add("ExitNodeID=$exitNodeId") }
+    if ($notes.Count -eq 0) { return $null }
+    return ($notes -join ', ')
+}
+
+function Assert-TailscaleReady {
+    param([int]$Attempts = 15, [int]$DelaySeconds = 2)
+
+    $ts = Get-TailscaleExe
+    if (-not $ts) { throw 'tailscale.exe not found' }
+    $lastState = 'unknown'
+
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        $statusJson = & $ts status --json 2>$null
+        if ($LASTEXITCODE -eq 0 -and $statusJson) {
+            try {
+                $status = $statusJson | ConvertFrom-Json
+                $lastState = [string]$status.BackendState
+                $ip = [string](& $ts ip -4 2>$null | Select-Object -First 1)
+                $ip = $ip.Trim()
+                if ($LASTEXITCODE -eq 0 -and $lastState -eq 'Running' -and (Test-TailscaleIPv4 $ip)) {
+                    return $ip
+                }
+            } catch {
+                $lastState = "invalid status JSON: $($_.Exception.Message)"
+            }
+        }
+        if ($attempt -lt $Attempts -and $DelaySeconds -gt 0) {
+            Start-Sleep -Seconds $DelaySeconds
+        }
+    }
+    throw "Tailscale did not become ready (BackendState=$lastState, no valid 100.64.0.0/10 IPv4 address)"
+}
+
+
+# ---------------------------------------------------------------------------
+# 5. OpenSSH, sshd_config, ACLs, firewall and failure diagnostics
+# ---------------------------------------------------------------------------
+
+
+
+
+
+
+
+
+
+
+
+
 function Wait-ServiceRegistered {
     param([string]$Name, [int]$Attempts = 30, [int]$DelaySeconds = 2)
 
@@ -425,80 +906,38 @@ function Wait-ServiceState {
     return $state
 }
 
-function Enable-TailscaleService {
-    $svc = Wait-ServiceRegistered -Name Tailscale
-    Set-Service -Name Tailscale -StartupType Automatic -ErrorAction Stop
-    if ($svc.Status -ne 'Running') {
-        Start-Service -Name Tailscale -ErrorAction Stop
+
+
+
+
+
+function Test-TcpPortListening {
+    # Privilege-free probe for "is anything listening on this port".  It uses
+    # the .NET socket table instead of the NetTCPIP provider, which needs WMI
+    # and raises an error when a port has no matching connection at all.
+    param([int]$Port)
+
+    try {
+        $listeners = [Net.NetworkInformation.IPGlobalProperties]::GetIPGlobalProperties().GetActiveTcpListeners()
+    } catch {
+        return $null
     }
-}
-
-function Connect-Tailscale {
-    param([string]$AuthKey)
-    if (-not $AuthKey) {
-        Write-Err 'No Tailscale auth key found. Set the $TsAuthKey variable at the top of the script.'
-        throw 'missing-authkey'
-    }
-    $ts = Get-TailscaleExe
-    if (-not $ts) { Write-Err 'tailscale.exe not found'; throw 'tailscale-not-found' }
-
-    $status = & $ts status --json 2>$null
-    if ($LASTEXITCODE -eq 0) {
-        try {
-            if ((($status | ConvertFrom-Json).BackendState) -eq 'Running') {
-                Write-Log 'Tailscale is already connected, skipping login'
-                return
-            }
-        } catch {}
-    }
-    Write-Log 'Logging in to Tailscale (auth key read, not echoed)...'
-
-    & $ts up --reset --authkey $AuthKey --unattended
-    Assert-NativeCommandSucceeded 'tailscale up'
-}
-
-function Test-TailscaleIPv4 {
-    param([string]$Address)
-    $parsed = $null
-    if (-not [Net.IPAddress]::TryParse($Address, [ref]$parsed)) { return $false }
-    $bytes = $parsed.GetAddressBytes()
-    return $bytes.Length -eq 4 -and $bytes[0] -eq 100 -and $bytes[1] -ge 64 -and $bytes[1] -le 127
-}
-
-function Assert-TailscaleReady {
-    param([int]$Attempts = 15, [int]$DelaySeconds = 2)
-
-    $ts = Get-TailscaleExe
-    if (-not $ts) { throw 'tailscale.exe not found' }
-    $lastState = 'unknown'
-
-    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
-        $statusJson = & $ts status --json 2>$null
-        if ($LASTEXITCODE -eq 0 -and $statusJson) {
-            try {
-                $status = $statusJson | ConvertFrom-Json
-                $lastState = [string]$status.BackendState
-                $ip = [string](& $ts ip -4 2>$null | Select-Object -First 1)
-                $ip = $ip.Trim()
-                if ($LASTEXITCODE -eq 0 -and $lastState -eq 'Running' -and (Test-TailscaleIPv4 $ip)) {
-                    return $ip
-                }
-            } catch {
-                $lastState = "invalid status JSON: $($_.Exception.Message)"
-            }
-        }
-        if ($attempt -lt $Attempts -and $DelaySeconds -gt 0) {
-            Start-Sleep -Seconds $DelaySeconds
-        }
-    }
-    throw "Tailscale did not become ready (BackendState=$lastState, no valid 100.64.0.0/10 IPv4 address)"
+    return [bool](@($listeners | Where-Object { $_.Port -eq $Port }).Count)
 }
 
 function Get-TcpPortListenerState {
     param([int]$Port)
 
-    $listeners = @(Get-NetTCPConnection -State Listen -ErrorAction Stop | Where-Object LocalPort -eq $Port)
-    if ($listeners.Count -eq 0) { return 'Free' }
+    if ((Test-TcpPortListening -Port $Port) -eq $false) { return 'Free' }
+
+    # Port is in use: ask the provider who owns it.  A query that cannot be
+    # answered must not be reported as "free" or as "sshd".
+    try {
+        $listeners = @(Get-NetTCPConnection -State Listen -LocalPort $Port -ErrorAction Stop)
+    } catch {
+        return 'Other'
+    }
+    if ($listeners.Count -eq 0) { return 'Other' }
 
     $owners = @($listeners | ForEach-Object OwningProcess | Sort-Object -Unique)
     $identified = 0
@@ -588,24 +1027,6 @@ function Wait-TcpPortListenerState {
     return $state
 }
 
-function Get-SshdServiceExecutable {
-    try {
-        $service = Get-CimInstance Win32_Service -Filter "Name='sshd'" -ErrorAction Stop
-        if (-not $service.PathName) { return $null }
-
-        $commandLine = [Environment]::ExpandEnvironmentVariables([string]$service.PathName)
-        $candidate = $null
-        if ($commandLine -match '^\s*"([^"]+\.exe)"') {
-            $candidate = $Matches[1]
-        } elseif ($commandLine -match '^\s*(.+?\.exe)(?:\s|$)') {
-            $candidate = $Matches[1].Trim()
-        }
-        if ($candidate -and (Test-Path -LiteralPath $candidate -PathType Leaf)) {
-            return $candidate
-        }
-    } catch {}
-    return $null
-}
 
 function Get-SshdForegroundDiagnostic {
     param(
@@ -669,7 +1090,10 @@ function Get-SshdRuntimeDiagnostic {
     $parts = New-Object System.Collections.Generic.List[string]
     try {
         $windows = Get-ItemProperty -LiteralPath 'HKLM:\SOFTWARE\Microsoft\Windows NT\CurrentVersion' -ErrorAction Stop
-        [void]$parts.Add("Windows=$($windows.DisplayVersion) build=$($windows.CurrentBuild).$($windows.UBR)")
+        $displayVersion = [string](Get-JsonProperty -Object $windows -Name 'DisplayVersion' -Default '')
+        $currentBuild = [string](Get-JsonProperty -Object $windows -Name 'CurrentBuild' -Default '')
+        $updateBuildRevision = [string](Get-JsonProperty -Object $windows -Name 'UBR' -Default '')
+        [void]$parts.Add("Windows=$displayVersion build=$currentBuild.$updateBuildRevision")
     } catch {
         [void]$parts.Add("Windows build query failed: $($_.Exception.Message)")
     }
@@ -847,11 +1271,13 @@ function Initialize-SshTargetUsers {
     if ([string]::IsNullOrWhiteSpace($script:SshTargetUserName)) {
         throw 'local built-in Administrator account (RID 500) has no usable name'
     }
-    if ($script:SshTargetUserName -match '[\s"@,*?!]') {
-        throw "built-in Administrator account name cannot be represented safely in sshd_config: $script:SshTargetUserName"
+    $targetNameProblem = Get-SshUserNameProblem -UserName $script:SshTargetUserName
+    if ($targetNameProblem) {
+        throw "built-in Administrator account name cannot be used in sshd_config ($targetNameProblem): $script:SshTargetUserName"
     }
 
     $administratorEnabled = -not [bool]$account.Disabled
+    $script:SshAdministratorState = if ($administratorEnabled) { 'already enabled' } else { 'was disabled' }
     if (-not $administratorEnabled) {
         $enableFailure = $null
         try {
@@ -881,6 +1307,9 @@ function Initialize-SshTargetUsers {
 
         if (-not $administratorEnabled) {
             Write-Warn "Could not enable built-in Administrator '$script:SshTargetUserName' ($enableFailure); continuing with the current user only."
+            $script:SshAdministratorState = "could not be enabled ($enableFailure)"
+        } else {
+            $script:SshAdministratorState = 'enabled by this run'
         }
     }
 
@@ -986,7 +1415,8 @@ function Get-SshConfigUserNames {
     $seenUsers = New-Object 'System.Collections.Generic.HashSet[string]' ([StringComparer]::OrdinalIgnoreCase)
     foreach ($userName in $sourceNames) {
         if ([string]::IsNullOrWhiteSpace($userName)) { continue }
-        if ($userName -match '[\s"@,*?!]') { throw 'SSH target username cannot be represented safely in sshd_config' }
+        $nameProblem = Get-SshUserNameProblem -UserName $userName
+        if ($nameProblem) { throw "SSH target username cannot be used in sshd_config ($nameProblem): $userName" }
         # Keep the canonical Windows account name for AllowUsers, Match User,
         # diagnostics, and the sshd -T -C validation context.
         $trimmedUserName = $userName.Trim()
@@ -1015,16 +1445,7 @@ function Initialize-SshdConfig {
 function Set-SshHostPrivateKeyAcl {
     param([Parameter(Mandatory)][string]$Path)
 
-    & takeown.exe /F $Path /A | Out-Null
-    Assert-NativeCommandSucceeded "take ownership of SSH host key: $Path"
-    & icacls.exe $Path /reset | Out-Null
-    Assert-NativeCommandSucceeded "reset SSH host key ACL: $Path"
-    & icacls.exe $Path /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
-    Assert-NativeCommandSucceeded "grant SSH host key ACL: $Path"
-    & icacls.exe $Path '/inheritance:r' | Out-Null
-    Assert-NativeCommandSucceeded "disable SSH host key ACL inheritance: $Path"
-    & icacls.exe $Path /setowner '*S-1-5-32-544' | Out-Null
-    Assert-NativeCommandSucceeded "set SSH host key owner: $Path"
+    Set-RestrictedSshPathAcl -Path $Path
 }
 
 function Get-SshHostKeyDiagnostic {
@@ -1112,13 +1533,6 @@ function Test-OpenSshServerInstalled {
     return [bool]($sshd -and $service)
 }
 
-function Get-NativeSystemPath {
-    param([string]$RelativePath)
-    $directory = if ([Environment]::Is64BitOperatingSystem -and -not [Environment]::Is64BitProcess) {
-        'Sysnative'
-    } else { 'System32' }
-    return Join-Path (Join-Path $env:WINDIR $directory) $RelativePath
-}
 
 function Get-OpenSshInstallServices {
     return @(Get-CimInstance Win32_Service -Filter "Name='TrustedInstaller' OR Name='wuauserv' OR Name='BITS'" -ErrorAction Stop)
@@ -1274,7 +1688,7 @@ function Install-OpenSshServerCapability {
             }
         }
 
-        $script:OpenSshRestartNeeded = [bool]$result.RestartNeeded
+        $script:OpenSshRestartNeeded = [bool]($result -and $result.RestartNeeded)
         Write-OpenSshInstallLog "Installation completed; RestartNeeded=$script:OpenSshRestartNeeded"
         $global:LASTEXITCODE = 0
         Update-ProcessPath
@@ -1305,6 +1719,7 @@ function Enable-OpenSSHServer {
 
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
     $defaultCfg = Get-NativeSystemPath 'OpenSSH\sshd_config_default'
+    $configHashBefore = Get-FileContentHash -Path $cfg
     Invoke-OpenSshOperation 'Initialize and write sshd_config' {
         Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
         Select-SshPort
@@ -1321,7 +1736,7 @@ function Enable-OpenSSHServer {
         Set-Service -Name sshd -StartupType Automatic -ErrorAction Stop
 
         try {
-            Start-OrRestartSshdService
+            Update-SshdServiceForConfigChange -ConfigPath $cfg -Port $SshPort -PreviousHash $configHashBefore
             Assert-SshdHealthy -Port $SshPort
         } catch {
             $initialFailure = $_.Exception.Message
@@ -1352,7 +1767,7 @@ function Enable-OpenSSHServer {
                 Write-Warn "Previous sshd_config was preserved at $backup"
                 Initialize-SshHostKeys
                 Assert-SshdConfigValid -ConfigPath $cfg
-                Start-OrRestartSshdService
+                Update-SshdServiceForConfigChange -ConfigPath $cfg -Port $SshPort -PreviousHash $null
                 Assert-SshdHealthy -Port $SshPort
             } catch {
                 $repairFailure = $_.Exception.Message
@@ -1366,8 +1781,12 @@ function Enable-OpenSSHServer {
     }
 
     try {
-        if (Get-Service -Name ssh-agent -ErrorAction SilentlyContinue) {
+        $agent = Get-Service -Name ssh-agent -ErrorAction SilentlyContinue
+        if ($agent) {
             Set-Service -Name ssh-agent -StartupType Automatic -ErrorAction Stop
+            if ($agent.Status -ne 'Running') {
+                Start-Service -Name ssh-agent -ErrorAction Stop
+            }
         }
     } catch {
         Write-Warn "Optional ssh-agent configuration failed: $($_.Exception.Message)"
@@ -1379,35 +1798,125 @@ function Enable-OpenSSHServer {
         if ($rule) {
             Remove-NetFirewallRule -Name $ruleName -ErrorAction Stop
         }
-        Write-Log "Creating inbound firewall rule (TCP $SshPort)..."
+        $ranges = Get-TailscaleFirewallRanges
+        Write-Log "Creating inbound firewall rule (TCP $SshPort from $($ranges -join ', '))..."
         New-NetFirewallRule -Name $ruleName -DisplayName 'OpenSSH Server (sshd)' `
             -Enabled True -Direction Inbound -Protocol TCP -Action Allow -LocalPort $SshPort `
-            -Profile Any -RemoteAddress '100.64.0.0/10' | Out-Null
+            -Profile Any -RemoteAddress $ranges | Out-Null
+    }
+
+    # The managed rule is not the only way this port can be reachable: report
+    # any other enabled inbound rule that exposes it to something wider than
+    # the tailnet instead of silently leaving the machine open.
+    $script:SshFirewallExposureProblems = @(Get-SshFirewallExposureProblems -Port $SshPort -ManagedRuleName 'OpenSSH-Server-In-TCP')
+    foreach ($exposure in $script:SshFirewallExposureProblems) {
+        Write-Warn "Another firewall rule exposes the SSH port: $exposure"
     }
 }
 
+function Get-SshdConfigSections {
+    # sshd_config is a global section followed by any number of Match blocks.
+    # Only the global section may be edited as a global option with "first
+    # occurrence wins" semantics, so keep the two parts apart.
+    param([string[]]$Lines)
+
+    $matchIndex = -1
+    for ($i = 0; $i -lt $Lines.Count; $i++) {
+        if ($Lines[$i] -match '^\s*Match(?:\s|$)') { $matchIndex = $i; break }
+    }
+    if ($matchIndex -lt 0) {
+        return [pscustomobject]@{
+            Global = @($Lines)
+            Conditional = @()
+        }
+    }
+    $globalLines = if ($matchIndex -gt 0) { @($Lines[0..($matchIndex - 1)]) } else { @() }
+    return [pscustomobject]@{
+        Global = $globalLines
+        Conditional = @($Lines[$matchIndex..($Lines.Count - 1)])
+    }
+}
+
+function Get-SshdUnmanagedConditionalLines {
+    # Conditional entries this script does not own.  Options inside the managed
+    # block are written on purpose and must not raise a warning.
+    param([string[]]$Lines)
+
+    $result = New-Object System.Collections.Generic.List[string]
+    $insideManagedBlock = $false
+    foreach ($line in @($Lines)) {
+        if ($line -eq $script:ManagedUserBlockBegin) { $insideManagedBlock = $true; continue }
+        if ($line -eq $script:ManagedUserBlockEnd) { $insideManagedBlock = $false; continue }
+        if ($insideManagedBlock) { continue }
+        $result.Add($line)
+    }
+    return @($result)
+}
+
 function Set-SshdOption {
+    # Writes a global option at the top of the file (first occurrence wins) and
+    # leaves a same-named option inside a Match block untouched so an operator
+    # keeps whatever they configured there.
     param([string]$File, [string]$Key, [string]$Value)
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
         throw "sshd_config not found, refusing to skip option '$Key': $File"
     }
-    $lines = @([IO.File]::ReadAllLines($File))
+    $sections = Get-SshdConfigSections -Lines @([IO.File]::ReadAllLines($File))
     $pattern = "^\s*$([regex]::Escape($Key))\s+"
-    $kept = @($lines | Where-Object { $_ -notmatch $pattern })
+    $kept = @($sections.Global | Where-Object { $_ -notmatch $pattern })
 
-    Write-SshdConfigLines -File $File -Lines (@("$Key $Value") + $kept)
+    $conditionalMatches = @(
+        Get-SshdUnmanagedConditionalLines -Lines $sections.Conditional |
+            Where-Object { $_ -match $pattern }
+    )
+    if ($conditionalMatches.Count) {
+        Write-Warn "sshd_config sets '$Key' inside a Match block; the global '$Key $Value' is the one in effect."
+    }
+
+    Write-SshdConfigLines -File $File -Lines (@("$Key $Value") + $kept + $sections.Conditional)
 }
 
 function Remove-SshdOption {
-    param([string]$File, [string]$Key)
+    # Disables a global option by commenting it out instead of deleting it, so
+    # the previous value stays visible and can be restored by hand.  A
+    # same-named option inside a Match block is left untouched.
+    # -Discard removes the option without leaving a comment; it is meant for
+    # options the caller rewrites immediately (an old alias, for example), where
+    # a comment would only add noise on every run.
+    param([string]$File, [string]$Key, [switch]$Discard)
     if (-not (Test-Path -LiteralPath $File -PathType Leaf)) {
         throw "sshd_config not found, refusing to remove option '$Key': $File"
     }
+    $sections = Get-SshdConfigSections -Lines @([IO.File]::ReadAllLines($File))
     $pattern = "^\s*$([regex]::Escape($Key))(?:\s|$)"
-    $lines = @([IO.File]::ReadAllLines($File))
-    $kept = @($lines | Where-Object { $_ -notmatch $pattern })
-    if ($kept.Count -ne $lines.Count) {
-        Write-SshdConfigLines -File $File -Lines $kept
+    $commentPrefix = "$script:DisabledOptionCommentPrefix$Key "
+
+    $updated = New-Object System.Collections.Generic.List[string]
+    $disabled = 0
+    # One comment per option keeps the original value visible and keeps the
+    # file stable: a later run finds nothing active to disable and adds nothing.
+    $alreadyRecorded = @(
+        $sections.Global | Where-Object { $_.StartsWith($commentPrefix, [StringComparison]::Ordinal) }
+    ).Count -gt 0
+    foreach ($line in @($sections.Global)) {
+        if ($line -match $pattern) {
+            $disabled++
+            if (-not $Discard -and -not $alreadyRecorded) { $updated.Add("$commentPrefix$line") }
+            continue
+        }
+        $updated.Add($line)
+    }
+
+    $conditionalMatches = @(
+        Get-SshdUnmanagedConditionalLines -Lines $sections.Conditional |
+            Where-Object { $_ -match $pattern }
+    )
+    if ($conditionalMatches.Count) {
+        Write-Warn "sshd_config sets '$Key' inside a Match block; leaving that entry untouched."
+    }
+
+    if ($disabled -gt 0) {
+        Write-SshdConfigLines -File $File -Lines (@($updated) + $sections.Conditional)
     }
 }
 
@@ -1415,11 +1924,15 @@ function Set-ManagedSshdConfig {
     param([string]$File, [int]$Port, [string[]]$UserNames)
 
     Remove-SshdOption -File $File -Key 'ListenAddress'
-    Set-SshdOption -File $File -Key 'AddressFamily' -Value 'inet'
+    # sshd listens on both families; the firewall rule restrict both to the
+    # tailnet instead of hiding the IPv6 listener behind AddressFamily inet.
+    Set-SshdOption -File $File -Key 'AddressFamily' -Value 'any'
     Set-SshdOption -File $File -Key 'Port' -Value $Port
     Set-SshdOption -File $File -Key 'PasswordAuthentication' -Value 'no'
 
-    Remove-SshdOption -File $File -Key 'ChallengeResponseAuthentication'
+    # Old Windows 10 builds use the ChallengeResponseAuthentication alias; it is
+    # discarded rather than commented because it is rewritten right below.
+    Remove-SshdOption -File $File -Key 'ChallengeResponseAuthentication' -Discard
     Set-SshdOption -File $File -Key 'KbdInteractiveAuthentication' -Value 'no'
     Set-SshdOption -File $File -Key 'ChallengeResponseAuthentication' -Value 'no'
     Set-SshdOption -File $File -Key 'PubkeyAuthentication' -Value 'yes'
@@ -1451,46 +1964,6 @@ function Repair-SshdConfigFromDefault {
     return $backup
 }
 
-function Start-OrRestartSshdService {
-    $service = Get-Service -Name sshd -ErrorAction Stop
-    if ($service.Status -eq 'Running') {
-        Restart-Service -Name sshd -ErrorAction Stop
-    } else {
-        Start-Service -Name sshd -ErrorAction Stop
-    }
-}
-
-function Enable-AuthorizedKeysAclRepairAccess {
-    param(
-        [string]$Path,
-        [switch]$Container
-    )
-
-    # A previous run may have removed the launching administrator from the
-    # DACL before it could set the final owner.  Temporarily make the built-in
-    # Administrators group the owner so an elevated administrator or SYSTEM
-    # can repair and rerun the setup.
-    & takeown.exe /F $Path /A | Out-Null
-    Assert-NativeCommandSucceeded "take ownership for ACL repair: $Path"
-
-    $rights = if ($Container) { '(OI)(CI)(F)' } else { '(F)' }
-    & icacls.exe $Path /grant "*S-1-5-32-544:$rights" | Out-Null
-    Assert-NativeCommandSucceeded "grant Administrators ACL repair access: $Path"
-}
-
-function Set-RestrictedAdministratorsAuthorizedKeysAcl {
-    param([string]$Path)
-
-    & icacls.exe $Path /reset | Out-Null
-    Assert-NativeCommandSucceeded 'reset administrators-authorized-keys ACL'
-    & icacls.exe $Path /grant:r '*S-1-5-18:(F)' '*S-1-5-32-544:(F)' | Out-Null
-    Assert-NativeCommandSucceeded 'grant administrators-authorized-keys ACL'
-    & icacls.exe $Path '/inheritance:r' | Out-Null
-    Assert-NativeCommandSucceeded 'disable administrators-authorized-keys ACL inheritance'
-    & icacls.exe $Path /setowner '*S-1-5-32-544' | Out-Null
-    Assert-NativeCommandSucceeded 'set administrators-authorized-keys owner'
-}
-
 function Set-AuthorizedKeys {
     if (-not $SshPublicKeys -or $SshPublicKeys.Count -eq 0) {
         throw '$SshPublicKeys is empty; refusing to disable password authentication without a public key'
@@ -1501,9 +1974,10 @@ function Set-AuthorizedKeys {
     if (-not (Test-Path -LiteralPath $authDir -PathType Container)) {
         New-Item -ItemType Directory -Path $authDir -Force | Out-Null
     }
+    Set-SshDirectoryAcl -Path $authDir
 
     if (-not (Test-Path $authFile)) { New-Item -ItemType File -Path $authFile -Force | Out-Null }
-    Enable-AuthorizedKeysAclRepairAccess -Path $authFile
+    Grant-SshPathAclRepairAccess -Path $authFile
 
     $existing = @(Get-Content -LiteralPath $authFile -ErrorAction SilentlyContinue)
     $added = 0
@@ -1516,35 +1990,11 @@ function Set-AuthorizedKeys {
     }
     Set-Content -LiteralPath $authFile -Value $existing -Encoding ASCII -ErrorAction Stop
 
-    # Finalize the file first.  The directory keeps the temporary repair ACE
-    # until the child no longer needs to be opened by this process.
-    Set-RestrictedAdministratorsAuthorizedKeysAcl -Path $authFile
+    Set-RestrictedSshPathAcl -Path $authFile
     Assert-AuthorizedKeysReady -File $authFile
+    Assert-SshDirectoryAclReady -Path $authDir
 
     Write-Log "authorized_keys configured ($authFile), $added key(s) added this run."
-}
-
-function Assert-RestrictedAdministratorsAuthorizedKeysAcl {
-    param([string]$Path)
-
-    $acl = Get-Acl -LiteralPath $Path -ErrorAction Stop
-    if (-not $acl.AreAccessRulesProtected) { throw 'administrators_authorized_keys ACL inheritance is enabled' }
-    $ownerSid = $acl.GetOwner([Security.Principal.SecurityIdentifier]).Value
-    if ($ownerSid -ne 'S-1-5-32-544') { throw 'administrators_authorized_keys owner is not Administrators' }
-
-    $allowed = @('S-1-5-18', 'S-1-5-32-544')
-    $rules = @($acl.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
-    if ($rules.Count -ne 2) { throw 'administrators_authorized_keys must have exactly two ACL entries' }
-    foreach ($rule in $rules) {
-        $sid = $rule.IdentityReference.Value
-        if ($sid -notin $allowed -or $rule.IsInherited) { throw 'administrators_authorized_keys has an unexpected ACL entry' }
-        if ($rule.AccessControlType -ne [Security.AccessControl.AccessControlType]::Allow) { throw 'administrators_authorized_keys has a non-Allow ACL entry' }
-        $fullControl = [Security.AccessControl.FileSystemRights]::FullControl
-        if (($rule.FileSystemRights -band $fullControl) -ne $fullControl) { throw 'administrators_authorized_keys ACL is not FullControl' }
-    }
-    foreach ($sid in $allowed) {
-        if (-not ($rules | Where-Object { $_.IdentityReference.Value -eq $sid })) { throw 'administrators_authorized_keys is missing a required ACL principal' }
-    }
 }
 
 function Assert-AuthorizedKeysReady {
@@ -1556,7 +2006,7 @@ function Assert-AuthorizedKeysReady {
         if ($existing -notcontains $key.Trim()) { throw "configured public key is missing: $(($key -split '\s+')[-1])" }
     }
 
-    Assert-RestrictedAdministratorsAuthorizedKeysAcl -Path $File
+    Assert-RestrictedSshPathAcl -Path $File -Label $File
 }
 
 function Enable-X11Forwarding {
@@ -1565,56 +2015,19 @@ function Enable-X11Forwarding {
         Write-Warn "$cfg not found (OpenSSH Server may not have started yet), skipping X11 config."
         return
     }
+    $configHashBefore = Get-FileContentHash -Path $cfg
     Write-Log "Enabling X11 forwarding ($cfg)..."
     Set-SshdOption -File $cfg -Key 'X11Forwarding' -Value 'yes'
     Set-SshdOption -File $cfg -Key 'X11UseLocalhost' -Value 'yes'
 
     Assert-SshdConfigValid
-    Restart-Service -Name sshd -ErrorAction Stop
+    Update-SshdServiceForConfigChange -ConfigPath $cfg -Port $SshPort -PreviousHash $configHashBefore
     Assert-SshdHealthy -Port $SshPort
 
     Write-Warn 'Native Windows has no built-in X server; to display remote GUI windows, install VcXsrv / Xming on the client.'
 }
 
-function Get-SshdExe {
-    # Validate with the binary that Start-Service will actually launch. PATH can
-    # contain a second OpenSSH installation with different defaults or features.
-    $serviceExe = Get-SshdServiceExecutable
-    if ($serviceExe) { return $serviceExe }
 
-    $candidate = Get-NativeSystemPath 'OpenSSH\sshd.exe'
-    if (Test-Path -LiteralPath $candidate) { return $candidate }
-
-    $cmd = Get-Command sshd.exe -ErrorAction SilentlyContinue
-    if (-not $cmd) { $cmd = Get-Command sshd -ErrorAction SilentlyContinue }
-    if ($cmd) { return $(if ($cmd.Path) { $cmd.Path } else { $cmd.Source }) }
-    return $null
-}
-
-function Get-SshdEffectiveValue {
-    param([string[]]$Config, [string]$Key)
-    foreach ($line in $Config) {
-        if ($line -match ("^" + [regex]::Escape($Key) + "\s+(.+)$")) { return $Matches[1].Trim() }
-    }
-    return $null
-}
-
-function Test-AdministratorAuthorizedKeysValue {
-    param([string]$Value)
-    if ([string]::IsNullOrWhiteSpace($Value)) { return $false }
-    $candidate = $Value.Trim()
-    if ($candidate -match '^"([^"]+)"$') {
-        $candidate = $Matches[1]
-    } elseif ($candidate.Contains('"')) {
-        return $false
-    }
-    $actual = $candidate.Replace('\', '/').TrimEnd('/').ToLowerInvariant()
-    $expected = @('__programdata__/ssh/administrators_authorized_keys')
-    if ($SshTargetAuthorizedKeysFile) {
-        $expected += $SshTargetAuthorizedKeysFile.Replace('\', '/').ToLowerInvariant()
-    }
-    return $actual -in $expected
-}
 
 function Assert-SshdEffectiveConfig {
     param([int]$Port, [string]$TailscaleIp)
@@ -1644,20 +2057,12 @@ function Assert-SshdEffectiveConfig {
             throw "effective PubkeyAuthentication is not yes for $userName"
         }
         $keyFile = Get-SshdEffectiveValue $effective 'authorizedkeysfile'
-        if (-not (Test-AdministratorAuthorizedKeysValue $keyFile)) {
+        if (-not (Test-AdministratorAuthorizedKeysValue -Value $keyFile -Path $SshTargetAuthorizedKeysFile)) {
             throw "effective AuthorizedKeysFile is incorrect for $($userName): $keyFile"
         }
     }
 }
 
-function Test-TailscaleFirewallRange {
-    param([object[]]$RemoteAddresses)
-    $normalized = @($RemoteAddresses | ForEach-Object { ([string]$_).Trim().ToLowerInvariant() })
-    return $normalized.Count -eq 1 -and $normalized[0] -in @(
-        '100.64.0.0/10',
-        '100.64.0.0/255.192.0.0'
-    )
-}
 
 function Assert-SshFirewallReady {
     param([int]$Port)
@@ -1676,37 +2081,11 @@ function Assert-SshFirewallReady {
     $addressFilters = @($rule | Get-NetFirewallAddressFilter -ErrorAction Stop)
     $remoteAddresses = @($addressFilters | ForEach-Object RemoteAddress)
     if (-not (Test-TailscaleFirewallRange $remoteAddresses)) {
-        throw "OpenSSH firewall rule is not limited to 100.64.0.0/10: $($remoteAddresses -join ', ')"
+        $expected = (Get-TailscaleFirewallRanges) -join ', '
+        throw "OpenSSH firewall rule is not limited to the tailnet ranges ($expected): $($remoteAddresses -join ', ')"
     }
 }
 
-function Assert-SshBanner {
-    param([string]$Address, [int]$Port, [int]$TimeoutMs = 5000)
-
-    $client = New-Object Net.Sockets.TcpClient
-    $stream = $null
-    $reader = $null
-    $async = $null
-    try {
-        $async = $client.BeginConnect($Address, $Port, $null, $null)
-        if (-not $async.AsyncWaitHandle.WaitOne($TimeoutMs, $false)) {
-            throw "SSH connection to $Address`:$Port timed out"
-        }
-        $client.EndConnect($async)
-        $stream = $client.GetStream()
-        $stream.ReadTimeout = $TimeoutMs
-        $reader = [IO.StreamReader]::new($stream, [Text.Encoding]::ASCII, $false, 1024, $true)
-        $banner = $reader.ReadLine()
-        if ($banner -notmatch '^SSH-(?:2\.0|1\.99)-') {
-            throw "unexpected SSH protocol banner from $Address`:$Port`: $banner"
-        }
-    } finally {
-        if ($reader) { $reader.Dispose() }
-        if ($stream) { $stream.Dispose() }
-        if ($async -and $async.AsyncWaitHandle) { $async.AsyncWaitHandle.Close() }
-        $client.Dispose()
-    }
-}
 
 function Assert-SshServerReady {
     param([int]$Port, [string]$TailscaleIp)
@@ -1714,9 +2093,24 @@ function Assert-SshServerReady {
     Assert-SshdEffectiveConfig -Port $Port -TailscaleIp $TailscaleIp
     $authFile = $SshTargetAuthorizedKeysFile
     Assert-AuthorizedKeysReady -File $authFile
+    Assert-SshDirectoryAclReady -Path (Split-Path -Parent $authFile)
     Assert-SshdHealthy -Port $Port
     Assert-SshFirewallReady -Port $Port
     Assert-SshBanner -Address $TailscaleIp -Port $Port
+
+    # sshd listens on both families now, so verify the IPv6 path too when
+    # Tailscale handed this node an address for it.
+    $ipv6 = Get-TailscaleIpAddress -Exe (Get-TailscaleExe) -Family 6
+    if ($ipv6) {
+        if (-not (Test-TailscaleIPv6 $ipv6)) {
+            throw "Tailscale returned an unexpected IPv6 address: $ipv6"
+        }
+        Assert-SshBanner -Address $ipv6 -Port $Port
+        Write-Log "SSH also answers on the Tailscale IPv6 address $ipv6"
+    } else {
+        Write-Warn 'This node has no Tailscale IPv6 address; only the IPv4 listener could be verified.'
+    }
+
     $finalTailscaleIp = Assert-TailscaleReady -Attempts 3 -DelaySeconds 1
     if ($finalTailscaleIp -ne $TailscaleIp) {
         throw "Tailscale IPv4 address changed during setup ($TailscaleIp -> $finalTailscaleIp)"
@@ -1732,10 +2126,255 @@ function Get-SshLoginText {
     ) -join "`n"
 }
 
+# ---------------------------------------------------------------------------
+# Configuration fingerprints and restart decisions
+# ---------------------------------------------------------------------------
+
+function Get-FileContentHash {
+    param([string]$Path)
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    try {
+        return (Get-FileHash -LiteralPath $Path -Algorithm SHA256 -ErrorAction Stop).Hash
+    } catch {
+        return $null
+    }
+}
+
+function Get-SshdRestartDecision {
+    # Windows OpenSSH has no reload, and restarting sshd interrupts live
+    # sessions, so only touch the service when something really changed.
+    param([string]$ConfigPath, [int]$Port, [AllowNull()][string]$PreviousHash)
+
+    $service = Get-Service -Name sshd -ErrorAction SilentlyContinue
+    if (-not $service -or $service.Status -ne 'Running') { return 'Start' }
+
+    $currentHash = Get-FileContentHash -Path $ConfigPath
+    if (-not $PreviousHash -or -not $currentHash -or $currentHash -ne $PreviousHash) { return 'Restart' }
+    if ((Get-TcpPortListenerState -Port $Port) -ne 'Sshd') { return 'Restart' }
+
+    # The listener must have started after the last write to the config file,
+    # otherwise it may be running with an older revision of it.
+    try {
+        $listener = Get-Process -Name sshd -ErrorAction Stop |
+            Sort-Object StartTime | Select-Object -First 1
+        $configItem = Get-Item -LiteralPath $ConfigPath -ErrorAction Stop
+        if ($listener -and $configItem -and $listener.StartTime -gt $configItem.LastWriteTime) {
+            return 'Skip'
+        }
+    } catch {}
+    return 'Restart'
+}
+
+function Update-SshdServiceForConfigChange {
+    param([string]$ConfigPath, [int]$Port, [AllowNull()][string]$PreviousHash)
+
+    switch (Get-SshdRestartDecision -ConfigPath $ConfigPath -Port $Port -PreviousHash $PreviousHash) {
+        'Start' {
+            Write-Log 'Starting the sshd service...'
+            Start-Service -Name sshd -ErrorAction Stop
+            return 'Started'
+        }
+        'Skip' {
+            Write-Log "sshd_config is unchanged and sshd already listens on TCP $Port; keeping the running service."
+            return 'Unchanged'
+        }
+        default {
+            Write-Log 'Restarting sshd to load the updated configuration...'
+            Restart-Service -Name sshd -ErrorAction Stop
+            return 'Restarted'
+        }
+    }
+}
+
+# ---------------------------------------------------------------------------
+# ACL application
+# ---------------------------------------------------------------------------
+
+function Grant-SshPathAclRepairAccess {
+    # A previous run may have removed the launching administrator from the DACL
+    # before it could set the final owner.  Temporarily make the built-in
+    # Administrators group the owner so an elevated administrator or SYSTEM can
+    # repair and rerun the setup.
+    param(
+        [string]$Path,
+        [switch]$Container
+    )
+
+    & takeown.exe /F $Path /A | Out-Null
+    Assert-NativeCommandSucceeded "take ownership for ACL repair: $Path"
+
+    $rights = if ($Container) { '(OI)(CI)(F)' } else { '(F)' }
+    & icacls.exe $Path /grant "*S-1-5-32-544:$rights" | Out-Null
+    Assert-NativeCommandSucceeded "grant Administrators ACL repair access: $Path"
+}
+
+function Set-RestrictedSshPathAcl {
+    # Final state for a file holding key material: no inheritance, owner is the
+    # built-in Administrators group, and only SYSTEM and Administrators have
+    # FullControl.
+    param(
+        [string]$Path,
+        [switch]$Container
+    )
+
+    $rights = if ($Container) { '(OI)(CI)(F)' } else { '(F)' }
+    & icacls.exe $Path /reset | Out-Null
+    Assert-NativeCommandSucceeded "reset ACL: $Path"
+    & icacls.exe $Path /grant:r "*S-1-5-18:$rights" "*S-1-5-32-544:$rights" | Out-Null
+    Assert-NativeCommandSucceeded "grant restricted ACL: $Path"
+    & icacls.exe $Path '/inheritance:r' | Out-Null
+    Assert-NativeCommandSucceeded "disable ACL inheritance: $Path"
+    & icacls.exe $Path /setowner '*S-1-5-32-544' | Out-Null
+    Assert-NativeCommandSucceeded "set ACL owner: $Path"
+}
+
+function Set-SshDirectoryAcl {
+    # The ssh directory stays readable for non-administrators because the
+    # OpenSSH client reads the system-wide ssh_config from it, but it must not
+    # be writable by them: a writable directory would let anyone plant files
+    # next to the managed key material.
+    param([string]$Path)
+
+    & takeown.exe /F $Path /A | Out-Null
+    Assert-NativeCommandSucceeded "take ownership of the SSH directory: $Path"
+    & icacls.exe $Path '/inheritance:r' | Out-Null
+    Assert-NativeCommandSucceeded "disable SSH directory ACL inheritance: $Path"
+    & icacls.exe $Path /grant:r '*S-1-5-18:(OI)(CI)(F)' '*S-1-5-32-544:(OI)(CI)(F)' '*S-1-5-11:(OI)(CI)(RX)' | Out-Null
+    Assert-NativeCommandSucceeded "apply SSH directory ACL: $Path"
+    & icacls.exe $Path /setowner '*S-1-5-32-544' | Out-Null
+    Assert-NativeCommandSucceeded "set SSH directory owner: $Path"
+}
+
+function Assert-RestrictedSshPathAcl {
+    param([string]$Path, [string]$Label)
+    $problems = @(Get-RestrictedSshPathAclProblems -Path $Path -Label $Label)
+    if ($problems.Count) { throw "$Label ACL is not restricted: $($problems -join '; ')" }
+}
+
+function Assert-SshDirectoryAclReady {
+    param([string]$Path)
+    $problems = @(Get-SshDirectoryAclProblems -Path $Path -Label $Path)
+    if ($problems.Count) { throw "SSH directory ACL is not restricted: $($problems -join '; ')" }
+}
+
+# ---------------------------------------------------------------------------
+# Reporting helpers
+# ---------------------------------------------------------------------------
+
+function Assert-SshBanner {
+    param([string]$Address, [int]$Port, [int]$TimeoutMs = 5000)
+    return Get-SshBanner -Address $Address -Port $Port -TimeoutMs $TimeoutMs
+}
+
+function Get-OpenSshInstallLogTail {
+    # The failure notification carries the tail of the OpenSSH install log so a
+    # remote operator sees the DISM output that caused the failure.
+    param([int]$MaxChars = 12000)
+
+    $path = $script:OpenSshInstallLog
+    if (-not $path -or -not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try {
+        $text = [IO.File]::ReadAllText($path).Trim()
+    } catch {
+        return "log unreadable: $($_.Exception.Message)"
+    }
+    if (-not $text) { return $null }
+    if ($text.Length -gt $MaxChars) { $text = '...' + $text.Substring($text.Length - $MaxChars) }
+    return $text
+}
+
+function Test-FirewallPortFilterCoversPort {
+    param([AllowNull()]$Filter, [int]$Port)
+    if (-not $Filter) { return $false }
+    $protocol = [string]$Filter.Protocol
+    if ($protocol -notin @('TCP', 'Any', '6', '256')) { return $false }
+    $localPort = [string]$Filter.LocalPort
+    if ([string]::IsNullOrWhiteSpace($localPort)) { return $false }
+    if ($localPort -in @('Any', '*')) { return $true }
+    foreach ($part in ($localPort -split ',')) {
+        $value = $part.Trim()
+        if ($value -eq [string]$Port) { return $true }
+        if ($value -match '^(\d+)\s*-\s*(\d+)$' -and $Port -ge [int]$Matches[1] -and $Port -le [int]$Matches[2]) {
+            return $true
+        }
+    }
+    return $false
+}
+
+function Get-SshFirewallExposureProblems {
+    # Audits every enabled inbound allow rule and reports the ones that expose
+    # the SSH port to something wider than the tailnet, so an unrelated rule
+    # cannot silently publish the port this script just configured.
+    param([int]$Port, [string]$ManagedRuleName)
+
+    $problems = New-Object System.Collections.Generic.List[string]
+    try {
+        $rules = @(Get-NetFirewallRule -Direction Inbound -Enabled True -Action Allow -ErrorAction Stop)
+    } catch {
+        $problems.Add("firewall audit could not enumerate inbound rules: $($_.Exception.Message)")
+        return @($problems)
+    }
+
+    foreach ($rule in $rules) {
+        if ($ManagedRuleName -and $rule.Name -eq $ManagedRuleName) { continue }
+
+        $coversPort = $false
+        foreach ($filter in @($rule | Get-NetFirewallPortFilter -ErrorAction SilentlyContinue)) {
+            if (Test-FirewallPortFilterCoversPort -Filter $filter -Port $Port) { $coversPort = $true; break }
+        }
+        if (-not $coversPort) { continue }
+
+        $remoteAddresses = @(
+            $rule | Get-NetFirewallAddressFilter -ErrorAction SilentlyContinue |
+                ForEach-Object { $_.RemoteAddress }
+        )
+        if (Test-TailscaleFirewallRange $remoteAddresses) { continue }
+        $problems.Add("$($rule.DisplayName) [$($rule.Name)] allows TCP $Port from $(@($remoteAddresses) -join ', ')")
+    }
+    return @($problems)
+}
+
+
+# ---------------------------------------------------------------------------
+# 6. Orchestration and result reporting
+# ---------------------------------------------------------------------------
+
+function Get-SetupContextLines {
+    # Facts about the run that belong in the report on every outcome: account
+    # state changes, firewall audit findings and preserved Tailscale options.
+    $lines = New-Object System.Collections.Generic.List[string]
+    if ($script:SshTargetUserName) {
+        $lines.Add("Built-in Administrator account ($($script:SshTargetUserName)): $script:SshAdministratorState")
+    }
+    if ($script:TailscalePrefsReset) {
+        $lines.Add('Tailscale: previous tailscale up options were reset (--reset)')
+    } elseif ($script:TailscalePreservedPrefs) {
+        $lines.Add("Tailscale: kept existing tailscale up options ($($script:TailscalePreservedPrefs))")
+    }
+    foreach ($exposure in @($script:SshFirewallExposureProblems)) {
+        $lines.Add("Firewall audit: $exposure")
+    }
+    return @($lines)
+}
+
+function Get-SetupUserList {
+    try {
+        return (Get-SshConfigUserNames) -join ', '
+    } catch {
+        return '<unresolved>'
+    }
+}
+
 function Invoke-Setup {
+    param([switch]$ResetPrefs)
+
     $FailedSteps.Clear()
     $script:ValidatedTailscaleIp = $null
     $script:OpenSshRestartNeeded = $false
+    $script:SshAdministratorState = 'unknown'
+    $script:SshFirewallExposureProblems = @()
+    $script:TailscalePreservedPrefs = $null
+    $script:TailscalePrefsReset = [bool]$ResetPrefs
     $tgConfig = if ($TgBotToken -and $TgChatId) {
         @{ Token = $TgBotToken; ChatId = $TgChatId }
     } else { $null }
@@ -1745,7 +2384,7 @@ function Invoke-Setup {
         Invoke-RequiredStep 'Enable and validate SSH target accounts' { Initialize-SshTargetUsers }
         Invoke-RequiredStep 'Install Tailscale' { Install-Tailscale }
         Invoke-RequiredStep 'Tailscale service autostart' { Enable-TailscaleService }
-        Invoke-RequiredStep 'Tailscale login' { Connect-Tailscale -AuthKey $TsAuthKey }
+        Invoke-RequiredStep 'Tailscale login' { Connect-Tailscale -AuthKey $TsAuthKey -ResetPrefs:$ResetPrefs }
         Invoke-RequiredStep 'Validate Tailscale readiness' {
             $script:ValidatedTailscaleIp = Assert-TailscaleReady
         }
@@ -1780,6 +2419,12 @@ SSH is still ready. Log in from another machine with a matching private key:
 $loginLine
 "@
         } else { '' }
+        $contextLines = @(Get-SetupContextLines)
+        $contextSection = if ($contextLines.Count) { ($contextLines -join "`n") + "`n" } else { '' }
+        # The docs promise the tail of the install log in the failure message:
+        # the DISM output is what identifies a failed capability install.
+        $logTail = Get-OpenSshInstallLogTail -MaxChars 12000
+        $logSection = if ($logTail) { "`nOpenSSH install log (tail):`n$logTail`n" } else { '' }
         $statusLabel = if ($rebootRequired) { '[REBOOT REQUIRED]' } else { '[FAILED]' }
         $detailLabel = if ($rebootRequired) { 'Details' } else { 'Failure' }
         $restartNote = if ($script:OpenSshRestartNeeded -and -not $rebootRequired) {
@@ -1788,11 +2433,12 @@ $loginLine
         $failureMessage = @"
 $statusLabel Windows OpenSSH server setup
 Host: $env:COMPUTERNAME (Windows)
-Users: $((Get-SshConfigUserNames) -join ', ')
-$($detailLabel):
+Users: $(Get-SetupUserList)
+$contextSection$($detailLabel):
 - $failureText
 $restartNote
 $sshLoginDetails
+$logSection
 "@
         if ($tgConfig -and -not (Send-Telegram -Config $tgConfig -Text $failureMessage)) {
             Write-Warn 'Telegram failure notification could not be delivered.'
@@ -1803,23 +2449,26 @@ $sshLoginDetails
 
     $publicIp = Get-PublicIp
     $loginLine = Get-SshLoginText -Port $SshPort -TailscaleIp $script:ValidatedTailscaleIp
+    $contextLines = @(Get-SetupContextLines)
     Write-Host ''
     Write-Host '==================== Summary ====================' -ForegroundColor Green
     Write-Log "This machine's Tailscale IP: $script:ValidatedTailscaleIp"
     Write-Log "Server-side SSH readiness checks passed: $loginLine"
+    foreach ($contextLine in $contextLines) { Write-Log $contextLine }
     Write-Warn 'This is Windows OpenSSH over Tailscale; no Tailscale SSH badge is expected.'
     $restartNote = if ($script:OpenSshRestartNeeded) {
         'Windows requested a restart after OpenSSH installation. SSH checks passed; restart at a convenient time and rerun SETUP.ps1.'
     } else { '' }
     if ($restartNote) { Write-Warn $restartNote }
 
+    $contextSection = if ($contextLines.Count) { ($contextLines -join "`n") + "`n" } else { '' }
     $successMessage = @"
 [READY] Windows OpenSSH server-side checks passed
 Host: $env:COMPUTERNAME (Windows)
-Users: $((Get-SshConfigUserNames) -join ', ')
+Users: $(Get-SetupUserList)
 Tailscale IP: $script:ValidatedTailscaleIp
 Public IP: $(if ($publicIp) { $publicIp } else { 'pending' })
-$restartNote
+$contextSection$restartNote
 
 Log in from another machine with a matching private key:
 $loginLine
@@ -1839,5 +2488,5 @@ Note: Windows uses standard OpenSSH, so the Tailscale Machines page will not sho
 }
 
 if ($LibraryOnly) { return }
-$setupExitCode = Invoke-Setup
+$setupExitCode = Invoke-Setup -ResetPrefs:$ResetTailscalePrefs
 exit $setupExitCode
