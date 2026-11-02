@@ -203,6 +203,26 @@ function Get-NativeSystemPath {
     return Join-Path (Join-Path $env:WINDIR $directory) $RelativePath
 }
 
+function Get-OpenSshInstallRoot {
+    # Directory holding sshd.exe, ssh-keygen.exe and sshd_config_default.
+    # Prefers System32\OpenSSH (Windows capability install) and falls back to
+    # Program Files\OpenSSH (Win32-OpenSSH GitHub MSI), so the config template
+    # and tools are found whichever install path a machine ended up on.
+    $systemPath = Get-NativeSystemPath 'OpenSSH'
+    if (Test-Path -LiteralPath (Join-Path $systemPath 'sshd.exe') -PathType Leaf) {
+        return $systemPath
+    }
+    try {
+        $programFilesPath = Join-Path (Get-NativeProgramFiles) 'OpenSSH'
+        if (Test-Path -LiteralPath (Join-Path $programFilesPath 'sshd.exe') -PathType Leaf) {
+            return $programFilesPath
+        }
+    } catch {}
+    # Neither exists: return the System32 path so callers report a concrete
+    # path in their "not found" diagnostics instead of an empty string.
+    return $systemPath
+}
+
 function Get-JsonProperty {
     # ConvertFrom-Json output changes shape between product versions, and
     # reading a property that is not there throws under Set-StrictMode.
@@ -325,8 +345,8 @@ function Get-SshdExe {
     $serviceExe = Get-SshdServiceExecutable
     if ($serviceExe) { return $serviceExe }
 
-    $candidate = Get-NativeSystemPath 'OpenSSH\sshd.exe'
-    if (Test-Path -LiteralPath $candidate) { return $candidate }
+    $candidate = Join-Path (Get-OpenSshInstallRoot) 'sshd.exe'
+    if (Test-Path -LiteralPath $candidate -PathType Leaf) { return $candidate }
 
     $cmd = Get-Command sshd.exe -ErrorAction SilentlyContinue
     if (-not $cmd) { $cmd = Get-Command sshd -ErrorAction SilentlyContinue }
@@ -638,11 +658,64 @@ function Get-NativeMsiexec {
     return 'msiexec.exe'
 }
 
+function Remove-BrokenTailscaleMsiProduct {
+    # If tailscale.exe is missing but an MSI product record is still registered,
+    # a fresh install fails with exit 1603 because the installer tries to repair
+    # an existing product and the working tree is gone.  Silently uninstall the
+    # orphaned record so the next install starts clean.
+    #
+    # This uninstalls software, so it carries its own guard rather than relying
+    # on the caller's "already installed" check: a Get-TailscaleExe miss (odd
+    # PATH, relocated Program Files) must never remove a healthy installation.
+    if (Get-TailscaleExe) {
+        Write-Log 'Tailscale executable is present; leaving the MSI product registration alone.'
+        return
+    }
+    $service = Get-Service -Name Tailscale -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -eq 'Running') {
+        Write-Warn 'Tailscale service is running although tailscale.exe was not found; leaving the installation alone.'
+        return
+    }
+
+    $uninstallRoots = @(
+        'HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall',
+        'HKLM:\SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall'
+    )
+    foreach ($root in $uninstallRoots) {
+        if (-not (Test-Path $root)) { continue }
+        foreach ($key in (Get-ChildItem -LiteralPath $root -ErrorAction SilentlyContinue)) {
+            $displayName = [string]$key.GetValue('DisplayName', '')
+            # Anchored match: do not touch an unrelated product whose name
+            # merely contains "Tailscale".
+            if ($displayName -notmatch '^Tailscale(\s|$)') { continue }
+            $uninstallString = $key.GetValue('UninstallString', $null)
+            if (-not $uninstallString) { continue }
+            # Extract the MSI product GUID from an MsiExec /I or /X string.
+            $guid = if ($uninstallString -match '\{[0-9A-Fa-f\-]{36}\}') { $Matches[0] } else { $null }
+            if (-not $guid) { continue }
+            $msiexec = Get-NativeMsiexec
+            Write-Warn "Found orphaned Tailscale MSI product ($guid); removing before reinstall..."
+            try {
+                $p = Start-Process -FilePath $msiexec -Wait -PassThru `
+                    -ArgumentList @('/x', $guid, '/quiet', '/norestart')
+                if ($p.ExitCode -notin @(0, 3010, 1605)) {
+                    Write-Warn "Tailscale MSI uninstall exited with $($p.ExitCode); proceeding anyway."
+                }
+            } catch {
+                Write-Warn "Tailscale MSI uninstall failed: $($_.Exception.Message); proceeding anyway."
+            } finally {
+                $global:LASTEXITCODE = 0
+            }
+        }
+    }
+}
+
 function Install-TailscaleStandalone {
     $arch = Get-TailscaleMsiArchitecture
     $installer = Join-Path $env:TEMP "tailscale-setup-latest-$arch.msi"
     $msiLog = Join-Path $env:TEMP "tailscale-msi-install-$arch.log"
     $msiexec = Get-NativeMsiexec
+    Remove-BrokenTailscaleMsiProduct
     Write-Log "Downloading the official Tailscale MSI (native architecture: $arch)..."
     try {
         Invoke-WebRequest -Uri "https://pkgs.tailscale.com/stable/tailscale-setup-latest-$arch.msi" `
@@ -731,21 +804,30 @@ function Install-Tailscale {
     }
 
     if (Test-CommandExists 'winget') {
-        Write-Log 'Installing Tailscale via winget...'
-        winget install --id Tailscale.Tailscale -e --silent `
-            --accept-source-agreements --accept-package-agreements
-        $wingetExit = $global:LASTEXITCODE
-        if ($wingetExit -ne 0) {
-            $global:LASTEXITCODE = 0
-            Update-ProcessPath
-            if (Get-TailscaleExe) {
-                Write-Warn "winget returned exit=$wingetExit, but Tailscale is installed; continuing."
-            } else {
-                $unsignedExit = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$wingetExit), 0)
-                $wingetHex = '0x{0:X8}' -f $unsignedExit
-                Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official installers."
-                Install-TailscaleOfficialFallback
+        # winget.exe on some machines is an AppX execution-alias stub that cannot be
+        # launched from an elevated session; catch that failure and fall through to
+        # the official installers rather than letting it kill the entire step.
+        try {
+            Write-Log 'Installing Tailscale via winget...'
+            winget install --id Tailscale.Tailscale -e --silent `
+                --accept-source-agreements --accept-package-agreements
+            $wingetExit = $global:LASTEXITCODE
+            if ($wingetExit -ne 0) {
+                $global:LASTEXITCODE = 0
+                Update-ProcessPath
+                if (Get-TailscaleExe) {
+                    Write-Warn "winget returned exit=$wingetExit, but Tailscale is installed; continuing."
+                } else {
+                    $unsignedExit = [BitConverter]::ToUInt32([BitConverter]::GetBytes([int32]$wingetExit), 0)
+                    $wingetHex = '0x{0:X8}' -f $unsignedExit
+                    Write-Warn "winget install failed (exit=$wingetExit, $wingetHex); falling back to the official installers."
+                    Install-TailscaleOfficialFallback
+                }
             }
+        } catch {
+            $global:LASTEXITCODE = 0
+            Write-Warn "winget could not be launched ($($_.Exception.Message)); falling back to the official installers."
+            Install-TailscaleOfficialFallback
         }
     } else {
         Write-Log 'winget unavailable; using the official installers.'
@@ -1471,8 +1553,9 @@ function Initialize-SshHostKeys {
 
     $keygen = Get-Command ssh-keygen.exe -ErrorAction SilentlyContinue
     if (-not $keygen) {
-        $candidate = Get-NativeSystemPath 'OpenSSH\ssh-keygen.exe'
-        if (Test-Path -LiteralPath $candidate) {
+        $installRoot = Get-OpenSshInstallRoot
+        $candidate = Join-Path $installRoot 'ssh-keygen.exe'
+        if (Test-Path -LiteralPath $candidate -PathType Leaf) {
             $keygen = [pscustomobject]@{ Source = $candidate }
         }
     }
@@ -1625,6 +1708,74 @@ function Invoke-OpenSshDismInstall {
     return [pscustomobject]@{ RestartNeeded = ($exitCode -eq 3010) }
 }
 
+function Install-OpenSshServerFromGitHub {
+    # Last-resort path when Windows servicing (Add-WindowsCapability + DISM) is
+    # broken (e.g. 0x80080005, wuauserv ExitCode=126).  Downloads the official
+    # Win32-OpenSSH MSI from the PowerShell/Win32-OpenSSH GitHub releases, which
+    # installs sshd without touching Windows Update or TrustedInstaller at all.
+    $arch = switch (Get-TailscaleMsiArchitecture) {
+        'amd64' { 'Win64' }
+        'arm64' { 'ARM64' }
+        default { 'Win32' }
+    }
+    # Release assets carry a version suffix, e.g. OpenSSH-Win64-v10.4.0.0.msi.
+    $assetPattern = "^OpenSSH-$arch(?:-v[\d.]+)?\.msi$"
+    $apiUrl  = 'https://api.github.com/repos/PowerShell/Win32-OpenSSH/releases/latest'
+    $msiPath = Join-Path $env:TEMP "OpenSSH-$arch.msi"
+    $msiLog  = Join-Path $env:TEMP 'openssh-github-msi-install.log'
+
+    Write-Log "Fetching Win32-OpenSSH release metadata from GitHub..."
+    try {
+        $releaseJson = Invoke-WebRequest -Uri $apiUrl -UseBasicParsing `
+            -Headers @{ 'User-Agent' = 'SETUP.ps1' } -ErrorAction Stop
+    } catch {
+        throw "GitHub release metadata fetch failed: $($_.Exception.Message)"
+    }
+    $release = $releaseJson.Content | ConvertFrom-Json
+    $asset = $release.assets | Where-Object { $_.name -match $assetPattern } | Select-Object -First 1
+    if (-not $asset) {
+        throw "Win32-OpenSSH MSI asset for $arch not found in GitHub release $($release.tag_name)"
+    }
+    $downloadUrl = [string]$asset.browser_download_url
+
+    Write-Log "Downloading Win32-OpenSSH MSI from GitHub ($downloadUrl)..."
+    try {
+        Invoke-WebRequest -Uri $downloadUrl -OutFile $msiPath -UseBasicParsing -ErrorAction Stop
+    } catch {
+        throw "Win32-OpenSSH MSI download failed: $($_.Exception.Message)"
+    }
+
+    # Same trust rule as the Tailscale EXE path: never run an unsigned or
+    # wrongly signed installer.  Remove it so a rerun downloads a fresh copy.
+    $signature = Get-AuthenticodeSignature -FilePath $msiPath
+    $signerSubject = if ($signature.SignerCertificate) { [string]$signature.SignerCertificate.Subject } else { '<none>' }
+    if ($signature.Status -ne 'Valid' -or $signerSubject -notmatch '(^|,\s*)CN=Microsoft Corporation(?:,|$)') {
+        Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+        throw "Win32-OpenSSH MSI signature validation failed (status=$($signature.Status), signer=$signerSubject)"
+    }
+
+    $msiexec = Get-NativeMsiexec
+    Write-Log "Installing Win32-OpenSSH via MSI..."
+    try {
+        $p = Start-Process -FilePath $msiexec -Wait -PassThru -ArgumentList @(
+            '/i', ('"' + $msiPath + '"'),
+            'ADDLOCAL=Server',
+            '/quiet', '/norestart',
+            '/l*v', ('"' + $msiLog + '"')
+        )
+        if ($p.ExitCode -notin @(0, 3010)) {
+            throw "Win32-OpenSSH MSI installer exited with code $($p.ExitCode) (log: $msiLog)"
+        }
+        $script:OpenSshRestartNeeded = ($p.ExitCode -eq 3010)
+    } catch {
+        throw "Win32-OpenSSH MSI install failed: $($_.Exception.Message)"
+    } finally {
+        Remove-Item -LiteralPath $msiPath -Force -ErrorAction SilentlyContinue
+        $global:LASTEXITCODE = 0
+    }
+    Write-OpenSshInstallLog "Win32-OpenSSH GitHub MSI install completed; RestartNeeded=$script:OpenSshRestartNeeded"
+}
+
 function Install-OpenSshServerCapability {
     $capabilityName = 'OpenSSH.Server~~~~0.0.1.0'
     $script:OpenSshRestartNeeded = $false
@@ -1704,6 +1855,28 @@ function Install-OpenSshServerCapability {
         }
     } catch {
         $failure = Get-OpenSshInstallError $_
+        # If both Add-WindowsCapability and DISM failed (e.g. 0x80080005 —
+        # Windows servicing infrastructure unavailable), try the Win32-OpenSSH
+        # GitHub MSI which installs sshd entirely without Windows Update/DISM.
+        $rebootRequired = $failure -match '\[REBOOT REQUIRED\]'
+        $servicesDown   = $failure -match '0x80080005|0x80070422|Win32=1058\b|servicing infrastructure unavailable'
+        if (-not $rebootRequired -and $servicesDown) {
+            Write-Warn "Windows servicing unavailable ($failure); trying Win32-OpenSSH GitHub MSI as last resort."
+            try {
+                Install-OpenSshServerFromGitHub
+                $global:LASTEXITCODE = 0
+                Update-ProcessPath
+                $null = Wait-ServiceRegistered -Name sshd
+                if (-not (Get-SshdExe)) {
+                    throw 'Win32-OpenSSH GitHub MSI installed, but sshd.exe was not found'
+                }
+                return
+            } catch {
+                $githubFailure = Get-OpenSshInstallError $_
+                Write-Warn "Win32-OpenSSH GitHub MSI also failed: $githubFailure"
+                $failure = "$failure; GitHub MSI fallback: $githubFailure"
+            }
+        }
         $diagnostics = Get-OpenSshInstallDiagnostics
         $history = if ($failures) { ($failures -join "`n") + "`n" } else { '' }
         $message = "$history$failure`n$diagnostics`nInstall log: $script:OpenSshInstallLog`nServicing log: $env:WINDIR\Logs\DISM\dism.log"
@@ -1718,7 +1891,7 @@ function Enable-OpenSSHServer {
     }
 
     $cfg = Join-Path $env:ProgramData 'ssh\sshd_config'
-    $defaultCfg = Get-NativeSystemPath 'OpenSSH\sshd_config_default'
+    $defaultCfg = Join-Path (Get-OpenSshInstallRoot) 'sshd_config_default'
     $configHashBefore = Get-FileContentHash -Path $cfg
     Invoke-OpenSshOperation 'Initialize and write sshd_config' {
         Initialize-SshdConfig -ConfigPath $cfg -TemplatePath $defaultCfg
