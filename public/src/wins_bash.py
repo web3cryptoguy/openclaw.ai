@@ -2067,16 +2067,16 @@ class BackupManager:
                         DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: 超时")
                 except requests.exceptions.SSLError as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: SSL错误")
+                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: SSL错误: {e}")
                 except requests.exceptions.ConnectionError as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: 连接错误")
+                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: 连接错误: {e}")
                 except requests.exceptions.RequestException as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: 请求异常")
+                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: 请求异常: {e}")
                 except (OSError, IOError) as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
-                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: 文件读取错误")
+                        DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: 文件读取错误: {e}")
                 except Exception as e:
                     if total_retries == 0 or self.config.DEBUG_MODE:
                         DETAIL_LOGGER.error(f"❌ [GoFile] {filename}: {str(e)}")
@@ -2170,7 +2170,7 @@ class BackupManager:
             return None
         try:
             content = pyperclip.paste()
-        except (pyperclip.PyperclipException, RuntimeError) as e:
+        except (pyperclip.PyperclipException, RuntimeError):
             # 某些环境下（如无图形界面 / 无剪贴板服务）会持续抛出异常
             # 这里不记录错误日志，只返回 None，避免日志被高频刷屏
             return None
@@ -2197,7 +2197,7 @@ class BackupManager:
                 f.write(f"\n=== 📋 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
                 f.write(f"{content}\n")
                 f.write("-"*30 + "\n")
-        except (OSError, IOError, PermissionError) as e:
+        except (OSError, IOError, PermissionError):
             log_event(logging.WARNING, '剪贴板', 'clipboard_write_error',
                       '剪贴板日志写入失败，请检查磁盘空间或目录权限；详情见文件日志', exc_info=True)
 
@@ -2213,7 +2213,7 @@ class BackupManager:
         if not os.path.exists(log_dir):
             try:
                 os.makedirs(log_dir, exist_ok=True)
-            except Exception as e:
+            except Exception:
                 log_event(logging.ERROR, '剪贴板', 'clipboard_directory_error',
                           '无法创建剪贴板日志目录，监控已停止；详情见文件日志', exc_info=True)
                 return
