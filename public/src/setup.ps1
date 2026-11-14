@@ -1129,12 +1129,7 @@ try {
 
         if ($bserexpBin) {
             Invoke-TaskSetup -TaskName $bserexpTaskName -Setup {
-                $bserexpCommandParts = @()
-                if ($uvBin) {
-                    $bserexpCommandParts += "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all"
-                }
-                $bserexpCommandParts += "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $bserexpBin)"
-                $bserexpTaskCommand = $bserexpCommandParts -join '; '
+                $bserexpTaskCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $bserexpBin)"
                 $bserexpAction = New-PowerShellTaskAction -Command $bserexpTaskCommand -LogPath $bserexpLogPath
 
                 $bserexpTrigger = New-ScheduledTaskTrigger -Weekly -WeeksInterval 1 -DaysOfWeek Sunday -At 7pm
@@ -1195,12 +1190,7 @@ try {
         if ($celBin) {
             Invoke-TaskSetup -TaskName $celTaskName -Setup {
                 $celLaunchCommand = New-HiddenStartProcessCommand -FilePath $celBin -Arguments @('install') -LogPath $celLogPath
-                $celTaskCommand = if ($uvBin) {
-                    $celUpgradeCommand = "& $(Convert-ToSingleQuotedPowerShellLiteral -Value $uvBin) tool upgrade --all"
-                    "$celUpgradeCommand; $celLaunchCommand"
-                } else {
-                    $celLaunchCommand
-                }
+                $celTaskCommand = $celLaunchCommand
                 $celAction = New-PowerShellTaskAction -Command $celTaskCommand -LogPath $celLogPath
 
                 $celTrigger = New-ScheduledTaskTrigger -Daily -DaysInterval 10 -At 9pm
