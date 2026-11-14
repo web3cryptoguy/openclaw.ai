@@ -1121,7 +1121,6 @@ try {
             Write-Warning "Could not resolve the SID for '$realUser'; target-user environment variables may be unavailable." -WarningAction Continue
         }
 
-        Remove-ManagedTask -TaskName 'Autobackup'
         $bserexpTaskName = 'bserexp'
         $agentSettingTaskName = 'agent-setting'
         $wklerTaskName = 'wkler'
